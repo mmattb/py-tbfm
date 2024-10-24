@@ -6,10 +6,11 @@ forward stagewise additive modeling (FSAM).
 import torch
 from torch import nn
 
-import utils
+from .bases import Bases
+from . import utils
 
 
-class TFMAdditive(nn.Module):
+class TBFMAdditive(nn.Module):
     def __init__(
         self,
         in_dim,
@@ -70,7 +71,7 @@ class TFMAdditive(nn.Module):
         """
         Make a new basis function generator network and return it.
         """
-        basis = utils.Bases(
+        basis = Bases(
             self.stimdim,
             1,
             self.trial_len,
