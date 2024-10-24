@@ -45,13 +45,14 @@ def generate_ou_sinusoidal_moving_mean(
     # Shift the phase so all channels aren't the same mean
     # Measured in time steps
     phase_shift=0,
+    sigma=0.5,
 ):
     lspace = torch.linspace(0, trial_len, trial_len)
     mean = torch.sin(lspace * 2 * math.pi / wavelength + phase_shift)
 
     # Cool; now OU on top of that:
     X = generate_ou_moving_mean(
-        mean, trial_len=trial_len, batch_size=batch_size, kappa=kappa
+        mean, trial_len=trial_len, batch_size=batch_size, kappa=kappa, sigma=sigma
     )
 
     return X
