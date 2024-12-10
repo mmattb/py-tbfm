@@ -39,3 +39,8 @@ yhat = model(
 
 ``TBFM Demo.ipynb`` provides a detailed walkthrough which uses some synthetic data.
 ``TBFM FSAM Demo.ipynb`` provides an additional demo where we build the TBFM using forward stagewise additive modeling. It's recommended to go through this one after the first.
+
+## Architecture
+
+![detail_arch](https://github.com/user-attachments/assets/daf3fb08-f087-4dcb-b4fb-5835a2f8f5c0)
+
