@@ -34,7 +34,8 @@ the full 164ms multistep prediction.
 Training uses a tripartite loss function:
 
 * an autoencoder loss  
-  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
+  <img src="https://github.com/user-attachments/assets/65bf3d6e-973b-47ff-908f-64de815dcdbc" height="30"/>
+
 
 * a dynamics prediction loss for all time steps in our window. Note however that we
     unroll predictions to make multi-step predictions, feeding our
@@ -43,6 +44,6 @@ Training uses a tripartite loss function:
   <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
 
 * a nearest-neighbor loss, which attempts to force all LFP values to align near each other in latent space so the model can take advantage of similar dynamics across channels and space. The simplest way to do that is to force the latent states to be centered at 0; hence:  
-  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
+  <img src="https://github.com/user-attachments/assets/ab6a5a7d-721c-43db-b443-5ab2935f4e6f" height="30"/>
 
 The LSTM model takes inspiration from dynamical systems and control methods which learn latent state representations for optimal control. Since it leverages an autoencoder architecture, it can be compared to methods such as deep Koopman for control, but without the key linearity constraint. We chose the LSTM model for comparison since it is a more expressive model than LSSMs, and has previously been demonstrated for control. While LSSMs were previously demonstrated for modeling neural stimulation, our ODE-LSTM model goes further by allowing for nonlinearities.
