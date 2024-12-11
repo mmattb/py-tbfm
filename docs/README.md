@@ -7,9 +7,7 @@ We compare TBFMs to two existing model types. Details are as follows.
 ### Linear state space model (LSSM)
 While there are a wide variety of LSSMs, some simple versions were previously demonstrated for modeling neural stimulation. These are commonly learned using the Kalman Filter, though they can also be trained using other methods such as backpropagation. In discrete time these simple LSSMs are specified as:
 
-$x_{k+1} = Ax_k + Bu_k$
-
-$y_k = Cx_k$
+<img src="https://github.com/user-attachments/assets/debae1b5-2622-4410-9c3f-73365ddb5e55" height="60"/>
 
 Here $x$ is a latent state, $u$ is the control input (e.g. stimulation parameters), and $y$ is the prediction. Forward prediction can be performed by specifying an initial latent state $x_0$ and autoregressing forward in time.
 
@@ -35,11 +33,16 @@ the full 164ms multistep prediction.
 
 Training uses a tripartite loss function:
 
-* an autoencoder loss $L_2(x, g^{-1}(g(x)))$
-* a dynamics prediction loss $L_2(z_t + \Delta z, z_{t+1})$ for all time steps in our window. Note however that we
+* an autoencoder loss  
+  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
+
+* a dynamics prediction loss for all time steps in our window. Note however that we
     unroll predictions to make multi-step predictions, feeding our
     prediction back to the dynamics model at each step. The dynamics
-    loss is a multi-step loss.
-* a nearest-neighbor loss, which attempts to force all LFP values to align near each other in latent space so the model can take advantage of similar dynamics across channels and space. The simplest way to do that is to force the latent states to be centered at 0; hence $L_2(\overline{z}, 0)$.
+    loss is a multi-step loss.  
+  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
+
+* a nearest-neighbor loss, which attempts to force all LFP values to align near each other in latent space so the model can take advantage of similar dynamics across channels and space. The simplest way to do that is to force the latent states to be centered at 0; hence:  
+  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
 
 The LSTM model takes inspiration from dynamical systems and control methods which learn latent state representations for optimal control. Since it leverages an autoencoder architecture, it can be compared to methods such as deep Koopman for control, but without the key linearity constraint. We chose the LSTM model for comparison since it is a more expressive model than LSSMs, and has previously been demonstrated for control. While LSSMs were previously demonstrated for modeling neural stimulation, our ODE-LSTM model goes further by allowing for nonlinearities.
