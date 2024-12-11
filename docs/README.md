@@ -9,9 +9,9 @@ While there are a wide variety of LSSMs, some simple versions were previously de
 
 <img src="https://github.com/user-attachments/assets/debae1b5-2622-4410-9c3f-73365ddb5e55" height="60"/>
 
-Here $x$ is a latent state, $u$ is the control input (e.g. stimulation parameters), and $y$ is the prediction. Forward prediction can be performed by specifying an initial latent state $x_0$ and autoregressing forward in time.
+Here x is a latent state, u is the control input (e.g. stimulation parameters), and y is the prediction. Forward prediction can be performed by specifying an initial latent state x<sub>0</sub> and autoregressing forward in time.
 
-We leverage this simple formulation by providing our stimulation descriptor as input. We estimate the initial state $x_0$ using the Moore-Penrose pseudoinverse of $C$ and the last value of the runway. We train the model explicitly using backpropagation to perform multisstep forecasting. We use the $L_2$ prediction loss to train the three matrices of parameters $A, B, C$.
+We leverage this simple formulation by providing our stimulation descriptor as input. We estimate the initial state x<sub>0</sub> using the Moore-Penrose pseudoinverse of C and the last value of the runway. We train the model explicitly using backpropagation to perform multisstep forecasting. We use the L<sub>2</sub> prediction loss to train the three matrices of parameters A, B, C.
 
 ### LSTM-based dynamical systems model (ODE-LSTM)
 We base this model on the more complex long short-term memory (LSTM) network, a nonlinear neural network for representing neural dynamics as a dynamical system with external inputs. The LSTM-based model uses an autoencoder architecture to lift the LFP data into a latent space, and
@@ -19,9 +19,9 @@ We base this model on the more complex long short-term memory (LSTM) network, a 
 
 The latent space may be higher or lower dimensionality than the number of LFP channels.
 In this demo case it is 96 dimensions - equal to the number of electrodes in the ECog array. We chose this dimensionality to ensure we were not
-losing critical information when transforming into the latent space, but note that a lower dimensionality may provide similar results without penalty due to the inherently low dimensional nature of neural data. As in TBFM, we leverage a stimulation descriptor, which we concatenate to the estimated latent state of the system $z$.
+losing critical information when transforming into the latent space, but note that a lower dimensionality may provide similar results without penalty due to the inherently low dimensional nature of neural data. As in TBFM, we leverage a stimulation descriptor, which we concatenate to the estimated latent state of the system z.
 The LSTM estimates a single step change in the system, which is summed
-into the latent state to make a single step prediction $z^+$. To make multi-step predictions the single step prediction is passed back into the dynamics model repeatedly. Thus: multi-step predictions are made using the first-order Euler integration method.
+into the latent state to make a single step prediction z<sup>+</sup>. To make multi-step predictions the single step prediction is passed back into the dynamics model repeatedly. Thus: multi-step predictions are made using the first-order Euler integration method.
 
 ![ode_lstm](https://github.com/user-attachments/assets/72ae40a2-96db-4ba0-a390-e7403265544d)
 
