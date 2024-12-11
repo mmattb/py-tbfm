@@ -15,7 +15,7 @@ Here $x$ is a latent state, $u$ is the control input (e.g. stimulation parameter
 
 We leverage this simple formulation by providing our stimulation descriptor as input. We estimate the initial state $x_0$ using the Moore-Penrose pseudoinverse of $C$ and the last value of the runway. We train the model explicitly using backpropagation to perform multisstep forecasting. We use the $L_2$ prediction loss to train the three matrices of parameters $A, B, C$.
 
-### LSTM-based dynamical systems model (ODE-LSTM}
+### LSTM-based dynamical systems model (ODE-LSTM)
 We base this model on the more complex long short-term memory (LSTM) network, a nonlinear neural network for representing neural dynamics as a dynamical system with external inputs. The LSTM-based model uses an autoencoder architecture to lift the LFP data into a latent space, and
  predicts the effect of stimulation using an estimated dynamical system defined in the latent space.  The model predicts the change in neural activity between time steps, and performs forward prediction through a simple first-order integration. 
 
