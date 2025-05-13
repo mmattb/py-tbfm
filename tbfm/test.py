@@ -6,14 +6,21 @@ import math
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import scipy.stats as ss
 import torch
 
 
-def generate_ou_moving_mean(mean, trial_len=200, batch_size=1000, kappa=0.5, sigma=0.5):
+def generate_ou_moving_mean(
+    mean, trial_len=200, batch_size=1000, kappa=0.5, sigma=0.5, x0_mean=None
+):
     _, dt = np.linspace(0, trial_len, trial_len, retstep=True)
 
-    X0 = np.random.normal(size=(batch_size,)) + mean[0].item()
+    if x0_mean is None:
+        X0 = np.random.normal(size=(batch_size,)) + mean[0].item()
+    else:
+        X0 = np.random.normal(size=(batch_size,), scale=0.2) + x0_mean
+
     X = np.zeros((trial_len, batch_size))
     X[0, :] = X0
     W = ss.norm.rvs(loc=0, scale=1, size=(trial_len - 1, batch_size))
@@ -46,13 +53,19 @@ def generate_ou_sinusoidal_moving_mean(
     # Measured in time steps
     phase_shift=0,
     sigma=0.5,
+    x0_mean=None,
 ):
     lspace = torch.linspace(0, trial_len, trial_len)
     mean = torch.sin(lspace * 2 * math.pi / wavelength + phase_shift)
 
     # Cool; now OU on top of that:
     X = generate_ou_moving_mean(
-        mean, trial_len=trial_len, batch_size=batch_size, kappa=kappa, sigma=sigma
+        mean,
+        trial_len=trial_len,
+        batch_size=batch_size,
+        kappa=kappa,
+        sigma=sigma,
+        x0_mean=x0_mean,
     )
 
     return X
@@ -104,6 +117,7 @@ def graph_state_dependency(
     title="Train",
     colormap=None,
     colormap_offset=0.0,
+    savepath=None,
 ):
     means, meanshat, minval, maxval = bin_state_percentiles(
         y, yhat, ch=ch, runway_length=runway_length, bin_count=bin_count
@@ -150,3 +164,6 @@ def graph_state_dependency(
     plt.yticks(fontsize=32)
     plt.xlabel("Time steps", fontsize=32)
     plt.tight_layout()
+
+    if savepath:
+        plt.savefig(savepath, dpi=150)
