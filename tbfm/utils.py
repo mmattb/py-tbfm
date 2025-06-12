@@ -1,7 +1,9 @@
 """
 Myriad reusable functions go here.
 """
+
 import torch
+
 
 def zscore(data, mean, std):
     """
@@ -13,12 +15,13 @@ def zscore(data, mean, std):
     zscored = demeaned / std
     return zscored
 
+
 def fft_circular_shift_per_basis(bases, shift):
     """
     Args:
         bases: Tensor of shape (batch_size, num_bases, trial_len):
         shift: Tensor of shape (batch_size, in_dim, num_bases).
-    
+
     Returns:
         shifted_bases: Tensor of shape (batch_size, in_dim, num_bases, trial_len):
             circularly shifted vectors
@@ -37,7 +40,9 @@ def fft_circular_shift_per_basis(bases, shift):
     freqs = torch.fft.fftfreq(trial_len, device=bases.device)  # shape (trial_len,)
 
     # Forward FFT over last dim
-    spectrum = torch.fft.fft(bases, dim=-1)  # shape (batch_size, in_dim, num_bases, trial_len)
+    spectrum = torch.fft.fft(
+        bases, dim=-1
+    )  # shape (batch_size, in_dim, num_bases, trial_len)
 
     # Phase shift: shape (batch_size, in_dim, num_bases, trial_len)
     phase = torch.exp(-2j * torch.pi * freqs.view(1, 1, 1, -1) * shift[..., None])
@@ -46,11 +51,14 @@ def fft_circular_shift_per_basis(bases, shift):
     shifted_spectrum = spectrum * phase
 
     # Inverse FFT
-    shifted = torch.fft.ifft(shifted_spectrum, dim=-1).real  # (batch_size, in_dim, num_bases, trial_len)
+    shifted = torch.fft.ifft(
+        shifted_spectrum, dim=-1
+    ).real  # (batch_size, in_dim, num_bases, trial_len)
 
     return shifted
 
-def spectrum_shift_ifft(spectrum, shift, L):
+
+def spectrum_shift_ifft(spectrum, shift, L, preserve_hermitian=True):
     """
     Applies a differentiable circular (wrap-around) shift to each basis using
     the Fourier shift theorem. Assumes spectrum was produced by rfft.
@@ -68,7 +76,6 @@ def spectrum_shift_ifft(spectrum, shift, L):
     # (B, C, N, H)
     spectrum = spectrum.unsqueeze(1).expand(-1, num_ch, -1, -1).permute(0, 1, 3, 2)
 
-    B, C, N, H = spectrum.shape
     device = spectrum.device
 
     # Get frequencies corresponding to rfft bins
@@ -78,13 +85,24 @@ def spectrum_shift_ifft(spectrum, shift, L):
     shift = shift.unsqueeze(-1)  # (B, C, N, 1)
     freqs = freqs.view(1, 1, 1, -1)  # (1, 1, 1, H)
 
-    # Compute complex exponential for phase shift
-    phase = torch.exp(-2j * torch.pi * shift * freqs)  # (B, C, N, H)
+    # Compute the phase shift
+    phase = torch.exp(-2j * torch.pi * shift * freqs)
 
-    # Apply shift
-    shifted_spectrum = spectrum * phase  # (B, C, N, H)
+    if preserve_hermitian:
+        # Ensure conjugate symmetry is preserved
+        shifted_spectrum = spectrum * phase
 
-    # Inverse FFT to get real-valued time signal
+        # Force DC component to be real
+        shifted_spectrum[..., 0] = shifted_spectrum[..., 0].real
+
+        # For even-length signals, Nyquist frequency should be real
+        if L % 2 == 0:
+            shifted_spectrum[..., -1] = shifted_spectrum[..., -1].real
+    else:
+        shifted_spectrum = spectrum * phase
+
+    # Inverse FFT to get real-valued time signal. IRFFT automatically
+    # handles the Hermitian symmetry for real-valued output.
     shifted_bases = torch.fft.irfft(shifted_spectrum, n=L, dim=-1)  # (B, C, N, L)
 
     return shifted_bases

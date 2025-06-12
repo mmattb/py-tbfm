@@ -102,13 +102,26 @@ class FourierBases(nn.Module):
     def forward(self, stiminds):
         """
         stiminds: tensor([batch_size, trial_len, stimdim])
+        Returns spectrum with Hermitian symmetry to ensure real-valued output.
         """
         batch_size = stiminds.shape[0]
         # stiminds: (batch, time, stimdim)
         stiminds = stiminds.flatten(start_dim=1)
         # stiminds: (batch, time*stimdim)
         out = self._inner(stiminds)  # (batch_size, num_freqs * num_bases * 2)
-        out = out.view(batch_size, -1, self.num_freqs, 2)  # (batch_size, num_bases, num_freqs, 2)
-        spectrum = torch.complex(out[..., 0], out[..., 1])  # (batch_size, num_bases, num_freqs)
-        # (batch_size, num_freqs, num_bases)
+        out = out.view(
+            batch_size, -1, self.num_freqs, 2
+        )  # (batch_size, num_bases, num_freqs, 2)
+        spectrum = torch.complex(
+            out[..., 0], out[..., 1]
+        )  # (batch_size, num_bases, num_freqs)
+
+        # Force DC component (0 freq) to be real
+        spectrum[..., 0] = spectrum[..., 0].real
+
+        # For even-length signals, Nyquist frequency should be real
+        if self.trial_len % 2 == 0:
+            spectrum[..., -1] = spectrum[..., -1].real
+
+        # Return with shape (batch_size, num_freqs, num_bases)
         return spectrum.permute(0, 2, 1)
