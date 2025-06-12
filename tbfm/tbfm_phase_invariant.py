@@ -5,7 +5,7 @@ PyTorch implementation of the phase invariant temporal basis function model.
 import torch
 from torch import nn
 
-from .bases import Bases
+from .bases import FourierBases
 from . import utils
 
 
@@ -46,6 +46,7 @@ class TBFMPi(nn.Module):
         self.in_dim = in_dim
         self.device = device
         self.prev_bases = None
+        self.trial_len = trial_len
 
         self.should_zscore = zscore
         if zscore:
@@ -57,7 +58,7 @@ class TBFMPi(nn.Module):
         # 2 blocks: weights | phases.
         self.basis_weights_and_phases = nn.Linear(runway * in_dim, 2 * num_bases * in_dim).to(device)
 
-        self.bases = Bases(
+        self.bases = FourierBases(
             stimdim,
             num_bases,
             trial_len,
@@ -133,7 +134,7 @@ class TBFMPi(nn.Module):
         x0 = runway[:, -1:, :]
 
 
-        # bases: (all batch, time, num_bases)
+        # bases: (batch, time, num_bases)
         # basis_weights: (batch, in_dim * num_bases * 2)
         basis_weights_and_phases = self.basis_weights_and_phases(runway.flatten(start_dim=1))
         num_weights = self.in_dim * self.num_bases
@@ -146,18 +147,20 @@ class TBFMPi(nn.Module):
         # basis_phases: (batch, in_dim, num_bases)
         basis_phases = basis_phases.unflatten(1, (self.in_dim, self.num_bases))
 
-        # bases: (all batch, time, num_bases)
-        bases = self.bases(stiminds)
-        self.prev_bases = bases
-        # bases: (all batch, num_bases, time)
-        bases = bases.permute(0, 2, 1)
-        # (all batch, in_dim, num_bases, time)
-        bases = utils.fft_circular_shift_per_basis(bases, basis_phases)
+        # fourier_bases: (batch, num_freq, num_bases)
+        fourier_bases = self.bases(stiminds)
+        self.prev_bases = fourier_bases
 
-        # preds: (batch, time (after runway), in_dim)
-        preds = (basis_weights @ bases).permute(0, 2, 1)
-        preds = preds + x0
+        # (batch, in_dim, num_bases, time)
+        bases = utils.spectrum_shift_ifft(fourier_bases, basis_phases, self.trial_len)
 
+        # Multiply basis weights with bases and sum to get predictions.
+        # bases: (batch, in_dim, num_bases, time)
+        # basis_weights: (batch, in_dim, num_bases)
+        # Output shape: (batch, in_dim, time)
+        preds = (basis_weights.unsqueeze(2) * bases).sum(dim=1)
+
+        preds = preds.permute(0, 2, 1) + x0
         return preds
 
 
