@@ -25,6 +25,7 @@ class TBFM(nn.Module):
         latent_dim=20,
         basis_depth=2,
         zscore=True,
+        normalizer=None,
         device=None,
     ):
         """
@@ -47,9 +48,13 @@ class TBFM(nn.Module):
         self.device = device
         self.prev_bases = None
 
-        self.should_zscore = zscore
+        self.should_normalize = zscore or normalizer is not None
         if zscore:
-            self.set_z_params(batchy)
+            self.normalizer = utils.ScalerZscore()
+            self.normalizer.fit(batchy)
+        elif normalizer is not None:
+            self.normalizer = normalizer()
+            self.normalizer.fit(batchy)
 
         # One set of basis weights for each channel.
         self.basis_weighting = nn.Linear(runway * in_dim, num_bases * in_dim).to(device)
@@ -62,20 +67,6 @@ class TBFM(nn.Module):
             basis_depth=basis_depth,
             device=device,
         )
-
-    def set_z_params(self, batch):
-        """
-        Call to set/reset means and stdevs used for z scoring.
-        """
-        if not self.should_zscore:
-            raise RuntimeError("We cannot adapt Zscoring if we aren't Zscoring!")
-
-        # batchy: (batch, time, channel)
-        # We are Z scoring with channels. So:
-        flat = batch.flatten(end_dim=1)
-        self.mean = torch.mean(flat, axis=0).unsqueeze(0).to(self.device)
-        self.std = torch.std(flat, axis=0).unsqueeze(0).to(self.device)
-        assert self.mean.shape == self.std.shape == (1, batch.shape[-1])
 
     def get_optim(self, lr=1e-4):
         """
@@ -109,7 +100,15 @@ class TBFM(nn.Module):
         Args:
             data: tensor([batch_size, trial_len, in_dim])
         """
-        return utils.zscore(data, self.mean, self.std)
+        normalizer = self.normalizer
+        if not isinstance(normalizer, utils.ScalerZscore):
+            raise TypeError(
+                f"Requested Z-score normalization but normalizer is set to {type(normalizer)}"
+            )
+        return normalizer(data)
+
+    def normalize(self, data):
+        return self.normalizer(data)
 
     def forward(self, runway, stiminds):
         """
@@ -119,8 +118,8 @@ class TBFM(nn.Module):
         Returns:
             y_hat [tensor]: (batch_size, trial_len, in_dim)
         """
-        if self.should_zscore:
-            runway = self.zscore(runway)
+        if self.should_normalize:
+            runway = self.normalize(runway)
 
         # runway: (batch, time (runway), in_dim)
         # stiminds: (batch, time (after runway), stimdim)
@@ -158,8 +157,7 @@ class TBFMCompiled(nn.Module):
         super().__init__()
         self.device = tbfm.device
         self.bases = tbfm.bases(stiminds)
-        self.mean = tbfm.mean
-        self.std = tbfm.std
+        self.normalizer = tbfm.normalizer
         self.basis_weighting = tbfm.basis_weighting
         self.in_dim = tbfm.in_dim
         self.num_bases = tbfm.num_bases
@@ -171,7 +169,15 @@ class TBFMCompiled(nn.Module):
         Args:
             data: tensor([batch_size, trial_len, in_dim])
         """
-        return utils.zscore(data, self.mean, self.std)
+        normalizer = self.normalizer
+        if not isinstance(normalizer, utils.ScalerZscore):
+            raise TypeError(
+                f"Requested Z-score normalization but normalizer is set to {type(normalizer)}"
+            )
+        return normalizer(data)
+
+    def normalize(self, data):
+        return self.normalizer(data)
 
     def forward(self, runway):
         """
