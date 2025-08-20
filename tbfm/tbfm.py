@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from .bases import Bases
+from . import normalizer
 from . import utils
 
 
@@ -25,8 +26,6 @@ class TBFM(nn.Module):
         latent_dim=20,
         basis_depth=2,
         zscore=True,
-        normalizer=None,
-        ae=None,
         device=None,
     ):
         """
@@ -39,9 +38,6 @@ class TBFM(nn.Module):
         latent_dim [int]: width of hidden layers
         basis_depth [int]: number of hidden layers
         zscore [bool]: True if we should z score x values as they arrive, False otherwise
-        ae [nn.Module]: an optional autoencoder with encode() and decode() methods.
-                        When present, the TBFM lives in the latent space. We assume in that
-                        case that in_dim is equal to the encoder's latent dimension.
         device []: something tensor.to() would accept
         """
         super().__init__()
@@ -51,18 +47,12 @@ class TBFM(nn.Module):
         self.in_dim = in_dim
         self.device = device
         self.prev_bases = None
-        self.ae = ae
 
-        self.should_normalize = zscore or normalizer is not None
         if zscore:
-            self.normalizer = utils.ScalerZscore()
+            self.normalizer = normalizer.ScalerZscore()
             self.normalizer.fit(batchy)
-        elif normalizer is not None:
-            if type(normalizer) is type:
-                self.normalizer = normalizer()
-                self.normalizer.fit(batchy)
-            else:
-                self.normalizer = normalizer
+        else:
+            self.normalizer = None
 
         # One set of basis weights for each channel.
         self.basis_weighting = nn.Linear(runway * in_dim, num_bases * in_dim).to(device)
@@ -76,15 +66,13 @@ class TBFM(nn.Module):
             device=device,
         )
 
-    def get_optim(self, lr=1e-4, include_ae=False):
+    def get_optim(self, lr=1e-4):
         """
         Get a PyTorch optimizer for training this model.
         Args:
             lr [float]: learning rate
         """
         ml = [self.basis_weighting, self.bases]
-        if include_ae:
-            ml.append(self.ae)
         ml = nn.ModuleList(ml)
         return torch.optim.AdamW(ml.parameters(), lr=lr)
 
@@ -112,23 +100,15 @@ class TBFM(nn.Module):
             data: tensor([batch_size, trial_len, in_dim])
         """
         normalizer = self.normalizer
-        if not isinstance(normalizer, utils.ScalerZscore):
+        if not isinstance(normalizer, normalizer.ScalerZscore):
             raise TypeError(
                 f"Requested Z-score normalization but normalizer is set to {type(normalizer)}"
             )
         return normalizer(data)
 
     def normalize(self, data):
-        return self.normalizer(data)
-
-    def encode(self, data):
-        if self.ae is not None:
-            return self.ae.encode(data)
-        return data
-
-    def decode(self, data):
-        if self.ae is not None:
-            return self.ae.decode(data)
+        if self.normalizer:
+            data = self.normalizer(data)
         return data
 
     def forward(self, runway, stiminds):
@@ -139,9 +119,7 @@ class TBFM(nn.Module):
         Returns:
             y_hat [tensor]: (batch_size, trial_len, in_dim)
         """
-        if self.should_normalize:
-            runway = self.normalize(runway)
-        runway = self.encode(runway)
+        runway = self.normalize(runway)
 
         # runway: (batch, time (runway), in_dim)
         # stiminds: (batch, time (after runway), stimdim)
@@ -162,8 +140,6 @@ class TBFM(nn.Module):
         # preds: (batch, time (after runway), in_dim)
         preds = preds + x0
 
-        preds = self.decode(preds)
-
         return preds
 
 
@@ -182,7 +158,6 @@ class TBFMCompiled(nn.Module):
         self.device = tbfm.device
         self.bases = tbfm.bases(stiminds)
         self.normalizer = tbfm.normalizer
-        self.ae = tbfm.ae
         self.basis_weighting = tbfm.basis_weighting
         self.in_dim = tbfm.in_dim
         self.num_bases = tbfm.num_bases
@@ -202,16 +177,8 @@ class TBFMCompiled(nn.Module):
         return normalizer(data)
 
     def normalize(self, data):
-        return self.normalizer(data)
-
-    def encode(self, data):
-        if self.ae is not None:
-            return self.ae.encode(data)
-        return data
-
-    def decode(self, data):
-        if self.ae is not None:
-            return self.ae.decode(data)
+        if self.normalizer:
+            data = self.normalizer(data)
         return data
 
     def forward(self, runway):
@@ -221,8 +188,7 @@ class TBFMCompiled(nn.Module):
         Returns:
             y_hat [tensor]: (batch_size, trial_len, in_dim)
         """
-        runway = self.zscore(runway)
-        runway = self.encode(runway)
+        runway = self.normalize(runway)
 
         # runway: (batch, time (runway), in_dim)
         x0 = runway[:, -1:, :]
@@ -236,7 +202,5 @@ class TBFMCompiled(nn.Module):
         # preds: (batch, time (after runway), in_dim)
         preds = (basis_weights @ self.bases.permute(0, 2, 1)).permute(0, 2, 1)
         preds = preds + x0
-
-        preds = self.decode(preds)
 
         return preds
