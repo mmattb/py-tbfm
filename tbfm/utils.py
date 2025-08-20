@@ -53,7 +53,7 @@ class ScalerZscore(nn.Module):
     def __init__(self):
         super().__init__()
         self.register_buffer("mean", None)
-        self.register_buffer("var", None)
+        self.register_buffer("std", None)
 
     @torch.no_grad()
     def fit(self, x: torch.Tensor):
@@ -65,12 +65,12 @@ class ScalerZscore(nn.Module):
         self.std = torch.std(flat, axis=0).unsqueeze(0).to(x.device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.mean is None or self.var is None:
+        if self.mean is None or self.std is None:
             raise RuntimeError("Call fit() before forward().")
         return zscore(x, self.mean, self.std)
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        if self.mean is None or self.var is None:
+        if self.mean is None or self.std is None:
             raise RuntimeError("Call fit() before forward().")
         return zscore_inv(y, self.mean, self.std)
 
