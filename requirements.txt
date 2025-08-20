@@ -2,3 +2,4 @@ torch
 scipy
 numpy
 matplotlib
+hydra-core

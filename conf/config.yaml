@@ -1,0 +1,23 @@
+defaults:
+  - _self_  # Goes first to override sub-configs
+  - normalizer: default
+  - ae: default
+  - tbfm: default
+
+# General settings
+name: tbfm_experiment
+debug: false
+
+# TBFM lives in this space by default
+latent_dim: 30
+
+data:
+  trial_len: 184
+
+training:
+  epochs: 10000
+  train_set_size: 5000
+  test_set_size: 5000      # We may need both because of session structure
+
+# Device settings
+device: auto  # auto, cpu, cuda

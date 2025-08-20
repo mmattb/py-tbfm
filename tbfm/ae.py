@@ -6,12 +6,12 @@ from typing import Optional, Union
 class LinearChannelAE(nn.Module):
     """
     Linear channel autoencoder with tied weights for variable-channel sessions.
-    - Global encoder weight: w_enc in R[latent_dim, num_chan_max]
+    - Global encoder weight: w_enc in R[latent_dim, in_dim]
     - Decoder tied as w_dec = w_enc.T
     - For a session with present channels given by mask or indices, we select columns/rows.
 
     Args:
-        num_chan_max: maximum number of channels across sessions
+        in_dim: maximum number of channels across sessions
         latent_dim: latent width (e.g., 16–64)
         use_bias: if True, learn encoder bias (decoder bias tied to zero by default)
         use_lora: enable rank-1 LoRA on the selected session encoder matrix (lightweight)
@@ -19,21 +19,21 @@ class LinearChannelAE(nn.Module):
 
     def __init__(
         self,
-        num_chan_max: int,
+        in_dim: int,
         latent_dim: int,
         use_bias: bool = True,
         use_lora: bool = False,
         device=None,
     ):
         super().__init__()
-        self.num_chan_max = num_chan_max
+        self.in_dim = in_dim
         self.latent_dim = latent_dim
         self.use_bias = use_bias
         self.use_lora = use_lora
         self.device = device
 
         # Encoder weight (global). Kaiming uniform works fine here.
-        self.w_enc = nn.Parameter(torch.empty(latent_dim, num_chan_max).to(device))
+        self.w_enc = nn.Parameter(torch.empty(latent_dim, in_dim).to(device))
         nn.init.kaiming_uniform_(self.w_enc, a=5**0.5)
 
         # Optional encoder bias (decoder remains tied = no extra bias by default)
@@ -47,9 +47,7 @@ class LinearChannelAE(nn.Module):
         # Rank-1 LoRA (global directions); per-session you’ll scale with a scalar alpha if you want
         if use_lora:
             self.a = nn.Parameter(torch.zeros(latent_dim).to(device))  # left direction
-            self.b = nn.Parameter(
-                torch.zeros(num_chan_max).to(device)
-            )  # right direction
+            self.b = nn.Parameter(torch.zeros(in_dim).to(device))  # right direction
             # init tiny so base dominates
             nn.init.normal_(self.a, std=1e-3)
             nn.init.normal_(self.b, std=1e-3)
@@ -117,7 +115,7 @@ class LinearChannelAE(nn.Module):
 
     @staticmethod
     def _indices_from_mask(mask: torch.Tensor) -> torch.Tensor:
-        # mask: (num_chan_max,) bool → indices where True
+        # mask: (in_dim,) bool → indices where True
         if mask.dtype == torch.bool:
             return torch.nonzero(mask, as_tuple=False).squeeze(-1)
         elif mask.dtype in (torch.int32, torch.int64):
@@ -249,3 +247,30 @@ class LinearAEMaskedDispatcher(nn.Module):
 
     def forward(self, *args, **kwargs):
         return self.lae(*args, **kwargs)
+
+
+class AEDispatcher(nn.Module):
+    """
+    Thin wrapper around an AE which binds the mask and LoRA args.
+    """
+
+    def __init__(self, ae, masks, lora_alphas=None):
+        super().__init__()
+        self.ae = lae
+        self.masks = masks
+        self.lora_alphas = lora_alphas
+
+    def encode(self, x):
+        x = session_id, x
+        mask = self.masks[session_id]
+        lora_alpha = None if not self.lora_alphas else self.lora_alphas[session_id]
+        return self.ae.encode(x, mask, lora_alpha=lora_alpha)
+
+    def decode(self, z):
+        z = session_id, z
+        mask = self.masks[session_id]
+        lora_alpha = None if not self.lora_alphas else self.lora_alphas[session_id]
+        return self.ae.decode(z, mask, lora_alpha=lora_alpha)
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError()

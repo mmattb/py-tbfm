@@ -1,0 +1,18 @@
+# @package _global_
+# TBFM (Temporal Basis Function Model) configuration
+
+tbfm:
+  _target_: tbfm.tbfm.TBFM
+  in_dim: ${latent_dim}  # By default TBFM lives in a latent space.
+  stimdim: 1
+  runway: 20
+  num_bases: 15
+  trial_len: ${data.trial_len}
+  latent_dim: 4
+  basis_depth: 4
+  zscore: false
+  
+  # Learning parameters
+  training:
+    lr: 1e-4
+    lambda_fro: 0.01
