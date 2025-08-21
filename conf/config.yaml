@@ -1,8 +1,8 @@
 defaults:
   - _self_  # Goes first to override sub-configs
+  - tbfm: default
   - normalizer: default
   - ae: default
-  - tbfm: default
 
 # General settings
 name: tbfm_experiment

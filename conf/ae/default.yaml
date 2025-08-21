@@ -1,3 +1,4 @@
+# @package _global_
 # Autoencoder configuration
 
 ae:
@@ -6,11 +7,11 @@ ae:
     latent_dim: ${latent_dim}
     in_dim: 96
     warm_start: true
-
+  
   sharing:
     is_shared: false
     lora_dim: 1
-
+  
   training:
     loss_function: mse
     coadapt: true
