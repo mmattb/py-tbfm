@@ -2,12 +2,16 @@
 PyTorch implementation of the temporal basis function model.
 """
 
+import inspect
+
+import hydra.utils
 import torch
 from torch import nn
 
 from .bases import Bases
-from . import normalizer
+from . import normalizers
 from . import utils
+from .utils import SessionDispatcher
 
 
 class TBFM(nn.Module):
@@ -24,8 +28,12 @@ class TBFM(nn.Module):
         trial_len,
         batchy,
         latent_dim=20,
+        covariate_dim=None,
         basis_depth=2,
         zscore=True,
+        use_film_bases: bool = False,
+        embed_dim_rest: int | None = None,
+        embed_dim_stim: int | None = None,
         device=None,
     ):
         """
@@ -43,26 +51,29 @@ class TBFM(nn.Module):
         super().__init__()
 
         self.num_bases = num_bases
-        self.stimdim = stimdim
+        self.stimdim = stimdim or covariate_dim
         self.in_dim = in_dim
         self.device = device
         self.prev_bases = None
+        self.use_film_bases = use_film_bases
 
         if zscore:
-            self.normalizer = normalizer.ScalerZscore()
+            self.normalizer = normalizers.ScalerZscore()
             self.normalizer.fit(batchy)
         else:
             self.normalizer = None
 
         # One set of basis weights for each channel.
         self.basis_weighting = nn.Linear(runway * in_dim, num_bases * in_dim).to(device)
-
         self.bases = Bases(
-            stimdim,
+            self.stimdim,
             num_bases,
             trial_len,
             latent_dim=latent_dim,
             basis_depth=basis_depth,
+            use_film=use_film_bases,
+            embed_dim_rest=embed_dim_rest,
+            embed_dim_stim=embed_dim_stim,
             device=device,
         )
 
@@ -90,6 +101,8 @@ class TBFM(nn.Module):
         Return a compiled version of this TBFM.
         The compiled version operates the same but can no longer be trained.
         """
+        if self.use_film_bases:
+            raise NotImplementedError()
         return TBFMCompiled(self, stiminds)
 
     def zscore(self, data):
@@ -100,7 +113,7 @@ class TBFM(nn.Module):
             data: tensor([batch_size, trial_len, in_dim])
         """
         normalizer = self.normalizer
-        if not isinstance(normalizer, normalizer.ScalerZscore):
+        if not isinstance(normalizer, normalizers.ScalerZscore):
             raise TypeError(
                 f"Requested Z-score normalization but normalizer is set to {type(normalizer)}"
             )
@@ -111,7 +124,13 @@ class TBFM(nn.Module):
             data = self.normalizer(data)
         return data
 
-    def forward(self, runway, stiminds):
+    def forward(
+        self,
+        runway,
+        stiminds,
+        embedding_rest: torch.Tensor | None = None,
+        embedding_stim: torch.Tensor | None = None,
+    ):
         """
         Args:
             runway [tensor]: (batch_size, runway length, in_dim)
@@ -126,7 +145,9 @@ class TBFM(nn.Module):
         x0 = runway[:, -1:, :]
 
         # bases: (all batch, time, num_bases)
-        bases = self.bases(stiminds)
+        bases = self.bases(
+            stiminds, embedding_rest=embedding_rest, embedding_stim=embedding_stim
+        )
         self.prev_bases = bases
 
         # basis_weights: (batch, in_dim * num_bases)
@@ -170,7 +191,7 @@ class TBFMCompiled(nn.Module):
             data: tensor([batch_size, trial_len, in_dim])
         """
         normalizer = self.normalizer
-        if not isinstance(normalizer, utils.ScalerZscore):
+        if not isinstance(normalizer, normalizers.ScalerZscore):
             raise TypeError(
                 f"Requested Z-score normalization but normalizer is set to {type(normalizer)}"
             )
@@ -204,3 +225,77 @@ class TBFMCompiled(nn.Module):
         preds = preds + x0
 
         return preds
+
+
+class SessionDispatcherTBFM(SessionDispatcher):
+    DISPATCH_METHODS = [
+        "zscore",
+        "normalize",
+    ]
+
+    @property
+    def single(self):
+        fk = list(self.instances.keys())[0]
+        return self.instances[fk]
+
+    @property
+    def bases(self):
+        return self.single.bases
+
+    def __call__(self, runways, covariates, embeddings_rest=None, embeddings_stim=None):
+        # module-style call override
+        y_hats = {}
+
+        ck = self.get_closed_kwargs("__call__")
+
+        for sid, runway in runways.items():
+            _covariates = covariates[sid]
+
+            instance = self.instances[sid]
+
+            if embeddings_rest:
+                embedding_rest = embeddings_rest[sid]
+            elif sid in ck and "embeddings_rest" in ck[sid]:
+                embedding_rest = ck[sid]["embeddings_rest"]
+            else:
+                embedding_rest = None
+
+            if embeddings_stim:
+                embedding_stim = embeddings_stim[sid]
+            elif sid in ck and "embeddings_stim" in ck[sid]:
+                embedding_stim = ck[sid]["embeddings_stim"]
+            else:
+                embedding_stim = None
+
+            y_hat = instance(
+                runway,
+                _covariates,
+                embedding_rest=embedding_rest,
+                embedding_stim=embedding_stim,
+            )
+            y_hats[sid] = y_hat
+        return y_hats
+
+    def register_embeds_film(self, embeddings_rest, embeddings_stim):
+        self.close_kwarg("__call__", "embeddings_rest", embeddings_rest)
+        self.close_kwarg("__call__", "embeddings_stim", embeddings_stim)
+
+
+def from_cfg(cfg, session_ids, shared=False, **kwargs):
+    instances = {}  # {session_id, instance}
+
+    if shared:
+        # stimdim=None triggers use of covariate_dim instead; this is a backwards compat thing
+        instance = hydra.utils.instantiate(
+            cfg.tbfm.module, stimdim=None, zscore=False, batchy=None, **kwargs
+        )
+        for session_id in session_ids:
+            instances[session_id] = instance
+    else:
+        # stimdim=None triggers use of covariate_dim instead; this is a backwards compat thing
+        for session_id in session_ids:
+            instance = hydra.utils.instantiate(
+                cfg.tbfm.module, stimdim=None, zscore=False, batchy=None, **kwargs
+            )
+            instances[session_id] = instance
+    return hydra.utils.instantiate(cfg.tbfm.dispatcher, instances)

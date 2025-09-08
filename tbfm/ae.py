@@ -1,6 +1,10 @@
+import inspect
+import hydra.utils
 import torch
 import torch.nn as nn
 from typing import Optional, Union
+
+from .utils import SessionDispatcher, rotate_session_from_batch
 
 
 class LinearChannelAE(nn.Module):
@@ -125,7 +129,7 @@ class LinearChannelAE(nn.Module):
 
     def session_mats(
         self,
-        mask_or_idx: Union[torch.Tensor, list],
+        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ):
         """
@@ -136,10 +140,10 @@ class LinearChannelAE(nn.Module):
             w_enc_s: (latent_dim, C_s)
             w_dec_s: (C_s, latent_dim)  (tied transpose)
         """
-        if isinstance(mask_or_idx, list):
-            idx = torch.tensor(mask_or_idx, device=self.w_enc.device, dtype=torch.long)
+        if isinstance(mask, list):
+            idx = torch.tensor(mask, device=self.w_enc.device, dtype=torch.long)
         else:
-            idx = self._indices_from_mask(mask_or_idx).to(self.w_enc.device)
+            idx = self._indices_from_mask(mask).to(self.w_enc.device)
 
         w_sel = self.w_enc[:, idx]  # (latent_dim, C_s); selected dims only
 
@@ -157,14 +161,14 @@ class LinearChannelAE(nn.Module):
     def encode(
         self,
         x: torch.Tensor,
-        mask_or_idx: Union[torch.Tensor, list],
+        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x: (..., C_s)
         returns h: (..., latent_dim)
         """
-        w_enc_s, _, _ = self.session_mats(mask_or_idx, lora_alpha)
+        w_enc_s, _, _ = self.session_mats(mask, lora_alpha)
         h = x @ w_enc_s.t()  # (..., C_s) @ (C_s, latent_dim) -> (..., latent_dim)
         if self.b_enc is not None:
             h = h + self.b_enc
@@ -173,26 +177,24 @@ class LinearChannelAE(nn.Module):
     def decode(
         self,
         h: torch.Tensor,
-        mask_or_idx: Union[torch.Tensor, list],
+        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         h: (..., latent_dim)
         returns x_hat: (..., C_s)
         """
-        _, w_dec_s, _ = self.session_mats(mask_or_idx, lora_alpha)
+        _, w_dec_s, _ = self.session_mats(mask, lora_alpha)
         x_hat = h @ w_dec_s.t()  # (..., latent_dim) @ (latent_dim, C_s) -> (..., C_s)
         return x_hat
 
     def reconstruct(
         self,
         x: torch.Tensor,
-        mask_or_idx: Union[torch.Tensor, list],
+        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.decode(
-            self.encode(x, mask_or_idx, lora_alpha), mask_or_idx, lora_alpha
-        )
+        return self.decode(self.encode(x, mask, lora_alpha), mask, lora_alpha)
 
     @staticmethod
     def orthogonality_penalty(w_enc_s: torch.Tensor) -> torch.Tensor:
@@ -205,6 +207,18 @@ class LinearChannelAE(nn.Module):
         G = R @ R.t()  # (latent_dim, latent_dim)
         I = torch.eye(G.size(0), device=G.device).to(self.device)
         return ((G - I) ** 2).sum()
+
+    def get_optim(
+        self, lr=1e-4, betas=(0.5, 0.99), eps=1e-8, weight_decay=0.0, amsgrad=True
+    ):
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=lr,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad,
+        )
 
     @staticmethod
     def reconstruction_loss(
@@ -228,49 +242,86 @@ class LinearChannelAE(nn.Module):
             return nn.functional.mse_loss(x_hat, x)
 
 
-class LinearAEMaskedDispatcher(nn.Module):
+class SessionDispatcherLinearAE(SessionDispatcher):
+    DISPATCH_METHODS = [
+        "encode",
+        "decode",
+        "pca_warm_start",
+        "reconstruct",
+        "session_mats",
+    ]
+
+    def register_closure(self, name, values):
+        for dm in SessionDispatcherLinearAE.DISPATCH_METHODS:
+            sig = inspect.signature(getattr(LinearChannelAE, dm))
+            if name in sig.parameters:
+                self.close_kwarg(dm, name, values)
+
+    def register_lora_alphas(self, lora_alphas: dict):
+        return self.register_closure("lora_alpha", lora_alphas)
+
+    def register_masks(self, masks: dict):
+        return self.register_closure("mask", masks)
+
+
+def dispatch_warm_start(aes, masks, data, device=None):
+    for session_id in data.keys():
+        if not isinstance(data, dict):
+            d = rotate_session_from_batch(data, session_id, device=device)
+        else:
+            d = data[session_id]
+        mask = masks[session_id]
+        x = torch.cat((d[0], d[2]), dim=1)  # 20, 164 -> 184
+        aes.instances[session_id].pca_warm_start(x, mask=mask)
+
+
+def make_masks(data, device=None):
+    masks = {}
+
+    for session_id in data.session_ids:
+        masks[session_id] = torch.arange(data.get_session_num_feats(session_id)).to(
+            device
+        )
+    return masks
+
+
+def from_cfg_single(cfg, in_dim, device=None, **kwargs):
+    ae = hydra.utils.instantiate(cfg.ae.module, in_dim=in_dim, device=device, **kwargs)
+    return ae
+
+
+def from_cfg_and_in_dims(cfg, in_dims: dict, shared=False, device=None, **kwargs):
     """
-    Thin wrapper around LinearAE which binds the mask arguments statically.
+    in_dims: {session_id: in_dim}
     """
+    instances = {}  # {session_id, instance}
 
-    def __init__(self, lae, mask, lora_alpha=None):
-        super().__init__()
-        self.lae = lae
-        self.mask = mask
-        self.lora_alpha = lora_alpha
-
-    def encode(self, x):
-        return self.lae.encode(x, self.mask, lora_alpha=self.lora_alpha)
-
-    def decode(self, z):
-        return self.lae.decode(z, self.mask, lora_alpha=self.lora_alpha)
-
-    def forward(self, *args, **kwargs):
-        return self.lae(*args, **kwargs)
+    if shared:
+        in_dim = max(in_dims.values())
+        instance = from_cfg_single(cfg, in_dim, device=device, **kwargs)
+        for session_id, _in_dim in in_dims.items():
+            instances[session_id] = instance
+    else:
+        for session_id, in_dim in in_dims.items():
+            instance = from_cfg_single(cfg, in_dim, device=device, **kwargs)
+            instances[session_id] = instance
+    return hydra.utils.instantiate(cfg.ae.dispatcher, instances)
 
 
-class AEDispatcher(nn.Module):
+def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **kwargs):
     """
-    Thin wrapper around an AE which binds the mask and LoRA args.
+    datas: {session_id: data (batch, time, ch)}
     """
+    in_dims = {
+        session_id: data.get_session_num_feats(session_id)
+        for session_id in data.session_ids
+    }
 
-    def __init__(self, ae, masks, lora_alphas=None):
-        super().__init__()
-        self.ae = lae
-        self.masks = masks
-        self.lora_alphas = lora_alphas
+    aes = from_cfg_and_in_dims(cfg, in_dims, shared=shared, device=device, **kwargs)
+    masks = make_masks(data, device=device)
+    aes.register_masks(masks)
 
-    def encode(self, x):
-        x = session_id, x
-        mask = self.masks[session_id]
-        lora_alpha = None if not self.lora_alphas else self.lora_alphas[session_id]
-        return self.ae.encode(x, mask, lora_alpha=lora_alpha)
+    if warm_start:
+        dispatch_warm_start(aes, masks, data, device=device)
 
-    def decode(self, z):
-        z = session_id, z
-        mask = self.masks[session_id]
-        lora_alpha = None if not self.lora_alphas else self.lora_alphas[session_id]
-        return self.ae.decode(z, mask, lora_alpha=lora_alpha)
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError()
+    return aes

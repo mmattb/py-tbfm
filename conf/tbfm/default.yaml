@@ -2,17 +2,28 @@
 # TBFM (Temporal Basis Function Model) configuration
 
 tbfm:
-  _target_: tbfm.tbfm.TBFM
-  in_dim: ${latent_dim}  # By default TBFM lives in a latent space.
-  stimdim: 1
-  runway: 20
-  num_bases: 15
-  trial_len: ${data.trial_len}
-  latent_dim: 4
-  basis_depth: 4
-  zscore: false
-  
+  module:
+    _target_: tbfm.tbfm.TBFM
+    in_dim: ${latent_dim}  # By default TBFM lives in a latent space.
+    runway: ${data.runway}
+    num_bases: 15
+    trial_len: ${data.y_len}
+    latent_dim: 4
+    basis_depth: 4
+    covariate_dim: ${covariate_dim}
+    zscore: false
+    use_film_bases: true
+    embed_dim_rest: 3
+    embed_dim_stim: 29
+
+  sharing:
+    shared: true
+
+  dispatcher:
+    _target_: tbfm.tbfm.SessionDispatcherTBFM
+
   # Learning parameters
   training:
-    lr: 1e-4
+    optim:
+      lr: 2e-4
     lambda_fro: 0.01

@@ -1,7 +1,39 @@
+from hydra.utils import instantiate
 import torch
 from torch import nn
 
-from utils import zscore, zscore_inv, percentile_affine
+from .utils import (
+    zscore,
+    zscore_inv,
+    percentile_affine,
+    SessionDispatcher,
+    rotate_session_from_batch,
+)
+
+
+class SessionDispatcherScaler(SessionDispatcher):
+    DISPATCH_METHODS = ["fit", "forward", "inverse"]
+
+
+def from_cfg_single(cfg, data, device=None):
+    x = torch.cat((data[0], data[2]), dim=1)  # 20, 164 -> 184
+    normalizer = instantiate(cfg.normalizers.module)
+    normalizer.fit(x)
+    normalizer = normalizer.to(device)
+    return normalizer
+
+
+def from_cfg(cfg, data, device=None):
+    instances = {}  # {session_id, instance}
+
+    for session_id in data.keys():
+        if not isinstance(data, dict):
+            d = rotate_session_from_batch(data, session_id, device=device)
+        else:
+            d = data[session_id]
+        instance = from_cfg_single(cfg, d, device=device)
+        instances[session_id] = instance
+    return SessionDispatcherScaler(instances)
 
 
 class ScalerZscore(nn.Module):
@@ -68,6 +100,6 @@ class ScalerQuant(nn.Module):
         return (x + self.b) * self.a
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
-        if self.mean is None or self.var is None:
-            raise RuntimeError("Call fit() before forward().")
+        if self.a is None or self.b is None:
+            raise RuntimeError("Call fit() before inverse().")
         return y / self.a - self.b

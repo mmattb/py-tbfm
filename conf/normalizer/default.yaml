@@ -1,5 +1,0 @@
-# @package _global_
-# Normalizer configuration
-
-normalizer:
-  _target_: tbfm.normalizer.ScalerQuant
