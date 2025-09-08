@@ -26,4 +26,4 @@ tbfm:
   training:
     optim:
       lr: 2e-4
-    lambda_fro: 0.01
+    lambda_fro: 0.05
