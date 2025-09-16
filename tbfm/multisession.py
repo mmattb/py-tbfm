@@ -110,7 +110,7 @@ def train_from_cfg(
     embed_stim_weight_decay: float = None,
     regularizer_fn=None,  # callable(model, rest_embed, stim_embed) -> scalar penalty
     device: str = "cuda",
-    grad_clip: float = 1.0,
+    grad_clip: float | None = None,
 ):
     """
     One epoch over sessions with:
@@ -130,6 +130,7 @@ def train_from_cfg(
     embed_dim_rest = cfg.tbfm.module.embed_dim_rest
     inner_steps = inner_steps or cfg.film.training.inner_steps
     use_film = cfg.tbfm.module.use_film_bases
+    grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     device = model.device
 
     if inner_mode not in {"stopgrad", "maml"}:

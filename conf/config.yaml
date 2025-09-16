@@ -10,7 +10,7 @@ name: tbfm_experiment
 debug: false
 
 # TBFM lives in this space by default
-latent_dim: 30
+latent_dim: 50
 covariate_dim: 3
 
 data:
@@ -24,6 +24,7 @@ training:
   train_set_size: 5000
   test_set_size: 5000      # We may need both because of session structure
   num_held_out_sessions: 10
+  grad_clip: 10.0
 
 # Device settings
 device: auto  # auto, cpu, cuda

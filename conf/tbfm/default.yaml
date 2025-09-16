@@ -6,7 +6,7 @@ tbfm:
     _target_: tbfm.tbfm.TBFM
     in_dim: ${latent_dim}  # By default TBFM lives in a latent space.
     runway: ${data.runway}
-    num_bases: 15
+    num_bases: 20
     trial_len: ${data.y_len}
     latent_dim: 4
     basis_depth: 4
@@ -26,4 +26,4 @@ tbfm:
   training:
     optim:
       lr: 2e-4
-    lambda_fro: 0.05
+    lambda_fro: 0.01
