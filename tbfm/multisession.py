@@ -1,11 +1,13 @@
 # Okay; this is a bit complicated...
 # In general: some args will come in dictionaries {session_id, arg,...}, others will be bound by a closure.
+import math
 import random
 import os
 import sys
 
 import torch
 from torch import nn
+from torch.optim.lr_scheduler import LambdaLR
 from torcheval.metrics.functional import r2_score
 from typing import Dict, Tuple, List
 
@@ -24,6 +26,7 @@ def build_from_cfg(
     session_data,
     shared_ae=False,
     latent_dim=None,
+    base_model_path=None,
     device=None,
 ):
     latent_dim = cfg["latent_dim"]
@@ -47,17 +50,39 @@ def build_from_cfg(
         )
 
         # TBFM ------
-        print("Building TBFM...")
-        _tbfm = tbfm.from_cfg(
-            cfg,
-            tuple(session_data.keys()),
-            shared=cfg.tbfm.sharing.shared,
-            device=device,
-        )
+        if not base_model_path:
+            print("Building TBFM...")
+            _tbfm = tbfm.from_cfg(
+                cfg,
+                tuple(session_data.keys()),
+                shared=cfg.tbfm.sharing.shared,
+                device=device,
+            )
+        else:
+            print("Loading base TBFM from file...")
+            _tbfm = tbfm.shared_from_cfg_and_base(
+                cfg,
+                tuple(session_data.keys()),
+                base_model_path,
+                device=device,
+            )
 
         # Cleared for takeoff ------
         print("BOOM! Dino DNA!")
     return TBFMMultisession(norms, aes, _tbfm, device=device)
+
+
+def save_model(model, path, tbfm_only=True):
+    # We save only the TBFM for now, since that is how we are doing TTA
+    if not tbfm_only:
+        raise NotImplementedError()
+    else:
+        instances = set(model.model.instances.values())
+        if len(instances) != 1:
+            raise NotImplementedError()
+
+        model_tbfm = next(iter(instances))
+        torch.save(model_tbfm.state_dict(), path)
 
 
 def get_optims(cfg, model_ms: TBFMMultisession):
@@ -71,9 +96,32 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         optims_aes = tuple()
 
     # Will have only 1 elem if tbfm is shared.
-    optims_models = set(model_ms.model.get_optim(**cfg.tbfm.training.optim).values())
+    optims_model = model_ms.model.get_optim_custom_base(**cfg.tbfm.training.optim)
 
-    return utils.OptimCollection((optims_norms, optims_aes, optims_models))
+    warmup = 1500
+
+    # def warmup_cos(step):
+    #    if step < warmup:
+    #        return (step + 1) / max(1, warmup)
+    #    t = (step - warmup) / max(1, cfg.training.epochs - warmup)
+    #    return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+    def warmup_cos(step):
+        if step < warmup:
+            return 1.0
+        t = (step - warmup) / max(1, cfg.training.epochs - warmup)
+        return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+
+    bw_schedulers = []
+    for sid, optims in optims_model.items():
+        optim_bw, optim_bg, optim_film = optims
+        bw_scheduler = LambdaLR(optim_bw, lr_lambda=warmup_cos)
+        bw_schedulers.append(bw_scheduler)
+
+    optims_model = optims_model.values()
+
+    return utils.OptimCollection(
+        (optims_norms, optims_aes, optims_model), schedulers=(bw_schedulers,)
+    )
 
 
 # Training ------------------------------------------------------
@@ -131,6 +179,7 @@ def train_from_cfg(
     inner_steps = inner_steps or cfg.film.training.inner_steps
     use_film = cfg.tbfm.module.use_film_bases
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
+    epochs = epochs or cfg.training.epochs
     device = model.device
 
     if inner_mode not in {"stopgrad", "maml"}:
@@ -141,6 +190,7 @@ def train_from_cfg(
     iter_test = iter(data_test)
 
     train_losses = []
+    train_r2s = []
     test_losses = []
     test_r2s = []
     for eidx in range(epochs):
@@ -154,6 +204,7 @@ def train_from_cfg(
             _data_train,
             support_size=support_size,
         )
+        query = _data_train
 
         with torch.no_grad():
             y_query = {sid: d[2] for sid, d in query.items()}
@@ -192,26 +243,50 @@ def train_from_cfg(
         )
 
         losses = {}
+        r2_trains = []
         for sid, y in y_query.items():
             loss = nn.MSELoss()(yhat_query[sid], y)
             losses[sid] = loss
+
+            r2_train = r2_score(
+                yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1),
+                y.permute(0, 2, 1).flatten(end_dim=1),
+            )
+            r2_trains.append(r2_train.item())
         loss = sum(losses.values()) / len(y_query)
         train_losses.append(loss.item())
+        train_r2s.append(sum(r2_trains) / len(y_query))
 
         tbfm_regs = model.model.get_weighting_reg()
         loss += cfg.tbfm.training.lambda_fro * sum(tbfm_regs.values()) / len(y_query)
 
-        # TODO: other regularization etc. here down
-        # if regularizer_fn is not None:
-        #    loss += loss + regularizer_fn(
-        #        model, parts["rest_embed_query"], stim_embed_query
-        #    )
+        tbfm_regs_ortho = model.model.get_basis_rms_reg()
+        loss += (
+            cfg.tbfm.training.lambda_ortho
+            * sum(tbfm_regs_ortho.values())
+            / len(y_query)
+        )
 
         loss.backward()
 
         if grad_clip is not None:
             model_optims.clip_grad(value=grad_clip)
 
+        if eidx == 2999:
+            model.model.instances["MonkeyG_20150925_Session2_S1"].bases.be_loud()
+        if eidx == 3000:
+            print(
+                "after gc",
+                utils.log_grad_norms(
+                    model.model.instances["MonkeyG_20150925_Session2_S1"]
+                ),
+                utils.log_grad_norms(
+                    model.ae.instances["MonkeyG_20150925_Session2_S1"]
+                ),
+            )
+            import pdb
+
+            pdb.set_trace()
         model_optims.step()
 
         if data_test is not None and (eidx % test_interval) == 0:
@@ -249,25 +324,26 @@ def train_from_cfg(
                 loss = loss_outer / test_batch_count
                 test_losses.append((eidx, loss))
                 test_r2s.append((eidx, r2_test))
-                print("----", eidx, loss, r2_test)
+                print("----", eidx, train_losses[-1], loss, train_r2s[-1], r2_test)
 
     # ----- (optional) EMA of AE params -----
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
     # TODO: full train set
-    if inner_mode == "stopgrad":
-        embeddings_stim = film.inner_update_stopgrad(
-            model,
-            _data_train,
-            embeddings_rest,
-            inner_steps=1000,
-            lr=embed_stim_lr,
-            weight_decay=embed_stim_weight_decay,
-            # regularizer_fn=regularizer_fn,
-        )
-    else:
-        raise NotImplementedError()
+    if use_film:
+        if inner_mode == "stopgrad":
+            embeddings_stim = film.inner_update_stopgrad(
+                model,
+                _data_train,
+                embeddings_rest,
+                inner_steps=1000,
+                lr=embed_stim_lr,
+                weight_decay=embed_stim_weight_decay,
+                # regularizer_fn=regularizer_fn,
+            )
+        else:
+            raise NotImplementedError()
 
     model_optims.zero_grad(set_to_none=True)
     with torch.no_grad():
@@ -322,6 +398,92 @@ def train_from_cfg(
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    return embeddings_stim, results
+
+
+def test_time_adaptation(
+    cfg,
+    model,
+    embeddings_rest,
+    data_train,
+    epochs=1000,
+    data_test=None,
+    lr=None,
+    weight_decay=None,
+    grad_clip=None,
+) -> torch.Tensor:
+
+    model.train()
+
+    lr = lr or cfg.film.training.optim.lr
+    weight_decay = weight_decay or cfg.film.training.optim.weight_decay
+    grad_clip = grad_clip or cfg.training.grad_clip or 10.0
+    device = model.device
+
+    # We materialize the training data set under the presumption it is small and a single batch.
+    # TODO we should probably enforce that somehow.
+    _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
+
+    embeddings_stim = film.inner_update_stopgrad(
+        model,
+        data_train,
+        embeddings_rest,
+        inner_steps=epochs,
+        lr=lr,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        quiet=False,
+    )
+
+    if data_test:
+        with torch.no_grad():
+            model.eval()
+            loss_outer = 0
+            r2_outer = 0
+            test_batch_count = 0
+            final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
+            for test_batch in data_test:
+                test_batch = utils.move_batch(test_batch, device=device)
+                y_hat_test = model(
+                    test_batch,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim,
+                )
+
+                loss = 0
+                r2_test = 0
+                for session_id, d in test_batch.items():
+                    y_test = d[2]
+                    loss += nn.MSELoss()(y_hat_test[session_id], y_test)
+                    _r2_test = r2_score(
+                        y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
+                        y_test.permute(0, 2, 1).flatten(end_dim=1),
+                    )
+                    r2_test += _r2_test
+                    final_test_r2s[session_id] += _r2_test
+                loss /= len(test_batch)
+                r2_test /= len(test_batch)
+
+                r2_outer += r2_test.item()
+                loss_outer += loss.item()
+                test_batch_count += 1
+
+            r2_test = r2_outer / test_batch_count
+            loss = loss_outer / test_batch_count
+            final_test_r2s = {
+                session_id: r2 / test_batch_count
+                for session_id, r2 in final_test_r2s.items()
+            }
+    else:
+        r2_test = None
+        final_test_r2s = None
+        loss = None
+
+    results = {}
+    results["final_test_r2"] = r2_test
+    results["final_test_r2s"] = final_test_r2s
+    results["final_test_loss"] = loss
+    results["train_losses"] = train_losses
     return embeddings_stim, results
 
 

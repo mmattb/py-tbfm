@@ -48,12 +48,12 @@ class Bases(nn.Module):
 
         # Core MLP
         self.in_layer = nn.Linear(in_dim, latent_dim)
-        self.in_activation = nn.Tanh()
+        self.in_activation = nn.GELU()
 
         self.hiddens = nn.ModuleList()
         for _ in range(basis_depth):
             self.hiddens.append(nn.Linear(latent_dim, latent_dim))
-        self.hidden_activation = nn.Tanh()
+        self.hidden_activation = nn.GELU()
 
         self.out_layer = nn.Linear(latent_dim, trial_len * num_bases)
 
@@ -83,6 +83,7 @@ class Bases(nn.Module):
                 self.gate_rest_to_stim = None
 
             # FiLM head → (gamma | beta) for first hidden width
+            self.embed_norm = nn.LayerNorm(mod_width)
             self.film_head = nn.Sequential(
                 nn.Linear(mod_width, mod_width),
                 nn.GELU(),
@@ -93,6 +94,13 @@ class Bases(nn.Module):
             nn.init.zeros_(self.film_head[-1].bias)
 
         self.to(device)
+
+        self._last_hidden = None
+
+        self._be_loud = False
+
+    def be_loud(self):
+        self._be_loud = True
 
     def fuse_embeddings(
         self, embedding_rest: torch.Tensor, embedding_stim: torch.Tensor | None
@@ -129,6 +137,29 @@ class Bases(nn.Module):
         beta = gamma_beta[:, half:]
         return gamma.pow(2).mean() + beta.pow(2).mean()
 
+    def get_params(self):
+        # core MLP inside Bases (exclude FiLM pieces)
+        bases_core_params = []
+        bases_core_params += [
+            self.in_layer.parameters(),
+            self.out_layer.parameters(),
+        ]
+        for layer in self.hiddens:
+            bases_core_params.append(layer.parameters())
+
+        bases_film_params = []
+        if self.use_film:
+            bases_film_params += list(self.proj_rest.parameters())
+            if self.gate_rest_to_stim is not None:
+                bases_film_params += list(self.proj_stim.parameters())
+                bases_film_params += list(self.gate_rest_to_stim.parameters())
+            bases_film_params += list(self.film_head.parameters())
+
+            # LN on fused embedding
+            bases_film_params += list(self.embed_norm.parameters())
+
+        return bases_core_params, bases_film_params
+
     def forward(
         self,
         stiminds: torch.Tensor,  # (batch, trial_len, stimdim)
@@ -151,15 +182,26 @@ class Bases(nn.Module):
             fused_embed = self.fuse_embeddings(
                 embedding_rest, embedding_stim
             )  # (batch, mod_width)
-            gamma_beta = self.film_head(fused_embed)  # (batch, 2*width)
+            fused_embed = self.embed_norm(fused_embed)
+            gamma_beta = torch.tanh(self.film_head(fused_embed))  # (batch, 2*width)
             half = gamma_beta.size(-1) // 2
             gamma = gamma_beta[:, :half]
             beta = gamma_beta[:, half:]
+            if self._be_loud:
+                print("fh", self.film_head[0].weight)
+                print("fe", fused_embed[0])
+                print("gb:", gamma[0], beta[0])
+                print("h", hidden[0], ((1.0 + gamma) * hidden + beta)[0])
+            # import pdb
+
+            # pdb.set_trace()
             hidden = (1.0 + gamma) * hidden + beta
 
         # hidden stack (tanh as before)
         for layer in self.hiddens:
             hidden = self.hidden_activation(layer(hidden))
+
+        self.last_hidden = hidden
 
         # bases: (batch, time*num_bases)
         bases = self.out_layer(hidden)

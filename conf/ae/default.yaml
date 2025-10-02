@@ -8,6 +8,7 @@ ae:
     in_dim: 96
 
   should_warm_start: true
+  warm_start_is_identity: false
 
   dispatcher:
     _target_: tbfm.ae.SessionDispatcherLinearAE
@@ -19,7 +20,7 @@ ae:
   training:
     coadapt: true # If true, we will adapt in a supervised manner after PCA warm-up
     optim:
-      lr: 1e-4
+      lr: 1e-5
       eps: 1e-8
       weight_decay: 0.0
       amsgrad: true

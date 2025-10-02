@@ -25,7 +25,7 @@ class LinearChannelAE(nn.Module):
         self,
         in_dim: int,
         latent_dim: int,
-        use_bias: bool = True,
+        use_bias: bool = False,
         use_lora: bool = False,
         device=None,
     ):
@@ -116,6 +116,13 @@ class LinearChannelAE(nn.Module):
             # Orthonormalize rows via QR on transpose (columns orthonormal -> rows orthonormal after T)
             Q, _ = torch.linalg.qr(W_slice.t(), mode="reduced")  # [C_s, k]
             self.w_enc[:k, mask] = Q.t()  # [k, C_s]
+
+    def identity_warm_start(self):
+        with torch.no_grad():
+            d1, d2 = self.w_enc.shape
+            m_dim = max(d1, d2)
+            i = torch.eye(m_dim)
+            self.w_enc[:] = i[:d1, :d2]
 
     @staticmethod
     def _indices_from_mask(mask: torch.Tensor) -> torch.Tensor:
@@ -264,15 +271,19 @@ class SessionDispatcherLinearAE(SessionDispatcher):
         return self.register_closure("mask", masks)
 
 
-def dispatch_warm_start(aes, masks, data, device=None):
+def dispatch_warm_start(aes, masks, data, is_identity=False, device=None):
     for session_id in data.keys():
         if not isinstance(data, dict):
             d = rotate_session_from_batch(data, session_id, device=device)
         else:
             d = data[session_id]
-        mask = masks[session_id]
-        x = torch.cat((d[0], d[2]), dim=1)  # 20, 164 -> 184
-        aes.instances[session_id].pca_warm_start(x, mask=mask)
+
+        if is_identity:
+            aes.instances[session_id].identity_warm_start()
+        else:
+            mask = masks[session_id]
+            x = torch.cat((d[0], d[2]), dim=1)  # 20, 164 -> 184
+            aes.instances[session_id].pca_warm_start(x, mask=mask)
 
 
 def make_masks(data, device=None):
@@ -322,6 +333,8 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
     aes.register_masks(masks)
 
     if warm_start:
-        dispatch_warm_start(aes, masks, data, device=device)
+        dispatch_warm_start(
+            aes, masks, data, device=device, is_identity=cfg.ae.warm_start_is_identity
+        )
 
     return aes

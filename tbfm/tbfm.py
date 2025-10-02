@@ -55,6 +55,7 @@ class TBFM(nn.Module):
         self.in_dim = in_dim
         self.device = device
         self.prev_bases = None
+        self.prev_bases_weights = None
         self.use_film_bases = use_film_bases
 
         if zscore:
@@ -87,6 +88,37 @@ class TBFM(nn.Module):
         ml = nn.ModuleList(ml)
         return torch.optim.AdamW(ml.parameters(), lr=lr)
 
+    def get_optim_custom_base(
+        self,
+        lr_head: float = 1e-3,
+        lr_film: float = 3e-3,
+        wd_head: float = 1e-4,
+        wd_film: float = 1e-5,
+    ):
+        """
+        Returns two optimizers:
+          - optim_head: basis weighting + core Bases MLP (non-FiLM)
+          - optim_film: FiLM-specific params (proj_rest, proj_stim, gate, film_head)
+        """
+        optim_bw = torch.optim.AdamW(
+            self.basis_weighting.parameters(),
+            lr=1.5 * lr_head,
+            weight_decay=wd_head,
+        )
+        bases_core_params, bases_film_params = self.bases.get_params()
+
+        # flatten
+        bg_params = [p for group in bases_core_params for p in group]
+
+        optim_bg = torch.optim.AdamW(bg_params, lr=lr_head, weight_decay=wd_head)
+        optim_film = None
+        if bases_film_params:
+            optim_film = torch.optim.AdamW(
+                bases_film_params, lr=lr_film, weight_decay=wd_film
+            )
+
+        return optim_bw, optim_bg, optim_film
+
     def get_weighting_reg(self):
         """
         Returns the Frobenius norm of the basis weightings, used to regularize during training.
@@ -95,6 +127,35 @@ class TBFM(nn.Module):
         #  Seems okay.
         l = torch.linalg.norm(self.basis_weighting.weight, ord="fro")
         return l
+
+    def get_basis_rms_reg(self, eps: float = 1e-8) -> torch.Tensor:
+        """
+        Softly encourages bases to be orthonormal over the time axis.
+        eps : numerical stability.
+
+        Returns
+        -------
+        loss : scalar tensor
+        """
+        # diag_weight : weight for pushing per-basis RMS toward 1 (||b_k||_2 over time).
+        # offdiag_weight : weight for pushing cross-basis correlations toward 0.
+        diag_weight: float = 1.0
+        offdiag_weight: float = 1.0
+
+        B = self.prev_bases
+        bsz, T, K = B.shape
+
+        # Gram over time: G[b] = (B[b]^T @ B[b]) / T, shape (b, k, k)
+        G = torch.einsum("btk,btj->bkj", B, B) / (T + eps)
+
+        # Diagonal toward 1 (unit RMS), off-diagonals toward 0 (orthogonality)
+        diag = torch.diagonal(G, dim1=-2, dim2=-1)  # (b, k)
+        loss_diag = (diag - 1.0).pow(2).mean()
+
+        off = G - torch.diag_embed(diag)  # zero out diagonal
+        loss_off = (off.pow(2)).mean()
+
+        return diag_weight * loss_diag + offdiag_weight * loss_off
 
     def tbfm_compile(self, stiminds):
         """
@@ -154,6 +215,8 @@ class TBFM(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
+
+        self.prev_basis_weights = basis_weights
 
         # cpreds: (batch, time (after runway), in_dim)
         preds = (basis_weights @ bases.permute(0, 2, 1)).permute(0, 2, 1)
@@ -279,6 +342,23 @@ class SessionDispatcherTBFM(SessionDispatcher):
     def register_embeds_film(self, embeddings_rest, embeddings_stim):
         self.close_kwarg("__call__", "embeddings_rest", embeddings_rest)
         self.close_kwarg("__call__", "embeddings_stim", embeddings_stim)
+
+
+def shared_from_cfg_and_base(cfg, session_ids, base_path, **kwargs):
+    # stimdim=None triggers use of covariate_dim instead; this is a backwards compat thing
+    instance = hydra.utils.instantiate(
+        cfg.tbfm.module, stimdim=None, zscore=False, batchy=None, **kwargs
+    )
+
+    # Load base model weights.
+    # Note the base must have the same cfg - e.g. latent dim
+    instance.load_state_dict(torch.load(base_path, weights_only=True))
+    instance.eval()
+
+    instances = {}  # {session_id, instance}
+    for session_id in session_ids:
+        instances[session_id] = instance
+    return hydra.utils.instantiate(cfg.tbfm.dispatcher, instances)
 
 
 def from_cfg(cfg, session_ids, shared=False, **kwargs):

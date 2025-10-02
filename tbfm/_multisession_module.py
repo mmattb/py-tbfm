@@ -36,3 +36,6 @@ class TBFMMultisession(nn.Module):
         forecast_decoded = self.ae.decode(latent_forecast)
         y_hat = self.norms.inverse(forecast_decoded)
         return y_hat
+
+    def normalize(self, y):
+        return self.norms(y)

@@ -130,9 +130,10 @@ def flatten(xs):
 
 
 class OptimCollection:
-    def __init__(self, collection):
+    def __init__(self, collection, schedulers=()):
         c = flatten(collection)
         self.optims = tuple(c)
+        self.schedulers = tuple(flatten(schedulers))
 
     def dispatch(self, attr, **kwargs):
         for optim in self.optims:
@@ -142,7 +143,10 @@ class OptimCollection:
         return self.dispatch("zero_grad", **kwargs)
 
     def step(self, **kwargs):
-        return self.dispatch("step", **kwargs)
+        ret = self.dispatch("step", **kwargs)
+        for sched in self.schedulers:
+            sched.step()
+        return ret
 
     def clip_grad(self, value=1.0):
         for optim in self.optims:
@@ -224,3 +228,16 @@ def rotate_session_from_batch(data, session_id, device=None):
             d[idx].append(session_batch[idx])
     output = tuple(torch.cat(dd, dim=0).to(device) for dd in d)
     return output
+
+
+def log_grad_norms(model):
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            weight_norm = param.data.norm().item()
+            ratio = grad_norm / (weight_norm + 1e-8)  # avoid div by zero
+            print(
+                f"{name:30s} grad_norm={grad_norm:.4e}, "
+                f"weight_norm={weight_norm:.4e}, "
+                f"ratio={ratio:.4e}"
+            )

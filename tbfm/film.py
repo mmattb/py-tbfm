@@ -132,6 +132,8 @@ def inner_update_stopgrad(
     inner_steps: int = 100,
     lr: float = 5e-2,
     weight_decay: float = 1e-3,
+    grad_clip: int = 1.0,
+    quiet=True,
 ) -> torch.Tensor:
     """
     Optimize a per-episode stim_embed on SUPPORT ONLY.
@@ -156,7 +158,8 @@ def inner_update_stopgrad(
         ]
     )
 
-    for _ in range(inner_steps):
+    losses = []
+    for eidx in range(inner_steps):
         optimizer_inner.zero_grad()
 
         preds = model(
@@ -169,15 +172,22 @@ def inner_update_stopgrad(
             loss += nn.MSELoss()(preds[session_id], y)
         loss /= len(preds)
 
+        if (eidx % 100) == 0 and not quiet:
+            print(eidx, loss.item())
+            losses.append((eidx, loss.item()))
+
         # if regularizer_fn is not None:
         #    loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
         loss.backward()
-        optimizer_inner.clip_grad(1.0)
+        optimizer_inner.clip_grad(grad_clip)
         optimizer_inner.step()
 
-    return {
+    embeddings_stim = {
         session_id: es.detach() for session_id, es in embeddings_stim.items()
-    }  # stop gradient for the outer step
+    }
+    if quiet:
+        return embeddings_stim
+    return embeddings_stim, losses
 
 
 def inner_update_maml(

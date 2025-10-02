@@ -225,7 +225,7 @@ class SessionInMemoryDataset(Dataset):
                 return self._outer[bidx]
 
             def set_batch_iter(self, batch_size):
-                self._cur_idx = 0
+                self._cur_idx = self._start_idx
                 self._batch_size = batch_size
 
             @property
@@ -240,11 +240,11 @@ class SessionInMemoryDataset(Dataset):
                 return self
 
             def __next__(self):
-                if self._cur_idx >= len(self):
+                if self._cur_idx >= self._end_idx:
                     raise StopIteration()
 
                 start_idx = self._cur_idx
-                end_idx = min(len(self), start_idx + self._batch_size)
+                end_idx = min(self._end_idx, start_idx + self._batch_size)
                 runway = self._outer.x[start_idx:end_idx, : self.runway, :]
                 stim_ind = self._outer.stim_ind[start_idx:end_idx, self.runway :, :]
                 y = self._outer.x[start_idx:end_idx, self.runway :, :]
