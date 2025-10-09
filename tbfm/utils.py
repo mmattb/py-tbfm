@@ -130,31 +130,106 @@ def flatten(xs):
 
 
 class OptimCollection:
-    def __init__(self, collection, schedulers=()):
-        c = flatten(collection)
-        self.optims = tuple(_c for _c in c if _c is not None)
-        self.schedulers = tuple(flatten(schedulers))
+    """
+    Collection of named optimizer groups with associated schedulers.
+    
+    Usage:
+        groups = {
+            "bw": {"optimizers": [optim_bw], "schedulers": [sched_bw]},
+            "bg": {"optimizers": [optim_bg], "schedulers": [sched_bg]},
+            "film": {"optimizers": [optim_film]},
+            "ae": {"optimizers": [optim_ae1, optim_ae2]},
+        }
+        optim_collection = OptimCollection(groups)
+        
+        # Update all groups
+        optim_collection.step()
+        
+        # Update only specific groups
+        optim_collection.step(only=["bw", "film"])
+        
+        # Update all except specific groups
+        optim_collection.step(skip=["bg"])
+    """
+    
+    def __init__(self, groups: dict):
+        """
+        Args:
+            groups: dict {group_name: {"optimizers": [...], "schedulers": [...]}}
+                   "schedulers" is optional and defaults to empty list
+        """
+        self.groups = {}
+        
+        for name, group_data in groups.items():
+            optims = group_data.get("optimizers", [])
+            scheds = group_data.get("schedulers", [])
+            
+            # Ensure lists, filter None
+            optims = [o for o in optims if o is not None]
+            scheds = [s for s in scheds if s is not None]
+            
+            self.groups[name] = {
+                "optimizers": optims,
+                "schedulers": scheds,
+            }
 
-    def dispatch(self, attr, **kwargs):
-        for optim in self.optims:
-            getattr(optim, attr)(**kwargs)
+    def zero_grad(self, only=None, skip=None, **kwargs):
+        """
+        Zero gradients for specified optimizer groups.
+        
+        Args:
+            only: list of group names (if None, use all groups)
+            skip: list of group names to skip (ignored if only is set)
+            **kwargs: passed to optimizer.zero_grad()
+        """
+        for name in self._resolve_groups(only, skip):
+            for optim in self.groups[name]["optimizers"]:
+                optim.zero_grad(**kwargs)
 
-    def zero_grad(self, **kwargs):
-        return self.dispatch("zero_grad", **kwargs)
-
-    def step(self, **kwargs):
-        ret = self.dispatch("step", **kwargs)
-        for sched in self.schedulers:
-            sched.step()
-        return ret
-
-    def clip_grad(self, value=1.0):
-        for optim in self.optims:
-            for param_group in optim.param_groups:
-                for p in param_group["params"]:
-                    if p.grad is None:
-                        continue
-                    torch.nn.utils.clip_grad_norm_(p, value)
+    def step(self, only=None, skip=None, **kwargs):
+        """
+        Step optimizers and their schedulers for specified groups.
+        
+        Args:
+            only: list of group names (if None, use all groups)
+            skip: list of group names to skip (ignored if only is set)
+            **kwargs: passed to optimizer.step()
+        """
+        for name in self._resolve_groups(only, skip):
+            # Step optimizers
+            for optim in self.groups[name]["optimizers"]:
+                optim.step(**kwargs)
+            
+            # Step schedulers
+            for sched in self.groups[name]["schedulers"]:
+                sched.step()
+    
+    def clip_grad(self, value=1.0, only=None, skip=None):
+        """
+        Clip gradients for specified optimizer groups.
+        
+        Args:
+            value: max gradient norm
+            only: list of group names (if None, use all groups)
+            skip: list of group names to skip (ignored if only is set)
+        """
+        for name in self._resolve_groups(only, skip):
+            for optim in self.groups[name]["optimizers"]:
+                for param_group in optim.param_groups:
+                    for p in param_group["params"]:
+                        if p.grad is not None:
+                            torch.nn.utils.clip_grad_norm_(p, value)
+    
+    def _resolve_groups(self, only=None, skip=None):
+        """Determine which groups to operate on."""
+        if only is not None:
+            return only
+        
+        all_groups = list(self.groups.keys())
+        if skip is not None:
+            return [g for g in all_groups if g not in skip]
+        
+        return all_groups
 
 
 def async_copy_sessions_to_device(sessions, device):
