@@ -290,7 +290,7 @@ def train_from_cfg(
         if alternating_updates:
             # Every basis_weight_steps_per_basis iterations, update both
             # Otherwise, only update basis weights
-            update_basis_gen = (eidx % bw_steps_per_bg_step) == 0
+            update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
             if update_basis_gen:
                 # Update everything (basis weights, basis gen, film, ae, norm)
