@@ -131,7 +131,7 @@ def inner_update_stopgrad(
     embeddings_rest,
     inner_steps: int = 100,
     lr: float = 5e-2,
-    weight_decay: float = 1e-3,
+    weight_decay: float = 1e-5,  # Reduced from 1e-3 to let embeddings escape zero
     grad_clip: int = 1.0,
     quiet=True,
 ) -> torch.Tensor:
@@ -147,10 +147,12 @@ def inner_update_stopgrad(
         ys = {sid: d[2] for sid, d in data_support.items()}
     device = ys[list(ys.keys())[0]].device
 
-    embeddings_stim = {
-        session_id: torch.zeros(embed_dim_stim, device=device, requires_grad=True)
-        for session_id in data_support.keys()
-    }
+    embeddings_stim = {}
+    for session_id in data_support.keys():
+        emb = torch.randn(embed_dim_stim, device=device) * 0.1
+        emb.requires_grad = True
+        embeddings_stim[session_id] = emb
+
     optimizer_inner = utils.OptimCollection(
         [
             torch.optim.AdamW((se,), lr=lr, weight_decay=weight_decay)
@@ -158,13 +160,24 @@ def inner_update_stopgrad(
         ]
     )
 
+    # Freeze model parameters during inner loop (stopgrad: no gradients w.r.t. model params)
+    model.requires_grad_(False)
+
+    # Detach embeddings_rest to prevent graph building through it (we don't optimize it)
+    embeddings_rest_detached = {
+        sid: emb.detach() for sid, emb in embeddings_rest.items()
+    }
+
     losses = []
     for eidx in range(inner_steps):
         optimizer_inner.zero_grad()
 
+        # Clear any stored state from previous forward passes
+        model.model.reset_state()
+
         preds = model(
             data_support,
-            embeddings_rest=embeddings_rest,
+            embeddings_rest=embeddings_rest_detached,
             embeddings_stim=embeddings_stim,
         )
         loss = 0
@@ -178,9 +191,15 @@ def inner_update_stopgrad(
 
         # if regularizer_fn is not None:
         #    loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
+
+        # Only gradients w.r.t. embeddings_stim (model params frozen, embeddings_rest detached)
         loss.backward()
+
         optimizer_inner.clip_grad(grad_clip)
         optimizer_inner.step()
+
+    # Re-enable gradients for model parameters (for outer loop)
+    model.requires_grad_(True)
 
     embeddings_stim = {
         session_id: es.detach() for session_id, es in embeddings_stim.items()
@@ -188,49 +207,6 @@ def inner_update_stopgrad(
     if quiet:
         return embeddings_stim
     return embeddings_stim, losses
-
-
-def inner_update_maml(
-    model: nn.Module,
-    loss_fn,
-    stiminds_support: torch.Tensor,
-    rest_embed_support: torch.Tensor,
-    inputs_support: torch.Tensor,
-    targets_support: torch.Tensor,
-    stim_dim: int,
-    inner_steps: int = 5,
-    inner_lr: float = 5e-2,
-    regularizer_fn=None,
-) -> torch.Tensor:
-    """
-    MAML-style inner loop on stim_embed:
-    - manually updates stim_embed with gradient steps using autograd.grad
-    - create_graph=True enables outer backprop THROUGH these updates.
-
-    Returns a differentiable stim_embed_final (no .detach()).
-    """
-    stim_embed = torch.zeros(
-        1, stim_dim, device=stiminds_support.device, requires_grad=True
-    )
-
-    def inner_forward(stim_code: torch.Tensor) -> torch.Tensor:
-        stim_b = stim_code.expand(stiminds_support.size(0), -1)
-        preds = model(stiminds_support, rest_embed_support, stim_b)
-        loss = loss_fn(preds, targets_support)
-        if regularizer_fn is not None:
-            loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
-        return loss
-
-    stim_current = stim_embed
-    for _ in range(inner_steps):
-        loss_support = inner_forward(stim_current)
-        grad = torch.autograd.grad(loss_support, stim_current, create_graph=True)[0]
-        stim_current = (
-            stim_current - inner_lr * grad
-        )  # manual SGD step (differentiable)
-
-    return stim_current  # keep graph for outer step (no detach)
-
 
 def cache_rest_embeds(
     session_ids,

@@ -1,5 +1,3 @@
-# Okay; this is a bit complicated...
-# In general: some args will come in dictionaries {session_id, arg,...}, others will be bound by a closure.
 import math
 import random
 import os
@@ -91,37 +89,51 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         raise NotImplementedError("No normalizer adaptation yet")
 
     if cfg.ae.training.coadapt:
-        optims_aes = set(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
+        optims_aes = list(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
     else:
-        optims_aes = tuple()
+        optims_aes = []
 
     # Will have only 1 elem if tbfm is shared.
     optims_model = model_ms.model.get_optim_custom_base(**cfg.tbfm.training.optim)
 
-    warmup = 1500
+    def warmup_cos(warmup):
+        def _inner(step):
+            if step < warmup:
+                return (step + 1) / max(1, warmup)
+            t = (step - warmup) / max(1, cfg.training.epochs - warmup)
+            return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
 
-    # def warmup_cos(step):
-    #    if step < warmup:
-    #        return (step + 1) / max(1, warmup)
-    #    t = (step - warmup) / max(1, cfg.training.epochs - warmup)
-    #    return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
-    def warmup_cos(step):
-        if step < warmup:
-            return 1.0
-        t = (step - warmup) / max(1, cfg.training.epochs - warmup)
-        return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+        return _inner
 
+    # Collect optimizers and schedulers by group
+    bw_optims = []
     bw_schedulers = []
+    bg_optims = []
+    bg_schedulers = []
+    film_optims = []
+
     for sid, optims in optims_model.items():
         optim_bw, optim_bg, optim_film = optims
-        bw_scheduler = LambdaLR(optim_bw, lr_lambda=warmup_cos)
-        bw_schedulers.append(bw_scheduler)
 
-    optims_model = optims_model.values()
+        bw_optims.append(optim_bw)
+        bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500)))
 
-    return utils.OptimCollection(
-        (optims_norms, optims_aes, optims_model), schedulers=(bw_schedulers,)
-    )
+        bg_optims.append(optim_bg)
+        bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(3000)))
+
+        if optim_film is not None:
+            film_optims.append(optim_film)
+
+    # Create named optimizer groups
+    groups = {
+        "norm": {"optimizers": optims_norms, "schedulers": []},
+        "ae": {"optimizers": optims_aes, "schedulers": []},
+        "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
+        "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
+        "film": {"optimizers": film_optims, "schedulers": []},
+    }
+
+    return utils.OptimCollection(groups)
 
 
 # Training ------------------------------------------------------
@@ -147,24 +159,31 @@ def train_from_cfg(
     model_optims,
     embeddings_rest,
     data_test=None,
-    inner_mode: str = "stopgrad",  # "stopgrad" | "maml"
     inner_steps: int | None = None,
     epochs: int = 10000,
     test_interval: int | None = None,
     support_size: int = 100,
-    inner_lr: float = 5e-2,
-    ae_lr: float | None = None,
     embed_stim_lr: int | None = None,
     embed_stim_weight_decay: float = None,
-    regularizer_fn=None,  # callable(model, rest_embed, stim_embed) -> scalar penalty
     device: str = "cuda",
     grad_clip: float | None = None,
+    alternating_updates: bool = True,  # Use alternating basis weight / basis gen updates
+    bw_steps_per_bg_step: (
+        int | None
+    ) = None,  # How many basis weight updates per basis update
 ):
     """
     One epoch over sessions with:
       - inner loop on support to adapt stim_embed (per-episode latent)
       - outer update on query for shared params
       - slow AE updates every step (small lr)
+      - optional alternating updates: update basis weights more frequently than basis generator
+
+    Alternating updates rationale:
+      - Basis weights have large gradients and adapt quickly
+      - Basis generator (Bases) changes more slowly
+      - By updating basis weights N times per basis generator update, we let the
+        weighting layer stabilize to the current bases before changing the bases
 
     Notes:
       • To add EMA for AE: keep a shadow copy of AE params and update with EMA after each optimizer.step().
@@ -175,19 +194,15 @@ def train_from_cfg(
     embed_stim_weight_decay = (
         embed_stim_weight_decay or cfg.film.training.optim.weight_decay
     )
-    embed_dim_rest = cfg.tbfm.module.embed_dim_rest
     inner_steps = inner_steps or cfg.film.training.inner_steps
     use_film = cfg.tbfm.module.use_film_bases
+    bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
     device = model.device
 
-    if inner_mode not in {"stopgrad", "maml"}:
-        raise ValueError("inner_mode must be 'stopgrad' or 'maml'")
-
     embeddings_stim = None  # default
     iter_train = iter(data_train)
-    iter_test = iter(data_test)
 
     train_losses = []
     train_r2s = []
@@ -204,37 +219,20 @@ def train_from_cfg(
             _data_train,
             support_size=support_size,
         )
-        query = _data_train
 
         with torch.no_grad():
             y_query = {sid: d[2] for sid, d in query.items()}
 
         # ----- inner adaptation on support -----
         if use_film:
-            if inner_mode == "stopgrad":
-                embeddings_stim = film.inner_update_stopgrad(
-                    model,
-                    support,
-                    embeddings_rest,
-                    inner_steps=inner_steps,
-                    lr=embed_stim_lr,
-                    weight_decay=embed_stim_weight_decay,
-                    # regularizer_fn=regularizer_fn,
-                )
-            else:  # "maml"
-                raise NotImplementedError()
-                # stim_embed_query = film.inner_update_maml(
-                #    model=model,
-                #    loss_fn=loss_fn,
-                #    stiminds_support=parts["stiminds_support"],
-                #    rest_embed_support=parts["rest_embed_support"],
-                #    inputs_support=parts["inputs_support"],
-                #    targets_support=parts["targets_support"],
-                #    stim_dim=stim_dim,
-                #    inner_steps=inner_steps,
-                #    inner_lr=inner_lr,
-                #    regularizer_fn=regularizer_fn,
-                # )
+            embeddings_stim = film.inner_update_stopgrad(
+                model,
+                support,
+                embeddings_rest,
+                inner_steps=inner_steps,
+                lr=embed_stim_lr,
+                weight_decay=embed_stim_weight_decay,
+            )
 
         model_optims.zero_grad(set_to_none=True)
 
@@ -245,35 +243,38 @@ def train_from_cfg(
         losses = {}
         r2_trains = []
         for sid, y in y_query.items():
-            loss = nn.MSELoss()(yhat_query[sid], y)
-            losses[sid] = loss
+            _loss = nn.MSELoss()(yhat_query[sid], y)
+            losses[sid] = _loss
 
             r2_train = r2_score(
                 yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1),
                 y.permute(0, 2, 1).flatten(end_dim=1),
             )
             r2_trains.append(r2_train.item())
-        loss = sum(losses.values()) / len(y_query)
-        train_losses.append(loss.item())
-        train_r2s.append(sum(r2_trains) / len(y_query))
+
+        cur_loss = sum(losses.values()) / len(y_query)
 
         tbfm_regs = model.model.get_weighting_reg()
-        loss += cfg.tbfm.training.lambda_fro * sum(tbfm_regs.values()) / len(y_query)
+        cur_loss += (
+            cfg.tbfm.training.lambda_fro * sum(tbfm_regs.values()) / len(y_query)
+        )
 
         tbfm_regs_ortho = model.model.get_basis_rms_reg()
-        loss += (
+        cur_loss += (
             cfg.tbfm.training.lambda_ortho
             * sum(tbfm_regs_ortho.values())
             / len(y_query)
         )
+
+        loss = cur_loss
+
+        train_losses.append((eidx, loss.item()))
 
         loss.backward()
 
         if grad_clip is not None:
             model_optims.clip_grad(value=grad_clip)
 
-        if eidx == 2999:
-            model.model.instances["MonkeyG_20150925_Session2_S1"].bases.be_loud()
         if eidx == 3000:
             print(
                 "after gc",
@@ -284,12 +285,25 @@ def train_from_cfg(
                     model.ae.instances["MonkeyG_20150925_Session2_S1"]
                 ),
             )
-            import pdb
 
-            pdb.set_trace()
-        model_optims.step()
+        # Alternating updates: update basis weights more frequently than basis generator
+        if alternating_updates:
+            # Every basis_weight_steps_per_basis iterations, update both
+            # Otherwise, only update basis weights
+            update_basis_gen = (eidx % bw_steps_per_bg_step) == 0
+
+            if update_basis_gen:
+                # Update everything (basis weights, basis gen, film, ae, norm)
+                model_optims.step()
+            else:
+                # Update only basis weights (skip basis gen and film)
+                model_optims.step(skip=["bg", "film"])
+        else:
+            model_optims.step()
 
         if data_test is not None and (eidx % test_interval) == 0:
+            train_r2s.append((eidx, sum(r2_trains) / len(y_query)))
+
             model_optims.zero_grad(set_to_none=True)
             with torch.no_grad():
                 model.eval()
@@ -324,7 +338,9 @@ def train_from_cfg(
                 loss = loss_outer / test_batch_count
                 test_losses.append((eidx, loss))
                 test_r2s.append((eidx, r2_test))
-                print("----", eidx, train_losses[-1], loss, train_r2s[-1], r2_test)
+                print(
+                    "----", eidx, train_losses[-1][-1], loss, train_r2s[-1][-1], r2_test
+                )
 
     # ----- (optional) EMA of AE params -----
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
@@ -332,18 +348,14 @@ def train_from_cfg(
 
     # TODO: full train set
     if use_film:
-        if inner_mode == "stopgrad":
-            embeddings_stim = film.inner_update_stopgrad(
-                model,
-                _data_train,
-                embeddings_rest,
-                inner_steps=1000,
-                lr=embed_stim_lr,
-                weight_decay=embed_stim_weight_decay,
-                # regularizer_fn=regularizer_fn,
-            )
-        else:
-            raise NotImplementedError()
+        embeddings_stim = film.inner_update_stopgrad(
+            model,
+            _data_train,
+            embeddings_rest,
+            inner_steps=(3 * inner_steps),
+            lr=embed_stim_lr,
+            weight_decay=embed_stim_weight_decay,
+        )
 
     model_optims.zero_grad(set_to_none=True)
     with torch.no_grad():
@@ -390,6 +402,7 @@ def train_from_cfg(
     results = {}
     results["train_losses"] = train_losses
     results["test_losses"] = test_losses
+    results["train_r2s"] = train_r2s
     results["test_r2s"] = test_r2s
     results["y_hat"] = yhat_query
     results["y"] = y_query

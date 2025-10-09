@@ -2,8 +2,6 @@
 PyTorch implementation of the temporal basis function model.
 """
 
-import inspect
-
 import hydra.utils
 import torch
 from torch import nn
@@ -55,7 +53,7 @@ class TBFM(nn.Module):
         self.in_dim = in_dim
         self.device = device
         self.prev_bases = None
-        self.prev_bases_weights = None
+        self.prev_basis_weights = None
         self.use_film_bases = use_film_bases
 
         if zscore:
@@ -66,6 +64,7 @@ class TBFM(nn.Module):
 
         # One set of basis weights for each channel.
         self.basis_weighting = nn.Linear(runway * in_dim, num_bases * in_dim).to(device)
+
         self.bases = Bases(
             self.stimdim,
             num_bases,
@@ -77,6 +76,16 @@ class TBFM(nn.Module):
             embed_dim_stim=embed_dim_stim,
             device=device,
         )
+
+    def reset_state(self):
+        """
+        Clear any cached state from previous forward passes.
+        Call this before inner optimization loops to prevent graph retention issues.
+        """
+        self.prev_bases = None
+        self.prev_basis_weights = None
+        if hasattr(self.bases, "reset_state"):
+            self.bases.reset_state()
 
     def get_optim(self, lr=1e-4):
         """
@@ -102,7 +111,7 @@ class TBFM(nn.Module):
         """
         optim_bw = torch.optim.AdamW(
             self.basis_weighting.parameters(),
-            lr=1.5 * lr_head,
+            lr=0.5 * lr_head,
             weight_decay=wd_head,
         )
         bases_core_params, bases_film_params = self.bases.get_params()
@@ -209,13 +218,18 @@ class TBFM(nn.Module):
         bases = self.bases(
             stiminds, embedding_rest=embedding_rest, embedding_stim=embedding_stim
         )
+        # Store for regularization (keep graph for outer loop backprop)
         self.prev_bases = bases
 
         # basis_weights: (batch, in_dim * num_bases)
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
+        # XXX
+        basis_weights = torch.tanh(basis_weights)
+        basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 
+        # Store for regularization (keep graph for outer loop backprop)
         self.prev_basis_weights = basis_weights
 
         # cpreds: (batch, time (after runway), in_dim)

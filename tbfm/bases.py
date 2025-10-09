@@ -4,8 +4,6 @@ PyTorch Implementation of the basis generator network.
 
 import torch
 from torch import nn
-import torch.nn.functional as F
-
 
 class Bases(nn.Module):
     """
@@ -48,94 +46,51 @@ class Bases(nn.Module):
 
         # Core MLP
         self.in_layer = nn.Linear(in_dim, latent_dim)
-        self.in_activation = nn.GELU()
+        self.in_activation = nn.Tanh()
 
         self.hiddens = nn.ModuleList()
         for _ in range(basis_depth):
             self.hiddens.append(nn.Linear(latent_dim, latent_dim))
-        self.hidden_activation = nn.GELU()
+        # self.hidden_activation = nn.GELU()
+        self.hidden_activation = nn.Tanh()
 
         self.out_layer = nn.Linear(latent_dim, trial_len * num_bases)
 
-        # ---- FiLM modulator (GELU in modulator paths) ----
         self.embed_dim_stim = embed_dim_stim
         self.embed_dim_rest = embed_dim_rest
         if use_film:
-            mod_width = max(32, latent_dim)
-
-            # rest and stim projection heads (GELU)
-            self.proj_rest = nn.Sequential(
-                nn.Linear(embed_dim_rest, mod_width),
-                nn.GELU(),
+            self.embed_dim_film = embed_dim_rest + embed_dim_stim
+            self.proj_film = nn.Sequential(
+                nn.Linear(self.embed_dim_film, 32),
+                nn.Tanh(),
+                nn.Linear(32, trial_len),
+                nn.Tanh(),
             )
-            if embed_dim_stim is not None:
-                self.proj_stim = nn.Sequential(
-                    nn.Linear(embed_dim_stim, mod_width),
-                    nn.GELU(),
-                )
-                # conservative scalar gate in [0,1] driven by rest
-                self.gate_rest_to_stim = nn.Sequential(
-                    nn.Linear(embed_dim_rest, 1),
-                    nn.Sigmoid(),
-                )
-            else:
-                self.proj_stim = None
-                self.gate_rest_to_stim = None
-
-            # FiLM head → (gamma | beta) for first hidden width
-            self.embed_norm = nn.LayerNorm(mod_width)
-            self.film_head = nn.Sequential(
-                nn.Linear(mod_width, mod_width),
-                nn.GELU(),
-                nn.Linear(mod_width, 2 * latent_dim),
-            )
-            # init near identity: gamma ≈ 0, beta ≈ 0 → (1+gamma) * h + beta ≈ h
-            nn.init.zeros_(self.film_head[-1].weight)
-            nn.init.zeros_(self.film_head[-1].bias)
+            # Initialize final layer to small weights (start near identity)
+            nn.init.normal_(self.proj_film[2].weight, mean=0, std=0.01)
+            nn.init.zeros_(self.proj_film[2].bias)
+        else:
+            self.proj_film = None
 
         self.to(device)
 
-        self._last_hidden = None
+        self.last_hidden = None
 
         self._be_loud = False
 
     def be_loud(self):
         self._be_loud = True
 
-    def fuse_embeddings(
-        self, embedding_rest: torch.Tensor, embedding_stim: torch.Tensor | None
-    ):
-        """
-        Fuse rest and stim embeddings conservatively:
-          fused = rest + gate(rest)*stim.
-        embedding_rest: (batch_size, self.embed_dim_rest)
-        embedding_stim: (batch_size, self.embed_dim_stim)
-        """
-        rest_proj = self.proj_rest(embedding_rest)
-        if (embedding_stim is not None) and (self.proj_stim is not None):
-            stim_proj = self.proj_stim(embedding_stim)
-            gate = self.gate_rest_to_stim(embedding_rest)  # (batch, 1)
-            return rest_proj + gate * stim_proj
-        return rest_proj
-
     def get_reg_weights(self):
         total = 0.0
         for layer in [self.in_layer, *self.hiddens]:
             total = total + torch.linalg.norm(layer.weight)
-        return total
 
-    def film_reg(
-        self, embedding_rest: torch.Tensor, embedding_stim: torch.Tensor | None = None
-    ):
-        """Small L2 on FiLM outputs to bias toward identity modulation."""
-        if not self.use_film:
-            return torch.tensor(0.0, device=embedding_rest.device)
-        fused_embed = self.fuse_embeddings(embedding_rest, embedding_stim)
-        gamma_beta = self.film_head(fused_embed)  # (batch, 2*width)
-        half = gamma_beta.size(-1) // 2
-        gamma = gamma_beta[:, :half]
-        beta = gamma_beta[:, half:]
-        return gamma.pow(2).mean() + beta.pow(2).mean()
+        if self.use_film:
+            total = total + torch.linalg.norm(self.proj_film[0].weight)
+            total = total + torch.linalg.norm(self.proj_film[2].weight)
+
+        return total
 
     def get_params(self):
         # core MLP inside Bases (exclude FiLM pieces)
@@ -149,16 +104,13 @@ class Bases(nn.Module):
 
         bases_film_params = []
         if self.use_film:
-            bases_film_params += list(self.proj_rest.parameters())
-            if self.gate_rest_to_stim is not None:
-                bases_film_params += list(self.proj_stim.parameters())
-                bases_film_params += list(self.gate_rest_to_stim.parameters())
-            bases_film_params += list(self.film_head.parameters())
-
-            # LN on fused embedding
-            bases_film_params += list(self.embed_norm.parameters())
+            for layer in self.proj_film:
+                bases_film_params.extend(list(layer.parameters()))
 
         return bases_core_params, bases_film_params
+
+    def reset_state(self):
+        self.last_hidden = None
 
     def forward(
         self,
@@ -168,34 +120,32 @@ class Bases(nn.Module):
     ):
         batch_size = stiminds.shape[0]
 
+        if self.use_film:
+            embedding_film = (
+                torch.cat((embedding_rest, embedding_stim), dim=0)
+                .unsqueeze(0)
+                .repeat(batch_size, 1)
+            )
+            film = self.proj_film(embedding_film)
+            if self._be_loud:
+                print(
+                    "eeee",
+                    film[0],
+                    film.shape,
+                    film[0].shape,
+                    stiminds.shape,
+                )
+                self._be_loud = False
+
+            stiminds = stiminds.clone()
+            stiminds[:, :, -1] = stiminds[:, :, -1] + film
+
         # flatten time × stimdim
         stiminds = stiminds.flatten(start_dim=1)  # (batch, trial_len*stimdim)
 
         # input layer + tanh
         hidden = self.in_layer(stiminds)
         hidden = self.in_activation(hidden)
-
-        # FiLM after input layer
-        if self.use_film:
-            embedding_rest = embedding_rest.unsqueeze(0).repeat(batch_size, 1)
-            embedding_stim = embedding_stim.unsqueeze(0).repeat(batch_size, 1)
-            fused_embed = self.fuse_embeddings(
-                embedding_rest, embedding_stim
-            )  # (batch, mod_width)
-            fused_embed = self.embed_norm(fused_embed)
-            gamma_beta = torch.tanh(self.film_head(fused_embed))  # (batch, 2*width)
-            half = gamma_beta.size(-1) // 2
-            gamma = gamma_beta[:, :half]
-            beta = gamma_beta[:, half:]
-            if self._be_loud:
-                print("fh", self.film_head[0].weight)
-                print("fe", fused_embed[0])
-                print("gb:", gamma[0], beta[0])
-                print("h", hidden[0], ((1.0 + gamma) * hidden + beta)[0])
-            # import pdb
-
-            # pdb.set_trace()
-            hidden = (1.0 + gamma) * hidden + beta
 
         # hidden stack (tanh as before)
         for layer in self.hiddens:

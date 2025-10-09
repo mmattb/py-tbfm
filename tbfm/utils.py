@@ -132,7 +132,7 @@ def flatten(xs):
 class OptimCollection:
     def __init__(self, collection, schedulers=()):
         c = flatten(collection)
-        self.optims = tuple(c)
+        self.optims = tuple(_c for _c in c if _c is not None)
         self.schedulers = tuple(flatten(schedulers))
 
     def dispatch(self, attr, **kwargs):
