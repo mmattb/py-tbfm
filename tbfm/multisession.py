@@ -340,7 +340,8 @@ def train_from_cfg(
 
                 if r2_test < min_test_r2:
                     min_test_r2 = r2_test
-                    save_model(model, model_save_path, tbfm_only=True)
+                    if model_save_path:
+                        save_model(model, model_save_path, tbfm_only=True)
 
     # ----- (optional) EMA of AE params -----
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
@@ -382,7 +383,7 @@ def train_from_cfg(
                     y_test.permute(0, 2, 1).flatten(end_dim=1),
                 )
                 r2_test += _r2_test
-                final_test_r2s[session_id] += _r2_test
+                final_test_r2s[session_id] += _r2_test.item()
             loss /= len(test_batch)
             r2_test /= len(test_batch)
 
@@ -399,7 +400,8 @@ def train_from_cfg(
 
         if r2_test < min_test_r2:
             min_test_r2 = r2_test
-            save_model(model, model_save_path, tbfm_only=True)
+            if model_save_path:
+                save_model(model, model_save_path, tbfm_only=True)
 
     print("Final:", loss, r2_test)
 
@@ -477,7 +479,7 @@ def test_time_adaptation(
                         y_test.permute(0, 2, 1).flatten(end_dim=1),
                     )
                     r2_test += _r2_test
-                    final_test_r2s[session_id] += _r2_test
+                    final_test_r2s[session_id] += _r2_test.item()
                 loss /= len(test_batch)
                 r2_test /= len(test_batch)
 
