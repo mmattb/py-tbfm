@@ -4,6 +4,7 @@
 film:
   training:
     inner_steps: 30
+    support_size: 300
     optim:
       lr: 1e-4
       weight_decay: 1e-3

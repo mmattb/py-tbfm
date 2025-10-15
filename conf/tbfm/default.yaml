@@ -6,7 +6,7 @@ tbfm:
     _target_: tbfm.tbfm.TBFM
     in_dim: ${latent_dim}  # By default TBFM lives in a latent space.
     runway: ${data.runway}
-    num_bases: 17
+    num_bases: 20
     trial_len: ${data.y_len}
     latent_dim: 32
     basis_depth: 2
@@ -30,4 +30,4 @@ tbfm:
       wd_head: 1e-4
       wd_film: 1e-5
     lambda_fro: 0.01
-    lambda_ortho: 0.2
+    lambda_ortho: 0.01

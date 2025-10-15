@@ -162,7 +162,7 @@ def train_from_cfg(
     inner_steps: int | None = None,
     epochs: int = 10000,
     test_interval: int | None = None,
-    support_size: int = 100,
+    support_size: int = 300,
     embed_stim_lr: int | None = None,
     embed_stim_weight_decay: float = None,
     device: str = "cuda",
@@ -171,6 +171,7 @@ def train_from_cfg(
     bw_steps_per_bg_step: (
         int | None
     ) = None,  # How many basis weight updates per basis update
+    model_save_path: str | None = None,
 ):
     """
     One epoch over sessions with:
@@ -199,6 +200,7 @@ def train_from_cfg(
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
+    support_size = support_size or cfg.film.training.support_size
     device = model.device
 
     embeddings_stim = None  # default
@@ -208,6 +210,7 @@ def train_from_cfg(
     train_r2s = []
     test_losses = []
     test_r2s = []
+    min_test_r2 = 1e99
     for eidx in range(epochs):
         model.train()
         iter_train, _data_train = utils.iter_loader(
@@ -275,16 +278,9 @@ def train_from_cfg(
         if grad_clip is not None:
             model_optims.clip_grad(value=grad_clip)
 
-        if eidx == 3000:
-            print(
-                "after gc",
-                utils.log_grad_norms(
-                    model.model.instances["MonkeyG_20150925_Session2_S1"]
-                ),
-                utils.log_grad_norms(
-                    model.ae.instances["MonkeyG_20150925_Session2_S1"]
-                ),
-            )
+        # if eidx == 3000:
+        #    utils.log_grad_norms(model.model.instances["MonkeyG_20150925_Session2_S1"])
+        #    utils.log_grad_norms(model.ae.instances["MonkeyG_20150925_Session2_S1"])
 
         # Alternating updates: update basis weights more frequently than basis generator
         if alternating_updates:
@@ -342,6 +338,10 @@ def train_from_cfg(
                     "----", eidx, train_losses[-1][-1], loss, train_r2s[-1][-1], r2_test
                 )
 
+                if r2_test < min_test_r2:
+                    min_test_r2 = r2_test
+                    save_model(model, model_save_path, tbfm_only=True)
+
     # ----- (optional) EMA of AE params -----
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
@@ -396,6 +396,10 @@ def train_from_cfg(
             session_id: r2 / test_batch_count
             for session_id, r2 in final_test_r2s.items()
         }
+
+        if r2_test < min_test_r2:
+            min_test_r2 = r2_test
+            save_model(model, model_save_path, tbfm_only=True)
 
     print("Final:", loss, r2_test)
 
@@ -509,6 +513,7 @@ def load_stim_batched(
     data_dir="/home/mmattb/Projects/opto-coproc/data",
     held_in_session_ids=None,
     num_held_out_sessions=10,
+    unpack_stiminds=False,
 ):
     paths = [
         dd
@@ -529,6 +534,7 @@ def load_stim_batched(
         session_subdir=session_subdir,
         batch_size=batch_size,
         window_size=window_size,
+        unpack_stiminds=unpack_stiminds,
         in_memory=True,
         device="cpu",
     )

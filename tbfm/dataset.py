@@ -75,15 +75,27 @@ class SessionInMemoryDataset(Dataset):
         window_size,
         runway,
         include_clockvec=True,
+        unpack_stiminds=False,
         device=DEVICE,
     ):
         """
         torchdir: path to the pytorch data for the given session.
         This implementation holds the whole set in memory. Take care!
+        
+        Args:
+            torchdir: path to the pytorch data for the given session
+            window_size: size of the window
+            runway: runway length
+            include_clockvec: if True, include clock vector in stim_ind
+            unpack_stiminds: if True, instead of stiminds of (batch, trial_len, 3),
+                            use (batch, 2) with normalized pulse positions. Ignores
+                            clock vector.
+            device: device to load data onto
         """
         self._device = device
         self._torchdir = torchdir
         self.include_clockvec = include_clockvec
+        self.unpack_stiminds = unpack_stiminds
         self._runway = runway
 
         self._chunk_paths = [
@@ -114,13 +126,26 @@ class SessionInMemoryDataset(Dataset):
             dtype=self._dtype,
             device=device,
         )
-        self.stim_ind = torch.zeros(
-            self._pulse_count,
-            window_size,
-            3 if include_clockvec else 2,
-            dtype=self._dtype,
-            device=device,
-        )
+        
+        # Stim_ind shape depends on unpack_stiminds flag
+        if unpack_stiminds:
+            # Unpacked: (batch, 2) with normalized pulse positions only
+            # No clock dimension needed
+            self.stim_ind = torch.zeros(
+                self._pulse_count,
+                2,
+                dtype=self._dtype,
+                device=device,
+            )
+        else:
+            # Original: (batch, trial_len, stimdim)
+            self.stim_ind = torch.zeros(
+                self._pulse_count,
+                window_size,
+                3 if include_clockvec else 2,
+                dtype=self._dtype,
+                device=device,
+            )
 
         # Here we gooooo...
         self.x = self.x.pin_memory()
@@ -133,7 +158,7 @@ class SessionInMemoryDataset(Dataset):
             self.x[cur_batch_loc : cur_batch_loc + bsize, :, :].copy_(
                 cur_x[:, :window_size, :]
             )
-            self.stim_ind[cur_batch_loc : cur_batch_loc + bsize, :, :].copy_(cur_i)
+            self.stim_ind[cur_batch_loc : cur_batch_loc + bsize].copy_(cur_i)
 
             cur_batch_loc += bsize
 
@@ -157,18 +182,34 @@ class SessionInMemoryDataset(Dataset):
         )
 
         # Supplement feats with stim locs
-        stim_dim = 3 if self.include_clockvec else 2
-        stim_ind = torch.zeros(
-            cond.shape[0], cond.shape[2] - 1, stim_dim, device=self._device
-        )
-        clock_vec = get_clock(stim_ind.shape[1], dtype=self._dtype, device=self._device)
-        for idx, pulse in enumerate(pulses):
-            assert len(pulse) == 3
-            stim_ind[idx, pulse[0], 0] = 1
-            stim_ind[idx, pulse[1], 1] = 1
+        if self.unpack_stiminds:
+            # Unpacked format: (batch, 2) with normalized pulse positions only
+            stim_ind = torch.zeros(
+                cond.shape[0], 2, device=self._device, dtype=self._dtype
+            )
 
-            if self.include_clockvec:
-                stim_ind[idx, :, 2] = clock_vec
+            window_size = cond.shape[2]
+            
+            for idx, pulse in enumerate(pulses):
+                assert len(pulse) == 3
+                # Normalize pulse positions to [0, 1]
+                stim_ind[idx, 0] = pulse[0] / window_size
+                stim_ind[idx, 1] = pulse[1] / window_size
+        else:
+            # Original format: (batch, trial_len, stimdim) with 1-hot encoding
+            stim_dim = 3 if self.include_clockvec else 2
+            stim_ind = torch.zeros(
+                cond.shape[0], cond.shape[2] - 1, stim_dim, device=self._device
+            )
+            clock_vec = get_clock(stim_ind.shape[1], dtype=self._dtype, device=self._device)
+            
+            for idx, pulse in enumerate(pulses):
+                assert len(pulse) == 3
+                stim_ind[idx, pulse[0], 0] = 1
+                stim_ind[idx, pulse[1], 1] = 1
+
+                if self.include_clockvec:
+                    stim_ind[idx, :, 2] = clock_vec
 
         x = cond[:, :, :].permute(0, 2, 1)
 
@@ -246,7 +287,15 @@ class SessionInMemoryDataset(Dataset):
                 start_idx = self._cur_idx
                 end_idx = min(self._end_idx, start_idx + self._batch_size)
                 runway = self._outer.x[start_idx:end_idx, : self.runway, :]
-                stim_ind = self._outer.stim_ind[start_idx:end_idx, self.runway :, :]
+                
+                # Handle unpacked vs packed stim_ind
+                if self._outer.unpack_stiminds:
+                    # Unpacked: (batch, stimdim) - no temporal slicing needed
+                    stim_ind = self._outer.stim_ind[start_idx:end_idx, :]
+                else:
+                    # Packed: (batch, trial_len, stimdim) - slice after runway
+                    stim_ind = self._outer.stim_ind[start_idx:end_idx, self.runway :, :]
+                
                 y = self._outer.x[start_idx:end_idx, self.runway :, :]
                 self._cur_idx += self._batch_size
 
@@ -377,6 +426,7 @@ class SessionLoader:
         batch_size=1000,
         window_size=None,
         in_memory=False,
+        unpack_stiminds=False,
         device=DEVICE,
     ):
         """
@@ -384,11 +434,13 @@ class SessionLoader:
             meta: Iterable[Meta] for each session we are including
             subdir: path to data directory; e.g. "./data"
             batch_size: [int]: our batches will be <= this in size
+            unpack_stiminds: if True, use unpacked (batch, stimdim) format for stim_ind
             device: something passable to tensor.to()
         """
         self._meta = meta
         self._device = device
         self._runway = runway
+        self.unpack_stiminds = unpack_stiminds
 
         num_sessions = len(meta)
         self._batch_size_per_session = batch_size // num_sessions
@@ -416,7 +468,11 @@ class SessionLoader:
 
             if in_memory:
                 dset = SessionInMemoryDataset(
-                    torchdir, runway=runway, window_size=window_size, device=device
+                    torchdir, 
+                    runway=runway, 
+                    window_size=window_size, 
+                    unpack_stiminds=unpack_stiminds,
+                    device=device
                 )
             else:
                 # dset = SessionDataset(torchdir, window_size=window_size, device=device)
@@ -579,6 +635,7 @@ def load_data_some_sessions(
     batch_size=1000,
     window_size=None,
     in_memory=True,
+    unpack_stiminds=False,
     device=DEVICE,
 ):
     """
@@ -587,6 +644,7 @@ def load_data_some_sessions(
         paths: Iterable[str] - paths to per-session dirs
         subdir: str - data directory
         batch_size: [int]: our batches will be <= this in size
+        unpack_stiminds: if True, use unpacked (batch, 2) format for stim_ind
         device: something passable to tensor.to()
     """
     sessions_to_keep = {os.path.basename(fqp) for fqp in paths}
@@ -599,6 +657,7 @@ def load_data_some_sessions(
         batch_size=batch_size,
         window_size=window_size,
         in_memory=in_memory,
+        unpack_stiminds=unpack_stiminds,
         device=device,
     )
     return trainloader
@@ -613,6 +672,7 @@ def load_data_all_sessions(
     batch_size=1000,
     in_memory=True,
     window_size=None,
+    unpack_stiminds=False,
     device=DEVICE,
 ):
     """
@@ -622,6 +682,7 @@ def load_data_all_sessions(
         num_held_out_sessions: int - number of sessions to hold out from the training loader
         held_out_session_ids: Iterable[str] - a specific set of session_ids for sessions to hold out
         batch_size: [int]: our batches will be <= this in size
+        unpack_stiminds: if True, use unpacked (batch, 2) format for stim_ind
         device: something passable to tensor.to()
 
     Returns:
@@ -659,6 +720,7 @@ def load_data_all_sessions(
         window_size=window_size,
         in_memory=in_memory,
         batch_size=batch_size,
+        unpack_stiminds=unpack_stiminds,
         device=device,
     )
 

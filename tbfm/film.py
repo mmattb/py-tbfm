@@ -154,10 +154,14 @@ def inner_update_stopgrad(
         embeddings_stim[session_id] = emb
 
     optimizer_inner = utils.OptimCollection(
-        [
-            torch.optim.AdamW((se,), lr=lr, weight_decay=weight_decay)
-            for se in embeddings_stim.values()
-        ]
+        {
+            "film": {
+                "optimizers": [
+                    torch.optim.AdamW((se,), lr=lr, weight_decay=weight_decay)
+                    for se in embeddings_stim.values()
+                ]
+            }
+        }
     )
 
     # Freeze model parameters during inner loop (stopgrad: no gradients w.r.t. model params)
@@ -207,6 +211,7 @@ def inner_update_stopgrad(
     if quiet:
         return embeddings_stim
     return embeddings_stim, losses
+
 
 def cache_rest_embeds(
     session_ids,
