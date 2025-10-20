@@ -8,7 +8,7 @@ tbfm:
     runway: ${data.runway}
     num_bases: 20
     trial_len: ${data.y_len}
-    latent_dim: 32
+    latent_dim: 16  # This is basis generator latent dim
     basis_depth: 2
     covariate_dim: ${covariate_dim}
     zscore: false

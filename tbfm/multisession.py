@@ -25,17 +25,20 @@ def build_from_cfg(
     shared_ae=False,
     latent_dim=None,
     base_model_path=None,
+    quiet=False,
     device=None,
 ):
     latent_dim = cfg["latent_dim"]
 
     with torch.no_grad():
         # Normalizers ------
-        print("Building and fitting normalizers...")
+        if not quiet:
+            print("Building and fitting normalizers...")
         norms = normalizers.from_cfg(cfg, session_data, device=device)
 
         # Autoencoders ------
-        print("Building and warm starting AEs...")
+        if not quiet:
+            print("Building and warm starting AEs...")
         aes = ae.from_cfg_and_data(
             cfg,
             session_data,
@@ -49,7 +52,8 @@ def build_from_cfg(
 
         # TBFM ------
         if not base_model_path:
-            print("Building TBFM...")
+            if not quiet:
+                print("Building TBFM...")
             _tbfm = tbfm.from_cfg(
                 cfg,
                 tuple(session_data.keys()),
@@ -57,7 +61,8 @@ def build_from_cfg(
                 device=device,
             )
         else:
-            print("Loading base TBFM from file...")
+            if not quiet:
+                print("Loading base TBFM from file...")
             _tbfm = tbfm.shared_from_cfg_and_base(
                 cfg,
                 tuple(session_data.keys()),
@@ -66,7 +71,8 @@ def build_from_cfg(
             )
 
         # Cleared for takeoff ------
-        print("BOOM! Dino DNA!")
+        if not quiet:
+            print("BOOM! Dino DNA!")
     return TBFMMultisession(norms, aes, _tbfm, device=device)
 
 
@@ -349,6 +355,7 @@ def train_from_cfg(
 
     # TODO: full train set
     if use_film:
+        model_optims.zero_grad(set_to_none=True)
         embeddings_stim = film.inner_update_stopgrad(
             model,
             _data_train,
@@ -507,16 +514,7 @@ def test_time_adaptation(
 
 
 # Multisession batched data loading ----------------------------
-def load_stim_batched(
-    runway=20,
-    batch_size=1000,
-    window_size=184,
-    session_subdir="torchraw",
-    data_dir="/home/mmattb/Projects/opto-coproc/data",
-    held_in_session_ids=None,
-    num_held_out_sessions=10,
-    unpack_stiminds=False,
-):
+def gather_session_ids(data_dir, num_held_out_sessions, held_in_session_ids=None):
     paths = [
         dd
         for dd in os.listdir(data_dir)
@@ -526,6 +524,23 @@ def load_stim_batched(
         paths, len(paths) - num_held_out_sessions
     )
     held_out_session_ids = list(set(paths) - set(held_in_session_ids))
+
+    return held_in_session_ids, held_out_session_ids
+
+
+def load_stim_batched(
+    runway=20,
+    batch_size=1000,
+    window_size=184,
+    session_subdir="torchraw",
+    data_dir="/home/mmattb/Projects/opto-coproc/data",
+    held_in_session_ids=None,
+    num_held_out_sessions=10,
+    unpack_stiminds=True,
+):
+    held_in_session_ids, held_out_session_ids = gather_session_ids(
+        data_dir, num_held_out_sessions, held_in_session_ids=held_in_session_ids
+    )
 
     # We load to CPU initially for the purpose of streaming from disk and pinning,
     #  then we shunt to DEVICE later.
