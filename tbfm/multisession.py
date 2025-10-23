@@ -42,7 +42,6 @@ def build_from_cfg(
         aes = ae.from_cfg_and_data(
             cfg,
             session_data,
-            use_bias=True,
             use_lora=shared_ae,
             latent_dim=latent_dim,
             shared=shared_ae,
@@ -231,6 +230,7 @@ def train_from_cfg(
 
         with torch.no_grad():
             y_query = {sid: d[2] for sid, d in query.items()}
+            y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
         if use_film:
@@ -314,6 +314,14 @@ def train_from_cfg(
                 test_batch_count = 0
                 for test_batch in data_test:
                     test_batch = utils.move_batch(test_batch, device=device)
+
+                    tb_norm = {}
+                    for session_id, d in test_batch.items():
+                        y_test = model.norms.instances[session_id](d[2])
+                        new_d = (d[0], d[1], y_test)
+                        tb_norm[session_id] = new_d
+                    test_batch = tb_norm
+
                     y_hat_test = model(
                         test_batch,
                         embeddings_rest=embeddings_rest,
@@ -353,12 +361,20 @@ def train_from_cfg(
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
-    # TODO: full train set
     if use_film:
+        iter_train, _data_train = utils.iter_loader(
+            iter_train, data_train, device=device
+        )
+        # split into support/query
+        support, _ = split_support_query_sessions(
+            _data_train,
+            support_size=support_size,
+        )
+
         model_optims.zero_grad(set_to_none=True)
         embeddings_stim = film.inner_update_stopgrad(
             model,
-            _data_train,
+            support,
             embeddings_rest,
             inner_steps=(3 * inner_steps),
             lr=embed_stim_lr,
@@ -374,6 +390,13 @@ def train_from_cfg(
         final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
         for test_batch in data_test:
             test_batch = utils.move_batch(test_batch, device=device)
+            tb_norm = {}
+            for session_id, d in test_batch.items():
+                y_test = model.norms.instances[session_id](d[2])
+                new_d = (d[0], d[1], y_test)
+                tb_norm[session_id] = new_d
+            test_batch = tb_norm
+
             y_hat_test = model(
                 test_batch,
                 embeddings_rest=embeddings_rest,
@@ -470,6 +493,13 @@ def test_time_adaptation(
             final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
             for test_batch in data_test:
                 test_batch = utils.move_batch(test_batch, device=device)
+                tb_norm = {}
+                for session_id, d in test_batch.items():
+                    y_test = model.norms.instances[session_id](d[2])
+                    new_d = (d[0], d[1], y_test)
+                    tb_norm[session_id] = new_d
+                test_batch = tb_norm
+
                 y_hat_test = model(
                     test_batch,
                     embeddings_rest=embeddings_rest,

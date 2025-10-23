@@ -6,6 +6,7 @@ ae:
     _target_: tbfm.ae.LinearChannelAE
     latent_dim: ${latent_dim}
     in_dim: 96
+    use_bias: true
 
   should_warm_start: true
   warm_start_is_identity: false

@@ -145,6 +145,7 @@ def inner_update_stopgrad(
 
     with torch.no_grad():
         ys = {sid: d[2] for sid, d in data_support.items()}
+        ys = model.norms(ys)
     device = ys[list(ys.keys())[0]].device
 
     embeddings_stim = {}

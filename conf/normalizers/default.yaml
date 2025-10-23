@@ -6,6 +6,6 @@ normalizers:
     _target_: tbfm.normalizers.ScalerQuant
 
   training:
-    coadapt: false   # If true, we will adapt in a supervised manner after PCA warm-up
+    coadapt: false   # If true, we will adapt in a supervised manner
     optim:
       lr: 1e-4
