@@ -167,6 +167,7 @@ def inner_update_stopgrad(
 
     # Freeze model parameters during inner loop (stopgrad: no gradients w.r.t. model params)
     model.requires_grad_(False)
+    model.eval()  # Disable dropout during inner loop optimization
 
     # Detach embeddings_rest to prevent graph building through it (we don't optimize it)
     embeddings_rest_detached = {

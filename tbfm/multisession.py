@@ -234,6 +234,7 @@ def train_from_cfg(
 
         # ----- inner adaptation on support -----
         if use_film:
+            model.eval()
             embeddings_stim = film.inner_update_stopgrad(
                 model,
                 support,
@@ -242,6 +243,7 @@ def train_from_cfg(
                 lr=embed_stim_lr,
                 weight_decay=embed_stim_weight_decay,
             )
+            model.train()
 
         model_optims.zero_grad(set_to_none=True)
 
@@ -462,7 +464,7 @@ def test_time_adaptation(
     grad_clip=None,
 ) -> torch.Tensor:
 
-    model.train()
+    model.eval()
 
     lr = lr or cfg.film.training.optim.lr
     weight_decay = weight_decay or cfg.film.training.optim.weight_decay
@@ -486,7 +488,6 @@ def test_time_adaptation(
 
     if data_test:
         with torch.no_grad():
-            model.eval()
             loss_outer = 0
             r2_outer = 0
             test_batch_count = 0
@@ -539,7 +540,6 @@ def test_time_adaptation(
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
-    results["train_losses"] = train_losses
     return embeddings_stim, results
 
 

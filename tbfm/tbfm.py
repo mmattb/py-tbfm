@@ -32,6 +32,7 @@ class TBFM(nn.Module):
         use_film_bases: bool = False,
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
+        basis_gen_dropout: float = 0.0,
         device=None,
     ):
         """
@@ -74,6 +75,7 @@ class TBFM(nn.Module):
             use_film=use_film_bases,
             embed_dim_rest=embed_dim_rest,
             embed_dim_stim=embed_dim_stim,
+            basis_gen_dropout=basis_gen_dropout,
             device=device,
         )
 

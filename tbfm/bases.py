@@ -27,6 +27,7 @@ class Bases(nn.Module):
         use_film: bool = False,
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
+        basis_gen_dropout: float = 0.0,
         device=None,
     ):
         """
@@ -39,6 +40,7 @@ class Bases(nn.Module):
             use_film: whether to use FiLM modulation
             embed_dim_rest: dimensionality of the rest data embedding, for FiLM
             embed_dim_stim: dimensionality of the stim data embedding, for FiLM
+            basis_gen_dropout: dropout rate for basis generator hidden layers
             device []: something tensor.to() would accept
         """
         super().__init__()
@@ -62,6 +64,7 @@ class Bases(nn.Module):
         # Core MLP
         self.in_layer = nn.Linear(in_dim, latent_dim)
         self.in_activation = nn.Tanh()
+        self.dropout = nn.Dropout(p=basis_gen_dropout)  # Regularize basis generator
 
         self.hiddens = nn.ModuleList()
         for _ in range(basis_depth):
@@ -162,16 +165,17 @@ class Bases(nn.Module):
                 self._be_loud = False
 
             # Apply FiLM modulation to stiminds
-            # stiminds = torch.cat((stiminds, film), dim=-1)
             stiminds = torch.cat((stiminds, embedding_film), dim=-1)
 
         # Pass through MLP (stiminds is already (batch, stimdim))
         hidden = self.in_layer(stiminds)
         hidden = self.in_activation(hidden)
+        hidden = self.dropout(hidden)
 
         # Hidden stack
         for layer in self.hiddens:
             hidden = self.hidden_activation(layer(hidden))
+            hidden = self.dropout(hidden)
 
         self.last_hidden = hidden
 
