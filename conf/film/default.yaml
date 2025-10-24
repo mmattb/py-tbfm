@@ -3,8 +3,8 @@
 
 film:
   training:
-    inner_steps: 30
+    inner_steps: 100
     support_size: 300
     optim:
-      lr: 1e-4
-      weight_decay: 1e-3
+      lr: 5e-3
+      weight_decay: 1e-5

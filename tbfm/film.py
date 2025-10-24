@@ -212,6 +212,7 @@ def inner_update_stopgrad(
     }
     if quiet:
         return embeddings_stim
+
     return embeddings_stim, losses
 
 

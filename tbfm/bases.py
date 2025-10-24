@@ -27,6 +27,7 @@ class Bases(nn.Module):
         use_film: bool = False,
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
+        proj_film_dim: int = 32,
         basis_gen_dropout: float = 0.0,
         device=None,
     ):
@@ -40,6 +41,7 @@ class Bases(nn.Module):
             use_film: whether to use FiLM modulation
             embed_dim_rest: dimensionality of the rest data embedding, for FiLM
             embed_dim_stim: dimensionality of the stim data embedding, for FiLM
+            proj_film_dim: dimensionality of the film embedding network
             basis_gen_dropout: dropout rate for basis generator hidden layers
             device []: something tensor.to() would accept
         """
@@ -49,6 +51,7 @@ class Bases(nn.Module):
         self.trial_len = trial_len
         self.latent_dim = latent_dim
         self.use_film = use_film
+        self.proj_film_dim = proj_film_dim
         self.stimdim = stimdim
 
         # Input is just stimdim (not flattened over time)
@@ -64,7 +67,7 @@ class Bases(nn.Module):
         # Core MLP
         self.in_layer = nn.Linear(in_dim, latent_dim)
         self.in_activation = nn.Tanh()
-        self.dropout = nn.Dropout(p=basis_gen_dropout)  # Regularize basis generator
+        self.dropout = nn.Dropout(p=basis_gen_dropout)
 
         self.hiddens = nn.ModuleList()
         for _ in range(basis_depth):
@@ -77,9 +80,11 @@ class Bases(nn.Module):
         if use_film:
             # FiLM modulates the stimdim input (before MLP)
             self.proj_film = nn.Sequential(
-                nn.Linear(self.embed_dim_film, 32),
+                nn.Linear(self.embed_dim_film, proj_film_dim),
                 nn.Tanh(),
-                nn.Linear(32, self.embed_dim_film),  # For now: this is just a transform
+                nn.Linear(
+                    proj_film_dim, self.embed_dim_film
+                ),  # For now: this is just a transform
                 nn.Tanh(),
             )
             # Initialize final layer to small weights (start near identity)

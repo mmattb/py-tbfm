@@ -475,7 +475,7 @@ def test_time_adaptation(
     # TODO we should probably enforce that somehow.
     _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
 
-    embeddings_stim = film.inner_update_stopgrad(
+    embeddings_stim, _ = film.inner_update_stopgrad(
         model,
         data_train,
         embeddings_rest,
@@ -491,7 +491,7 @@ def test_time_adaptation(
             loss_outer = 0
             r2_outer = 0
             test_batch_count = 0
-            final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
+            final_test_r2s = {session_id: 0 for session_id in data_train.keys()}
             for test_batch in data_test:
                 test_batch = utils.move_batch(test_batch, device=device)
                 tb_norm = {}
@@ -540,6 +540,8 @@ def test_time_adaptation(
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    results["y_hat_test"] = y_hat_test
+    results["y_test"] = test_batch
     return embeddings_stim, results
 
 
