@@ -101,12 +101,14 @@ def get_optims(cfg, model_ms: TBFMMultisession):
     # Will have only 1 elem if tbfm is shared.
     optims_model = model_ms.model.get_optim_custom_base(**cfg.tbfm.training.optim)
 
-    def warmup_cos(warmup):
+    def warmup_cos(warmup, cos=True):
         def _inner(step):
             if step < warmup:
                 return (step + 1) / max(1, warmup)
-            t = (step - warmup) / max(1, cfg.training.epochs - warmup)
-            return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+            if cos:
+                t = (step - warmup) / max(1, cfg.training.epochs - warmup)
+                return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+            return 1.0
 
         return _inner
 
@@ -121,10 +123,10 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         optim_bw, optim_bg, optim_film = optims
 
         bw_optims.append(optim_bw)
-        bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500)))
+        bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500, cos=False)))
 
         bg_optims.append(optim_bg)
-        bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(3000)))
+        bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(5000)))
 
         if optim_film is not None:
             film_optims.append(optim_film)
@@ -474,6 +476,8 @@ def test_time_adaptation(
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
     _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
+
+    # TODO: need to do the AE warm starting here.
 
     embeddings_stim, _ = film.inner_update_stopgrad(
         model,
