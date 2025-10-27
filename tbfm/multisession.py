@@ -208,6 +208,7 @@ def train_from_cfg(
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
     support_size = support_size or cfg.film.training.support_size
+    ae_freeze_epoch = cfg.training.get("ae_freeze_epoch", None)
     device = model.device
 
     embeddings_stim = None  # default
@@ -293,19 +294,25 @@ def train_from_cfg(
         #    utils.log_grad_norms(model.ae.instances["MonkeyG_20150925_Session2_S1"])
 
         # Alternating updates: update basis weights more frequently than basis generator
+        # Also: freeze AE after specified epoch to prevent late-stage overfitting
+        skip_groups = []
+
+        if ae_freeze_epoch is not None and eidx >= ae_freeze_epoch:
+            skip_groups.append("ae")
+
         if alternating_updates:
             # Every basis_weight_steps_per_basis iterations, update both
             # Otherwise, only update basis weights
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
             if update_basis_gen:
-                # Update everything (basis weights, basis gen, film, ae, norm)
-                model_optims.step()
+                # Update everything (basis weights, basis gen, film, ae, norm) minus frozen groups
+                model_optims.step(skip=skip_groups)
             else:
-                # Update only basis weights (skip basis gen and film)
-                model_optims.step(skip=["bg", "film"])
+                # Update only basis weights (skip basis gen and film) minus frozen groups
+                model_optims.step(skip=["bg", "film"] + skip_groups)
         else:
-            model_optims.step()
+            model_optims.step(skip=skip_groups)
 
         if data_test is not None and (eidx % test_interval) == 0:
             train_r2s.append((eidx, sum(r2_trains) / len(y_query)))

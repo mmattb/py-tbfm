@@ -26,6 +26,7 @@ training:
   num_held_out_sessions: 15
   grad_clip: 2.0
   bw_steps_per_bg_step: 3  # Update basis weights this many times per basis update
+  ae_freeze_epoch: 5000    # Freeze AE after this epoch to prevent late-stage overfit
 
 # Device settings
 device: auto  # auto, cpu, cuda
