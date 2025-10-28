@@ -94,7 +94,21 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         raise NotImplementedError("No normalizer adaptation yet")
 
     if cfg.ae.training.coadapt:
-        optims_aes = list(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
+        use_two_stage = cfg.ae.get("use_two_stage", False)
+
+        if use_two_stage:
+            # Two-stage AE returns a single optimizer with param groups
+            optim_ae = model_ms.ae.get_optim(
+                adapter_lr=cfg.ae.two_stage.adapter_lr,
+                encoder_lr=cfg.ae.two_stage.encoder_lr,
+                eps=cfg.ae.training.optim.eps,
+                weight_decay=cfg.ae.training.optim.weight_decay,
+                amsgrad=cfg.ae.training.optim.amsgrad,
+            )
+            optims_aes = [optim_ae]
+        else:
+            # Single-stage AE dispatcher returns dict of optimizers
+            optims_aes = list(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
     else:
         optims_aes = []
 
@@ -270,6 +284,8 @@ def train_from_cfg(
         cur_loss = sum(losses.values()) / len(y_query)
 
         # Add AE reconstruction loss (optional)
+        use_two_stage = cfg.ae.get("use_two_stage", False)
+
         if lambda_ae_recon > 0:
             runways_normalized, runways_recon = model.forward_reconstruct(query)
             ae_recon_loss = 0.0
@@ -279,6 +295,33 @@ def train_from_cfg(
             ae_recon_loss /= len(query)
 
             cur_loss += lambda_ae_recon * ae_recon_loss
+        else:
+            runways_normalized = None
+
+        # Add moment matching losses for two-stage AE (optional)
+        if use_two_stage:
+            lambda_mu = cfg.ae.two_stage.get("lambda_mu", 0.0)
+            lambda_cov = cfg.ae.two_stage.get("lambda_cov", 0.0)
+
+            if lambda_mu > 0 or lambda_cov > 0:
+                # Normalize runways if not already done
+                if runways_normalized is None:
+                    runways = {sid: d[0] for sid, d in query.items()}
+                    runways_normalized = model.norms(runways)
+
+                # Collect latents from all query sessions
+                all_z = []
+                for sid, runway_norm in runways_normalized.items():
+                    z = model.ae.encode(runway_norm, session_id=sid)
+                    all_z.append(z.flatten(end_dim=-2))  # Flatten batch/time
+
+                z_batch = torch.cat(all_z, dim=0)  # [total_samples, latent_dim]
+                L_mu, L_cov = model.ae.moment_matching_loss(z_batch)
+
+                if lambda_mu > 0:
+                    cur_loss += lambda_mu * L_mu
+                if lambda_cov > 0:
+                    cur_loss += lambda_cov * L_cov
 
         tbfm_regs = model.model.get_weighting_reg()
         cur_loss += (
@@ -305,8 +348,26 @@ def train_from_cfg(
         # Also: freeze AE after specified epoch to prevent late-stage overfitting
         skip_groups = []
 
+        use_two_stage = cfg.ae.get("use_two_stage", False)
+
         if ae_freeze_epoch is not None and eidx >= ae_freeze_epoch:
-            skip_groups.append("ae")
+            if use_two_stage:
+                # For two-stage: optionally freeze only shared encoder/decoder, keep adapters trainable
+                freeze_only_shared = cfg.ae.two_stage.get("freeze_only_shared", False)
+
+                if freeze_only_shared:
+                    # Freeze shared encoder/decoder parameters
+                    for param in model.ae.encoder.parameters():
+                        param.requires_grad = False
+                    if model.ae.decoder_bias is not None:
+                        model.ae.decoder_bias.requires_grad = False
+                    # Adapters remain trainable - don't skip "ae" group
+                else:
+                    # Freeze entire AE (adapters + encoder/decoder)
+                    skip_groups.append("ae")
+            else:
+                # Single-stage: freeze all AE instances
+                skip_groups.append("ae")
 
         if alternating_updates:
             # Every basis_weight_steps_per_basis iterations, update both
