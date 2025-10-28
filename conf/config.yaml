@@ -10,7 +10,7 @@ name: tbfm_experiment
 debug: false
 
 # TBFM lives in this space by default
-latent_dim: 50
+latent_dim: 80
 covariate_dim: 3 # e.g. dim of stim parameters
 
 data:
