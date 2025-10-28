@@ -208,7 +208,8 @@ def train_from_cfg(
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
     support_size = support_size or cfg.film.training.support_size
-    ae_freeze_epoch = cfg.training.get("ae_freeze_epoch", None)
+    ae_freeze_epoch = cfg.ae.training.get("ae_freeze_epoch", None)
+    lambda_ae_recon = cfg.ae.training.get("lambda_ae_recon", 0.0)
     device = model.device
 
     embeddings_stim = None  # default
@@ -268,6 +269,18 @@ def train_from_cfg(
 
         cur_loss = sum(losses.values()) / len(y_query)
 
+        # Add AE reconstruction loss (optional)
+        if lambda_ae_recon > 0:
+            ae_recon_loss = 0
+            for sid, d in query.items():
+                runway_raw = d[0]  # (batch, time, channels)
+                runway_norm = model.norms.instances[sid](runway_raw)
+                runway_latent = model.ae.instances[sid].encode(runway_norm)
+                runway_recon = model.ae.instances[sid].decode(runway_latent)
+                ae_recon_loss += nn.functional.mse_loss(runway_recon, runway_norm)
+            ae_recon_loss /= len(query)
+            cur_loss += cfg.training.lambda_ae_recon * ae_recon_loss
+
         tbfm_regs = model.model.get_weighting_reg()
         cur_loss += (
             cfg.tbfm.training.lambda_fro * sum(tbfm_regs.values()) / len(y_query)
@@ -288,10 +301,6 @@ def train_from_cfg(
 
         if grad_clip is not None:
             model_optims.clip_grad(value=grad_clip)
-
-        # if eidx == 3000:
-        #    utils.log_grad_norms(model.model.instances["MonkeyG_20150925_Session2_S1"])
-        #    utils.log_grad_norms(model.ae.instances["MonkeyG_20150925_Session2_S1"])
 
         # Alternating updates: update basis weights more frequently than basis generator
         # Also: freeze AE after specified epoch to prevent late-stage overfitting

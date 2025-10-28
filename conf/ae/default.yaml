@@ -20,6 +20,8 @@ ae:
 
   training:
     coadapt: true # If true, we will adapt in a supervised manner after PCA warm-up
+    ae_freeze_epoch: 5000    # Freeze AE after this epoch to prevent late-stage overfit
+    lambda_ae_recon: 0.0     # Weight for AE reconstruction loss (0 = disabled)
     optim:
       lr: 1e-5
       eps: 1e-8
