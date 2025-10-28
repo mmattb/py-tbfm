@@ -9,7 +9,7 @@ tbfm:
     num_bases: 20
     trial_len: ${data.y_len}
     latent_dim: 16  # This is basis generator latent dim
-    basis_depth: 2
+    basis_depth: 3
     covariate_dim: ${covariate_dim}
     zscore: false
     use_film_bases: true
@@ -31,5 +31,5 @@ tbfm:
       lr_film: 3e-3
       wd_head: 1e-4
       wd_film: 1e-5
-    lambda_fro: 0.01
-    lambda_ortho: 0.01
+    lambda_fro: 0.04
+    lambda_ortho: 0.00
