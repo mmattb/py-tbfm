@@ -212,7 +212,7 @@ class LinearChannelAE(nn.Module):
         # Normalize rows
         R = w_enc_s / (w_enc_s.norm(dim=1, keepdim=True) + 1e-8)
         G = R @ R.t()  # (latent_dim, latent_dim)
-        I = torch.eye(G.size(0), device=G.device).to(self.device)
+        I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
         return ((G - I) ** 2).sum()
 
     def get_optim(
@@ -303,13 +303,6 @@ class TwoStageAffineAE(nn.Module):
         if use_encoder_bias:
             nn.init.zeros_(self.encoder.bias)
 
-        # Shared decoder (tied weights): d_z → d_c
-        # Note: decoder weight is encoder.weight.T, no separate parameters
-        if use_encoder_bias:
-            self.decoder_bias = nn.Parameter(torch.zeros(canonical_dim, device=device))
-        else:
-            self.decoder_bias = None
-
     def encode(self, x, session_id=None):
         """
         Encode input through adapter then shared encoder.
@@ -333,6 +326,10 @@ class TwoStageAffineAE(nn.Module):
     def decode(self, z, session_id=None):
         """
         Decode latent through shared decoder then adapter transpose.
+        
+        Decoder uses tied weights (W_d = W_e^T) and symmetric bias handling:
+        - If encoder has bias b_e, decode as: h = W_e^T @ (z - b_e)
+        - If adapter has bias b_a, we need to invert it: x = A^T @ (h - b_a)
 
         Args:
             z: latent tensor (..., d_z) or dict {session_id: (..., d_z)}
@@ -345,17 +342,22 @@ class TwoStageAffineAE(nn.Module):
             return {sid: self.decode(z_s, session_id=sid) for sid, z_s in z.items()}
 
         # z: (..., d_z) → decoder (tied) → (..., d_c)
-        h = z @ self.encoder.weight  # Tied: W_d = W_e^T
-        if self.decoder_bias is not None:
-            h = h + self.decoder_bias
+        # Symmetric bias handling: h = W_e^T @ (z - b_e)
+        if self.encoder.bias is not None:
+            z_unbiased = z - self.encoder.bias
+            h = z_unbiased @ self.encoder.weight  # (z - b_e) @ W_e^T
+        else:
+            h = z @ self.encoder.weight  # z @ W_e^T
 
         # h: (..., d_c) → adapter^T → (..., d_s)
+        # Invert adapter: x = A^T @ (h - b_a)
         adapter = self.adapters[session_id]
-        x_hat = h @ adapter.weight  # Use transpose of adapter weight
-        if self.use_adapter_bias:
-            # For reconstruction, we typically don't add adapter bias on decode
-            # (symmetric with encode where bias is added)
-            pass
+        if self.use_adapter_bias and adapter.bias is not None:
+            h_unbiased = h - adapter.bias  # Remove bias before transpose
+            x_hat = h_unbiased @ adapter.weight
+        else:
+            x_hat = h @ adapter.weight
+        
         return x_hat
 
     def reconstruct(self, x, session_id=None):
@@ -559,14 +561,6 @@ class TwoStageAffineAE(nn.Module):
 
         if self.encoder.bias is not None:
             param_groups[1]["params"] = [self.encoder.weight, self.encoder.bias]
-
-        if self.decoder_bias is not None:
-            param_groups.append(
-                {
-                    "params": [self.decoder_bias],
-                    "lr": encoder_lr,
-                }
-            )
 
         return torch.optim.AdamW(
             param_groups,

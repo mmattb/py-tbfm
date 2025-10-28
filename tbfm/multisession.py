@@ -359,8 +359,6 @@ def train_from_cfg(
                     # Freeze shared encoder/decoder parameters
                     for param in model.ae.encoder.parameters():
                         param.requires_grad = False
-                    if model.ae.decoder_bias is not None:
-                        model.ae.decoder_bias.requires_grad = False
                     # Adapters remain trainable - don't skip "ae" group
                 else:
                     # Freeze entire AE (adapters + encoder/decoder)

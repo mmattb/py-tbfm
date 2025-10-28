@@ -20,8 +20,8 @@ ae:
   # Two-stage specific configuration (only used when use_two_stage=true)
   two_stage:
     canonical_dim: 65  # Intermediate canonical dimension (approx median of 40-92 channel range)
-    use_adapter_bias: true
-    use_encoder_bias: true
+    use_adapter_bias: true   # Adapters handle session-specific centering
+    use_encoder_bias: false  # Shared encoder uses tied weights without bias (cleaner geometry)
     
     # Freezing strategy
     freeze_only_shared: true  # If true, freeze only encoder/decoder after ae_freeze_epoch (keep adapters trainable)
