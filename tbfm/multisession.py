@@ -271,15 +271,14 @@ def train_from_cfg(
 
         # Add AE reconstruction loss (optional)
         if lambda_ae_recon > 0:
-            ae_recon_loss = 0
-            for sid, d in query.items():
-                runway_raw = d[0]  # (batch, time, channels)
-                runway_norm = model.norms.instances[sid](runway_raw)
-                runway_latent = model.ae.instances[sid].encode(runway_norm)
-                runway_recon = model.ae.instances[sid].decode(runway_latent)
-                ae_recon_loss += nn.functional.mse_loss(runway_recon, runway_norm)
+            runways_normalized, runways_recon = model.forward_reconstruct(query)
+            ae_recon_loss = 0.0
+            for sid, rn in runways_normalized.items():
+                rr = runways_recon[sid]
+                ae_recon_loss += nn.functional.mse_loss(rr, rn)
             ae_recon_loss /= len(query)
-            cur_loss += cfg.training.lambda_ae_recon * ae_recon_loss
+
+            cur_loss += lambda_ae_recon * ae_recon_loss
 
         tbfm_regs = model.model.get_weighting_reg()
         cur_loss += (

@@ -38,5 +38,12 @@ class TBFMMultisession(nn.Module):
         y_hat = forecast_decoded
         return y_hat
 
+    def forward_reconstruct(self, data):
+        runways = {sid: d[0] for sid, d in data.items()}
+        runways_normalized = self.norms(runways)
+        runways_latent = self.ae.encode(runways_normalized)
+        runways_decoded = self.ae.decode(runways_latent)
+        return runways_normalized, runways_decoded
+
     def normalize(self, y):
         return self.norms(y)
