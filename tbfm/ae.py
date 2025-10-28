@@ -326,7 +326,7 @@ class TwoStageAffineAE(nn.Module):
     def decode(self, z, session_id=None):
         """
         Decode latent through shared decoder then adapter transpose.
-        
+
         Decoder uses tied weights (W_d = W_e^T) and symmetric bias handling:
         - If encoder has bias b_e, decode as: h = W_e^T @ (z - b_e)
         - If adapter has bias b_a, we need to invert it: x = A^T @ (h - b_a)
@@ -357,7 +357,7 @@ class TwoStageAffineAE(nn.Module):
             x_hat = h_unbiased @ adapter.weight
         else:
             x_hat = h @ adapter.weight
-        
+
         return x_hat
 
     def reconstruct(self, x, session_id=None):
@@ -440,8 +440,7 @@ class TwoStageAffineAE(nn.Module):
                     Q, _ = torch.linalg.qr(rand_vecs.T)
                     self.adapters[session_id].weight[k:, :] = Q.T[:remaining, :]
 
-            # Project to canonical space for step 2
-            with torch.no_grad():
+                # Project to canonical space for step 2
                 h_s = self.adapters[session_id](x_s)
                 canonical_data[session_id] = h_s
 
@@ -464,12 +463,15 @@ class TwoStageAffineAE(nn.Module):
             S_top = S[:k].clamp_min(eps)
             V_top = V_top / S_top.unsqueeze(1)
 
-        # Initialize encoder weight
+        # Initialize encoder weight with PCA directions
         with torch.no_grad():
             self.encoder.weight[:k, :] = V_top
-            # Orthonormalize
-            Q, _ = torch.linalg.qr(self.encoder.weight.T)
-            self.encoder.weight[:] = Q.T[: self.latent_dim, :]
+
+            # Orthonormalize the rows we just initialized
+            W_slice = self.encoder.weight[:k, :]  # [k, d_c]
+            Q, _ = torch.linalg.qr(W_slice.T, mode="reduced")  # [d_c, k]
+            self.encoder.weight[:k, :] = Q.T  # [k, d_c]
+            # Remaining rows (if k < latent_dim) keep their Kaiming initialization
 
     def identity_warm_start(self):
         """Initialize with identity-like mappings (for debugging)."""
