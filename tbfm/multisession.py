@@ -12,6 +12,7 @@ from typing import Dict, Tuple, List
 from . import ae
 from . import dataset
 from . import film
+from . import flow_ae  # Normalizing flow autoencoder support
 from . import normalizers
 from . import tbfm
 from . import utils
@@ -28,6 +29,15 @@ def build_from_cfg(
     quiet=False,
     device=None,
 ):
+    """
+    Build complete multisession TBFM model from config.
+
+    Autoencoder type is determined by cfg.ae.module._target_:
+    - tbfm.ae.LinearChannelAE: Linear tied-weight autoencoder (default)
+    - tbfm.flow_ae.FlowChannelAE: Normalizing flow autoencoder (invertible)
+
+    To use flow autoencoder, set: ae=flow in config or overrides.
+    """
     latent_dim = cfg["latent_dim"]
 
     with torch.no_grad():
@@ -37,6 +47,9 @@ def build_from_cfg(
         norms = normalizers.from_cfg(cfg, session_data, device=device)
 
         # Autoencoders ------
+        # Note: ae.from_cfg_and_data uses Hydra instantiate, which respects
+        # cfg.ae.module._target_ to determine which autoencoder class to create.
+        # This allows seamless switching between LinearChannelAE and FlowChannelAE.
         if not quiet:
             print("Building and warm starting AEs...")
         aes = ae.from_cfg_and_data(
@@ -565,7 +578,7 @@ def load_stim_batched(
     batch_size=1000,
     window_size=184,
     session_subdir="torchraw",
-    data_dir="/home/mmattb/Projects/opto-coproc/data",
+    data_dir="/home/danmuir/Projects/tbfm_multisession/data",
     held_in_session_ids=None,
     num_held_out_sessions=10,
     unpack_stiminds=True,
