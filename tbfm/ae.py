@@ -372,6 +372,7 @@ class TwoStageAffineAE(nn.Module):
         center: str = "median",
         whiten: bool = False,
         eps: float = 1e-8,
+        max_samples_for_encoder: int = 10000,  # Limit samples for shared encoder PCA
     ):
         """
         Initialize adapters and encoder with PCA.
@@ -379,12 +380,13 @@ class TwoStageAffineAE(nn.Module):
         Strategy:
         1. For each session, run PCA on session data to initialize adapter
         2. Project all data through adapters to canonical space
-        3. Run PCA on canonical representations to initialize shared encoder
+        3. Sample from canonical space and run PCA to initialize shared encoder
 
         Args:
             data: dict {session_id: tensor [B, T, C_s]} or similar structure
             center: 'median' or 'mean' for centering
             whiten: whether to scale by inverse singular values
+            max_samples_for_encoder: max samples to use for encoder PCA (to avoid OOM)
         """
         # Step 1: Initialize adapters with per-session PCA
         canonical_data = {}
@@ -443,7 +445,15 @@ class TwoStageAffineAE(nn.Module):
                 canonical_data[session_id] = h_s
 
             # Step 2: Initialize shared encoder with PCA on canonical data
+            # Concatenate all canonical data and sample if needed
             h_all = torch.cat([canonical_data[sid] for sid in self.session_ids], dim=0)
+
+            # Sample if we have too many samples (to avoid OOM)
+            n_samples = h_all.shape[0]
+            if n_samples > max_samples_for_encoder:
+                # Random sample without replacement
+                indices = torch.randperm(n_samples)[:max_samples_for_encoder]
+                h_all = h_all[indices]
 
             # Center
             if center == "median":
@@ -462,13 +472,14 @@ class TwoStageAffineAE(nn.Module):
                 V_top = V_top / S_top.unsqueeze(1)
 
             # Initialize encoder weight with PCA directions
-            self.encoder.weight[:k, :] = V_top
+            with torch.no_grad():
+                self.encoder.weight[:k, :] = V_top
 
-            # Orthonormalize the rows we just initialized
-            W_slice = self.encoder.weight[:k, :]  # [k, d_c]
-            Q, _ = torch.linalg.qr(W_slice.T, mode="reduced")  # [d_c, k]
-            self.encoder.weight[:k, :] = Q.T  # [k, d_c]
-            # Remaining rows (if k < latent_dim) keep their Kaiming initialization
+                # Orthonormalize the rows we just initialized
+                W_slice = self.encoder.weight[:k, :]  # [k, d_c]
+                Q, _ = torch.linalg.qr(W_slice.T, mode="reduced")  # [d_c, k]
+                self.encoder.weight[:k, :] = Q.T  # [k, d_c]
+                # Remaining rows (if k < latent_dim) keep their Kaiming initialization
 
     def identity_warm_start(self):
         """Initialize with identity-like mappings (for debugging)."""
@@ -696,7 +707,8 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
                 ae.identity_warm_start()
             else:
                 # PCA warm-start on adapters and encoder
-                ae.pca_warm_start(data)
+                max_samples = cfg.ae.two_stage.get("max_samples_for_encoder_pca", 10000)
+                ae.pca_warm_start(data, max_samples_for_encoder=max_samples)
 
         return ae
 

@@ -133,20 +133,12 @@ def inner_update_stopgrad(
     lr: float = 5e-2,
     weight_decay: float = 1e-5,  # Reduced from 1e-3 to let embeddings escape zero
     grad_clip: int = 1.0,
-    use_early_stopping: bool = False,
-    early_stop_patience: int = 10,
-    early_stop_threshold: float = 1e-4,
     quiet=True,
 ) -> torch.Tensor:
     """
     Optimize a per-episode stim_embed on SUPPORT ONLY.
     Does NOT backprop through the inner loop (two-backprop variant).
     Returns a detached stim_embed to use on the QUERY pass.
-    
-    Args:
-        use_early_stopping: If True, stop when loss converges
-        early_stop_patience: Number of steps with no improvement before stopping
-        early_stop_threshold: Minimum loss change to count as improvement
     """
     embed_dim_stim = model.model.bases.embed_dim_stim
     # Split out y values for loss fn
@@ -182,10 +174,6 @@ def inner_update_stopgrad(
         sid: emb.detach() for sid, emb in embeddings_rest.items()
     }
 
-    # Early stopping tracking
-    prev_loss = float('inf')
-    stall_count = 0
-
     losses = []
     for eidx in range(inner_steps):
         optimizer_inner.zero_grad()
@@ -207,19 +195,6 @@ def inner_update_stopgrad(
             print(eidx, loss.item())
             losses.append((eidx, loss.item()))
 
-        # Early stopping check
-        if use_early_stopping:
-            loss_change = abs(loss.item() - prev_loss)
-            if loss_change < early_stop_threshold:
-                stall_count += 1
-                if stall_count >= early_stop_patience:
-                    if not quiet:
-                        print(f"Early stopping at step {eidx}, loss={loss.item():.6f}")
-                    break
-            else:
-                stall_count = 0
-            prev_loss = loss.item()
-
         # if regularizer_fn is not None:
         #    loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
 
@@ -237,7 +212,6 @@ def inner_update_stopgrad(
     }
     if quiet:
         return embeddings_stim
-
     return embeddings_stim, losses
 
 

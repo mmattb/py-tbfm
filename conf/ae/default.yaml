@@ -23,6 +23,9 @@ ae:
     use_adapter_bias: true   # Adapters handle session-specific centering
     use_encoder_bias: false  # Shared encoder uses tied weights without bias (cleaner geometry)
     
+    # PCA warm-start
+    max_samples_for_encoder_pca: 10000  # Max samples for encoder PCA (to avoid OOM on large datasets)
+    
     # Freezing strategy
     freeze_only_shared: true  # If true, freeze only encoder/decoder after ae_freeze_epoch (keep adapters trainable)
     
