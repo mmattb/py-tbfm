@@ -74,44 +74,42 @@ class LinearChannelAE(nn.Module):
         - Other columns of W_enc are left as-is (keep_rest=True). Set keep_rest=False if
           you want to zero them first (rarely needed).
         """
-        x = x.flatten(end_dim=1)
-        device = self.w_enc.device
-        dtype = self.w_enc.dtype
+        with torch.no_grad():
+            x = x.flatten(end_dim=1)
+            device = self.w_enc.device
+            dtype = self.w_enc.dtype
 
-        Xs = x.to(device=device, dtype=dtype)  # [N, C]
-        # Robust or standard centering
-        if center == "median":
-            c = Xs.median(dim=0).values
-        elif center == "mean":
-            c = Xs.mean(dim=0)
-        else:
-            raise ValueError("center must be 'median' or 'mean'")
-        Xc = Xs - c
+            Xs = x.to(device=device, dtype=dtype)  # [N, C]
+            # Robust or standard centering
+            if center == "median":
+                c = Xs.median(dim=0).values
+            elif center == "mean":
+                c = Xs.mean(dim=0)
+            else:
+                raise ValueError("center must be 'median' or 'mean'")
+            Xc = Xs - c
 
-        # SVD: Xc = U S Vh  (Vh: [min(N,C_s), C_s])
-        U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-        # Principal axes (columns of V): V = Vh^T, take top-k
-        C_s = Xs.shape[1]
-        k = min(self.latent_dim, C_s)
+            # SVD: Xc = U S Vh  (Vh: [min(N,C_s), C_s])
+            U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+            # Principal axes (columns of V): V = Vh^T, take top-k
+            C_s = Xs.shape[1]
+            k = min(self.latent_dim, C_s)
 
-        V_top = Vh[:k, :]  # [k, C_s]  (rows are top-k PCs^T)
-        if whiten:
-            # Whitening: scale each row by 1/sigma
-            S_top = S[:k].clamp_min(eps)  # [k]
-            V_top = V_top / S_top.unsqueeze(1)
+            V_top = Vh[:k, :]  # [k, C_s]  (rows are top-k PCs^T)
+            if whiten:
+                # Whitening: scale each row by 1/sigma
+                S_top = S[:k].clamp_min(eps)  # [k]
+                V_top = V_top / S_top.unsqueeze(1)
 
-        # Optionally zero the slice first
-        if not keep_rest:
-            with torch.no_grad():
+            # Optionally zero the slice first
+            if not keep_rest:
                 self.w_enc[:, mask] = 0.0
 
-        # Write PCA rows into the session slice
-        with torch.no_grad():
+            # Write PCA rows into the session slice
             self.w_enc[:k, mask] = V_top  # rows 0..k-1 get PCA directions
             # (If self.C_star > k, we leave remaining rows as-is.)
 
-        # Optional: row-orthonormalize the *written* rows of the slice for numerical niceness
-        with torch.no_grad():
+            # Optional: row-orthonormalize the *written* rows of the slice for numerical niceness
             W_slice = self.w_enc[:k, mask]  # [k, C_s]
             # Orthonormalize rows via QR on transpose (columns orthonormal -> rows orthonormal after T)
             Q, _ = torch.linalg.qr(W_slice.t(), mode="reduced")  # [C_s, k]
