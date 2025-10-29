@@ -391,46 +391,46 @@ class TwoStageAffineAE(nn.Module):
         # Step 1: Initialize adapters with per-session PCA
         canonical_data = {}
 
-        for session_id in self.session_ids:
-            # Extract session data
-            if isinstance(data, dict) and session_id in data:
-                x_s = data[session_id]
-                if isinstance(x_s, (tuple, list)):
-                    # Handle (runway, covariates, y) format
-                    x_s = torch.cat([x_s[0], x_s[2]], dim=1)  # concat runway + targets
-            else:
-                # Might be a data object with rotation method
-                from .utils import rotate_session_from_batch
+        with torch.no_grad():
+            for session_id in self.session_ids:
+                # Extract session data
+                if isinstance(data, dict) and session_id in data:
+                    x_s = data[session_id]
+                    if isinstance(x_s, (tuple, list)):
+                        # Handle (runway, covariates, y) format
+                        x_s = torch.cat(
+                            [x_s[0], x_s[2]], dim=1
+                        )  # concat runway + targets
+                else:
+                    # Might be a data object with rotation method
+                    d = rotate_session_from_batch(data, session_id, device=self.device)
+                    x_s = torch.cat((d[0], d[2]), dim=1)
 
-                d = rotate_session_from_batch(data, session_id, device=self.device)
-                x_s = torch.cat((d[0], d[2]), dim=1)
+                # Flatten to [N, C_s]
+                x_s = x_s.flatten(end_dim=-2).to(
+                    device=self.device, dtype=self.encoder.weight.dtype
+                )
 
-            # Flatten to [N, C_s]
-            x_s = x_s.flatten(end_dim=-2).to(
-                device=self.device, dtype=self.encoder.weight.dtype
-            )
+                # Center
+                if center == "median":
+                    c = x_s.median(dim=0).values
+                elif center == "mean":
+                    c = x_s.mean(dim=0)
+                else:
+                    raise ValueError("center must be 'median' or 'mean'")
+                x_c = x_s - c
 
-            # Center
-            if center == "median":
-                c = x_s.median(dim=0).values
-            elif center == "mean":
-                c = x_s.mean(dim=0)
-            else:
-                raise ValueError("center must be 'median' or 'mean'")
-            x_c = x_s - c
+                # SVD for PCA
+                U, S, Vh = torch.linalg.svd(x_c, full_matrices=False)
+                k = min(self.canonical_dim, x_c.shape[1])
 
-            # SVD for PCA
-            U, S, Vh = torch.linalg.svd(x_c, full_matrices=False)
-            k = min(self.canonical_dim, x_c.shape[1])
+                # Principal components (rows of Vh are PCs in input space)
+                V_top = Vh[:k, :]  # [k, C_s]
+                if whiten:
+                    S_top = S[:k].clamp_min(eps)
+                    V_top = V_top / S_top.unsqueeze(1)
 
-            # Principal components (rows of Vh are PCs in input space)
-            V_top = Vh[:k, :]  # [k, C_s]
-            if whiten:
-                S_top = S[:k].clamp_min(eps)
-                V_top = V_top / S_top.unsqueeze(1)
-
-            # Initialize adapter weight with PCs
-            with torch.no_grad():
+                # Initialize adapter weight with PCs
                 self.adapters[session_id].weight[:k, :] = V_top
                 # Orthonormalize in case k < canonical_dim
                 if k < self.canonical_dim:
@@ -444,27 +444,26 @@ class TwoStageAffineAE(nn.Module):
                 h_s = self.adapters[session_id](x_s)
                 canonical_data[session_id] = h_s
 
-        # Step 2: Initialize shared encoder with PCA on canonical data
-        h_all = torch.cat([canonical_data[sid] for sid in self.session_ids], dim=0)
+            # Step 2: Initialize shared encoder with PCA on canonical data
+            h_all = torch.cat([canonical_data[sid] for sid in self.session_ids], dim=0)
 
-        # Center
-        if center == "median":
-            c_h = h_all.median(dim=0).values
-        elif center == "mean":
-            c_h = h_all.mean(dim=0)
-        h_centered = h_all - c_h
+            # Center
+            if center == "median":
+                c_h = h_all.median(dim=0).values
+            elif center == "mean":
+                c_h = h_all.mean(dim=0)
+            h_centered = h_all - c_h
 
-        # SVD
-        U, S, Vh = torch.linalg.svd(h_centered, full_matrices=False)
-        k = min(self.latent_dim, self.canonical_dim)
+            # SVD
+            U, S, Vh = torch.linalg.svd(h_centered, full_matrices=False)
+            k = min(self.latent_dim, self.canonical_dim)
 
-        V_top = Vh[:k, :]  # [k, d_c]
-        if whiten:
-            S_top = S[:k].clamp_min(eps)
-            V_top = V_top / S_top.unsqueeze(1)
+            V_top = Vh[:k, :]  # [k, d_c]
+            if whiten:
+                S_top = S[:k].clamp_min(eps)
+                V_top = V_top / S_top.unsqueeze(1)
 
-        # Initialize encoder weight with PCA directions
-        with torch.no_grad():
+            # Initialize encoder weight with PCA directions
             self.encoder.weight[:k, :] = V_top
 
             # Orthonormalize the rows we just initialized
@@ -507,7 +506,7 @@ class TwoStageAffineAE(nn.Module):
             z = z.flatten(end_dim=-2)
 
         d_z = z.shape[1]
-        
+
         # Zero mean loss (normalized by number of dimensions)
         mu = z.mean(dim=0)
         L_mu = (mu**2).sum() / d_z
