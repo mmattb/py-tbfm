@@ -35,7 +35,7 @@ ae:
     
     # Optimizer settings (can differ from shared encoder)
     adapter_lr: 1e-4   # Learning rate for session adapters
-    encoder_lr: 1e-5   # Learning rate for shared encoder/decoder
+    encoder_lr: 1e-4   # Learning rate for shared encoder/decoder
   
   sharing:
     is_shared: false

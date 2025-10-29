@@ -493,8 +493,8 @@ class TwoStageAffineAE(nn.Module):
         """
         Compute moment matching losses to encourage standard Gaussian latent.
 
-        L_mu = ||mean(z)||^2  (penalize non-zero mean)
-        L_cov = ||cov(z) - I||^2  (penalize non-identity covariance)
+        L_mu = ||mean(z)||^2 / d_z  (mean squared deviation from zero, normalized)
+        L_cov = ||cov(z) - I||^2 / d_z^2  (mean squared deviation from identity, normalized)
 
         Args:
             z: latent tensor [N, d_z]
@@ -506,16 +506,18 @@ class TwoStageAffineAE(nn.Module):
         if z.ndim > 2:
             z = z.flatten(end_dim=-2)
 
-        # Zero mean loss
+        d_z = z.shape[1]
+        
+        # Zero mean loss (normalized by number of dimensions)
         mu = z.mean(dim=0)
-        L_mu = (mu**2).sum()
+        L_mu = (mu**2).sum() / d_z
 
-        # Identity covariance loss
+        # Identity covariance loss (normalized by number of matrix elements)
         z_centered = z - mu
         N = z.shape[0]
         cov = (z_centered.T @ z_centered) / (N - 1)
-        I = torch.eye(z.shape[1], device=z.device, dtype=z.dtype)
-        L_cov = ((cov - I) ** 2).sum()
+        I = torch.eye(d_z, device=z.device, dtype=z.dtype)
+        L_cov = ((cov - I) ** 2).sum() / (d_z * d_z)
 
         return L_mu, L_cov
 

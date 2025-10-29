@@ -224,6 +224,8 @@ def train_from_cfg(
     support_size = support_size or cfg.film.training.support_size
     ae_freeze_epoch = cfg.ae.training.get("ae_freeze_epoch", None)
     lambda_ae_recon = cfg.ae.training.get("lambda_ae_recon", 0.0)
+    lambda_mu = cfg.ae.two_stage.get("lambda_mu", 0.0)
+    lambda_cov = cfg.ae.two_stage.get("lambda_cov", 0.0)
     device = model.device
 
     embeddings_stim = None  # default
@@ -282,6 +284,7 @@ def train_from_cfg(
             r2_trains.append(r2_train.item())
 
         cur_loss = sum(losses.values()) / len(y_query)
+        train_losses.append((eidx, cur_loss.item()))
 
         # Add AE reconstruction loss (optional)
         use_two_stage = cfg.ae.get("use_two_stage", False)
@@ -300,9 +303,6 @@ def train_from_cfg(
 
         # Add moment matching losses for two-stage AE (optional)
         if use_two_stage:
-            lambda_mu = cfg.ae.two_stage.get("lambda_mu", 0.0)
-            lambda_cov = cfg.ae.two_stage.get("lambda_cov", 0.0)
-
             if lambda_mu > 0 or lambda_cov > 0:
                 # Normalize runways if not already done
                 if runways_normalized is None:
@@ -336,8 +336,6 @@ def train_from_cfg(
         )
 
         loss = cur_loss
-
-        train_losses.append((eidx, loss.item()))
 
         loss.backward()
 

@@ -136,9 +136,8 @@ class TBFM(nn.Module):
         """
         Returns the Frobenius norm of the basis weightings, used to regularize during training.
         """
-        # This assumes that we ought to weight each of these evenly?
-        #  Seems okay.
-        l = torch.linalg.norm(self.basis_weighting.weight, ord="fro")
+        W = self.basis_weighting.weight
+        l = torch.linalg.norm(W, ord="fro") / (W.numel() ** 0.5)
         return l
 
     def get_basis_rms_reg(self, eps: float = 1e-8) -> torch.Tensor:

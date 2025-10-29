@@ -31,5 +31,5 @@ tbfm:
       lr_film: 3e-3
       wd_head: 1e-4
       wd_film: 1e-5
-    lambda_fro: 0.03
+    lambda_fro: 45.0
     lambda_ortho: 0.00
