@@ -130,7 +130,7 @@ def inner_update_stopgrad(
     data_support,
     embeddings_rest,
     cfg,
-    inner_steps: int = None,
+    inner_steps_override: int = None,
     quiet=True,
 ) -> torch.Tensor:
     """
@@ -139,15 +139,15 @@ def inner_update_stopgrad(
     Returns a detached stim_embed to use on the QUERY pass.
 
     Args:
-        inner_steps: Optional override for number of inner steps.
-                             If None, uses cfg.film.training.inner_steps
+        inner_steps_override: Optional override for number of inner steps.
+                             If None, uses cfg.meta.training.inner_steps
     """
     # Extract parameters from config
     inner_steps = (
-        inner_steps if inner_steps is not None else cfg.film.training.inner_steps
+        inner_steps_override if inner_steps_override is not None else cfg.meta.training.inner_steps
     )
-    lr = cfg.film.training.optim.lr
-    weight_decay = cfg.film.training.optim.weight_decay
+    lr = cfg.meta.training.optim.lr
+    weight_decay = cfg.meta.training.optim.weight_decay
     grad_clip = cfg.training.grad_clip
 
     embed_dim_stim = model.model.bases.embed_dim_stim
@@ -166,7 +166,7 @@ def inner_update_stopgrad(
 
     optimizer_inner = utils.OptimCollection(
         {
-            "film": {
+            "meta": {
                 "optimizers": [
                     torch.optim.AdamW((se,), lr=lr, weight_decay=weight_decay)
                     for se in embeddings_stim.values()
@@ -207,7 +207,7 @@ def inner_update_stopgrad(
 
         # Optional L2 penalty to maintain a small sorta trust region
         # Using mean() for dimension normalization so penalty is scale-invariant
-        lambda_l2 = cfg.film.training.lambda_l2
+        lambda_l2 = cfg.meta.training.lambda_l2
         if lambda_l2:
             l2_reg = 0.0
             for emb in embeddings_stim.values():

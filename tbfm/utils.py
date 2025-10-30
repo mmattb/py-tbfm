@@ -137,7 +137,7 @@ class OptimCollection:
         groups = {
             "bw": {"optimizers": [optim_bw], "schedulers": [sched_bw]},
             "bg": {"optimizers": [optim_bg], "schedulers": [sched_bg]},
-            "film": {"optimizers": [optim_film]},
+            "meta": {"optimizers": [optim_meta]},
             "ae": {"optimizers": [optim_ae1, optim_ae2]},
         }
         optim_collection = OptimCollection(groups)
@@ -146,7 +146,7 @@ class OptimCollection:
         optim_collection.step()
         
         # Update only specific groups
-        optim_collection.step(only=["bw", "film"])
+        optim_collection.step(only=["bw", "meta"])
         
         # Update all except specific groups
         optim_collection.step(skip=["bg"])

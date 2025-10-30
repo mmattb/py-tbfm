@@ -3,7 +3,7 @@ defaults:
   - tbfm: default
   - normalizers: default
   - ae: default
-  - film: default
+  - meta: default
 
 # General settings
 name: tbfm_experiment

@@ -11,7 +11,7 @@ from typing import Dict, Tuple, List
 
 from . import ae
 from . import dataset
-from . import film
+from . import meta
 from . import normalizers
 from . import tbfm
 from . import utils
@@ -131,10 +131,10 @@ def get_optims(cfg, model_ms: TBFMMultisession):
     bw_schedulers = []
     bg_optims = []
     bg_schedulers = []
-    film_optims = []
+    meta_optims = []
 
     for sid, optims in optims_model.items():
-        optim_bw, optim_bg, optim_film = optims
+        optim_bw, optim_bg, optim_meta = optims
 
         bw_optims.append(optim_bw)
         bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500, cos=False)))
@@ -142,8 +142,8 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         bg_optims.append(optim_bg)
         bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(5000)))
 
-        if optim_film is not None:
-            film_optims.append(optim_film)
+        if optim_meta is not None:
+            meta_optims.append(optim_meta)
 
     # Create named optimizer groups
     groups = {
@@ -151,7 +151,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         "ae": {"optimizers": optims_aes, "schedulers": []},
         "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
         "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
-        "film": {"optimizers": film_optims, "schedulers": []},
+        "meta": {"optimizers": meta_optims, "schedulers": []},
     }
 
     return utils.OptimCollection(groups)
@@ -209,11 +209,11 @@ def train_from_cfg(
     """
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
-    use_film = cfg.tbfm.module.use_film_bases
+    use_meta = cfg.tbfm.module.use_meta_learning
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
-    support_size = support_size or cfg.film.training.support_size
+    support_size = support_size or cfg.meta.training.support_size
     ae_freeze_epoch = cfg.ae.training.ae_freeze_epoch
     lambda_ae_recon = cfg.ae.training.lambda_ae_recon
     lambda_mu = cfg.ae.two_stage.lambda_mu
@@ -263,9 +263,9 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
-        if use_film:
+        if use_meta:
             model.eval()
-            embeddings_stim = film.inner_update_stopgrad(
+            embeddings_stim = meta.inner_update_stopgrad(
                 model,
                 support,
                 embeddings_rest,
@@ -379,11 +379,11 @@ def train_from_cfg(
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
             if update_basis_gen:
-                # Update everything (basis weights, basis gen, film, ae, norm) minus frozen groups
+                # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
                 model_optims.step(skip=skip_groups)
             else:
-                # Update only basis weights (skip basis gen and film) minus frozen groups
-                model_optims.step(skip=["bg", "film"] + skip_groups)
+                # Update only basis weights (skip basis gen and meta) minus frozen groups
+                model_optims.step(skip=["bg", "meta"] + skip_groups)
         else:
             model_optims.step(skip=skip_groups)
 
@@ -421,8 +421,8 @@ def train_from_cfg(
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
-    use_film = cfg.tbfm.module.use_film_bases
-    if use_film:
+    use_meta = cfg.tbfm.module.use_meta_learning
+    if use_meta:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
         )
@@ -433,12 +433,12 @@ def train_from_cfg(
         )
 
         model_optims.zero_grad(set_to_none=True)
-        embeddings_stim = film.inner_update_stopgrad(
+        embeddings_stim = meta.inner_update_stopgrad(
             model,
             support,
             embeddings_rest,
             cfg,
-            inner_steps=(3 * cfg.film.training.inner_steps),
+            inner_steps=(3 * cfg.meta.training.inner_steps),
         )
 
     # Final test evaluation
@@ -528,7 +528,7 @@ def test_time_adaptation(
 
     # TODO: need to do the AE warm starting here.
 
-    embeddings_stim, _ = film.inner_update_stopgrad(
+    embeddings_stim, _ = meta.inner_update_stopgrad(
         model,
         data_train,
         embeddings_rest,
@@ -628,7 +628,7 @@ def load_rest_embeddings(
     session_ids, in_dir="data", in_subdir="embedding_rest", device=None
 ):
     """
-    See film.cache_rest_embeds.
+    See meta.cache_rest_embeds.
     """
     embeddings_rest = {}
     for session_id in session_ids:
@@ -636,7 +636,3 @@ def load_rest_embeddings(
         er = torch.load(path).to(device)
         embeddings_rest[session_id] = er
     return embeddings_rest
-
-
-# TODO: inner loop regularization
-# TODO: AE regularization including orthogonality

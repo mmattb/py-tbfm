@@ -12,8 +12,8 @@ tbfm:
     basis_depth: 3
     covariate_dim: ${covariate_dim}
     zscore: false
-    use_film_bases: true
-    proj_film_dim: 32
+    use_meta_learning: true
+    proj_meta_dim: 32
     basis_gen_dropout: 0.3
     embed_dim_rest: 3
     embed_dim_stim: 15
@@ -28,8 +28,8 @@ tbfm:
   training:
     optim:
       lr_head: 4e-4
-      lr_film: 3e-3
+      lr_meta: 3e-3
       wd_head: 1e-4
-      wd_film: 1e-5
+      wd_meta: 1e-5
     lambda_fro: 45.0
     lambda_ortho: 0.00

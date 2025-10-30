@@ -29,8 +29,8 @@ class TBFM(nn.Module):
         covariate_dim=None,
         basis_depth=2,
         zscore=True,
-        use_film_bases: bool = False,
-        proj_film_dim: int = 32,
+        use_meta_learning: bool = False,
+        proj_meta_dim: int = 32,
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
         basis_gen_dropout: float = 0.0,
@@ -56,7 +56,7 @@ class TBFM(nn.Module):
         self.device = device
         self.prev_bases = None
         self.prev_basis_weights = None
-        self.use_film_bases = use_film_bases
+        self.use_meta_learning = use_meta_learning
 
         if zscore:
             self.normalizer = normalizers.ScalerZscore()
@@ -73,8 +73,8 @@ class TBFM(nn.Module):
             trial_len,
             latent_dim=latent_dim,
             basis_depth=basis_depth,
-            use_film=use_film_bases,
-            proj_film_dim=proj_film_dim,
+            use_meta=use_meta_learning,
+            proj_meta_dim=proj_meta_dim,
             embed_dim_rest=embed_dim_rest,
             embed_dim_stim=embed_dim_stim,
             basis_gen_dropout=basis_gen_dropout,
@@ -104,33 +104,34 @@ class TBFM(nn.Module):
     def get_optim_custom_base(
         self,
         lr_head: float = 1e-3,
-        lr_film: float = 3e-3,
+        lr_meta: float = 3e-3,
         wd_head: float = 1e-4,
-        wd_film: float = 1e-5,
+        wd_meta: float = 1e-5,
     ):
         """
-        Returns two optimizers:
-          - optim_head: basis weighting + core Bases MLP (non-FiLM)
-          - optim_film: FiLM-specific params (proj_rest, proj_stim, gate, film_head)
+        Returns three optimizers:
+          - optim_bw: basis weighting
+          - optim_bg: core Bases MLP (basis generator)
+          - optim_meta: meta-learning specific params (embedding projections)
         """
         optim_bw = torch.optim.AdamW(
             self.basis_weighting.parameters(),
             lr=0.5 * lr_head,
             weight_decay=wd_head,
         )
-        bases_core_params, bases_film_params = self.bases.get_params()
+        bases_core_params, bases_meta_params = self.bases.get_params()
 
         # flatten
         bg_params = [p for group in bases_core_params for p in group]
 
         optim_bg = torch.optim.AdamW(bg_params, lr=lr_head, weight_decay=wd_head)
-        optim_film = None
-        if bases_film_params:
-            optim_film = torch.optim.AdamW(
-                bases_film_params, lr=lr_film, weight_decay=wd_film
+        optim_meta = None
+        if bases_meta_params:
+            optim_meta = torch.optim.AdamW(
+                bases_meta_params, lr=lr_meta, weight_decay=wd_meta
             )
 
-        return optim_bw, optim_bg, optim_film
+        return optim_bw, optim_bg, optim_meta
 
     def get_weighting_reg(self):
         """
