@@ -129,17 +129,27 @@ def inner_update_stopgrad(
     model: nn.Module,
     data_support,
     embeddings_rest,
-    inner_steps: int = 100,
-    lr: float = 5e-2,
-    weight_decay: float = 1e-5,  # Reduced from 1e-3 to let embeddings escape zero
-    grad_clip: int = 1.0,
+    cfg,
+    inner_steps: int = None,
     quiet=True,
 ) -> torch.Tensor:
     """
     Optimize a per-episode stim_embed on SUPPORT ONLY.
     Does NOT backprop through the inner loop (two-backprop variant).
     Returns a detached stim_embed to use on the QUERY pass.
+
+    Args:
+        inner_steps: Optional override for number of inner steps.
+                             If None, uses cfg.film.training.inner_steps
     """
+    # Extract parameters from config
+    inner_steps = (
+        inner_steps if inner_steps is not None else cfg.film.training.inner_steps
+    )
+    lr = cfg.film.training.optim.lr
+    weight_decay = cfg.film.training.optim.weight_decay
+    grad_clip = cfg.training.grad_clip
+
     embed_dim_stim = model.model.bases.embed_dim_stim
     # Split out y values for loss fn
 
@@ -195,8 +205,15 @@ def inner_update_stopgrad(
             print(eidx, loss.item())
             losses.append((eidx, loss.item()))
 
-        # if regularizer_fn is not None:
-        #    loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
+        # Optional L2 penalty to maintain a small sorta trust region
+        # Using mean() for dimension normalization so penalty is scale-invariant
+        lambda_l2 = cfg.film.training.lambda_l2
+        if lambda_l2:
+            l2_reg = 0.0
+            for emb in embeddings_stim.values():
+                l2_reg = l2_reg + (emb**2).mean()
+            l2_reg /= len(embeddings_stim)
+            loss = loss + (lambda_l2 * l2_reg)
 
         # Only gradients w.r.t. embeddings_stim (model params frozen, embeddings_rest detached)
         loss.backward()

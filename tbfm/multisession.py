@@ -180,12 +180,9 @@ def train_from_cfg(
     model_optims,
     embeddings_rest,
     data_test=None,
-    inner_steps: int | None = None,
     epochs: int = 10000,
     test_interval: int | None = None,
     support_size: int = 300,
-    embed_stim_lr: int | None = None,
-    embed_stim_weight_decay: float = None,
     device: str = "cuda",
     grad_clip: float | None = None,
     alternating_updates: bool = True,  # Use alternating basis weight / basis gen updates
@@ -212,11 +209,6 @@ def train_from_cfg(
     """
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
-    embed_stim_lr = embed_stim_lr or cfg.film.training.optim.lr
-    embed_stim_weight_decay = (
-        embed_stim_weight_decay or cfg.film.training.optim.weight_decay
-    )
-    inner_steps = inner_steps or cfg.film.training.inner_steps
     use_film = cfg.tbfm.module.use_film_bases
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
@@ -253,11 +245,11 @@ def train_from_cfg(
         _data_train, filter_stats = utils.filter_batch_outliers(
             _data_train, model.norms, cfg
         )
-        
+
         # Log filtering statistics occasionally
         if cfg.training.use_outlier_filtering and eidx % 100 == 0:
             outlier_stats["train_filtered_per_epoch"].append(
-                (eidx, filter_stats['total_kept'], filter_stats['total_samples'])
+                (eidx, filter_stats["total_kept"], filter_stats["total_samples"])
             )
 
         # split into support/query
@@ -265,7 +257,6 @@ def train_from_cfg(
             _data_train,
             support_size=support_size,
         )
-
 
         with torch.no_grad():
             y_query = {sid: d[2] for sid, d in query.items()}
@@ -278,9 +269,7 @@ def train_from_cfg(
                 model,
                 support,
                 embeddings_rest,
-                inner_steps=inner_steps,
-                lr=embed_stim_lr,
-                weight_decay=embed_stim_weight_decay,
+                cfg,
             )
             model.train()
 
@@ -414,9 +403,9 @@ def train_from_cfg(
                     device,
                     track_per_session_r2=False,
                 )
-                
-                loss = test_results['loss']
-                r2_test = test_results['r2']
+
+                loss = test_results["loss"]
+                r2_test = test_results["r2"]
                 test_losses.append((eidx, loss))
                 test_r2s.append((eidx, r2_test))
                 print(
@@ -448,9 +437,8 @@ def train_from_cfg(
             model,
             support,
             embeddings_rest,
-            inner_steps=(3 * inner_steps),
-            lr=embed_stim_lr,
-            weight_decay=embed_stim_weight_decay,
+            cfg,
+            inner_steps=(3 * cfg.film.training.inner_steps),
         )
 
     # Final test evaluation
@@ -467,19 +455,21 @@ def train_from_cfg(
             device,
             track_per_session_r2=True,
         )
-        
-        loss = final_test_results['loss']
-        r2_test = final_test_results['r2']
-        final_test_r2s = final_test_results['per_session_r2']
-        y_hat_test = final_test_results['y_hat']
-        test_batch = final_test_results['y_test']
-        
+
+        loss = final_test_results["loss"]
+        r2_test = final_test_results["r2"]
+        final_test_r2s = final_test_results["per_session_r2"]
+        y_hat_test = final_test_results["y_hat"]
+        test_batch = final_test_results["y_test"]
+
         # Log outlier filtering stats for test set
-        if final_test_results['outlier_stats'] is not None:
+        if final_test_results["outlier_stats"] is not None:
             outlier_stats["test_filtered_per_epoch"].append(
-                (epochs - 1, 
-                 final_test_results['outlier_stats']['total_kept'],
-                 final_test_results['outlier_stats']['total_samples'])
+                (
+                    epochs - 1,
+                    final_test_results["outlier_stats"]["total_kept"],
+                    final_test_results["outlier_stats"]["total_samples"],
+                )
             )
             print(
                 f"Test outlier filtering: kept {final_test_results['outlier_stats']['total_kept']}/"
@@ -500,7 +490,9 @@ def train_from_cfg(
     results["train_r2s"] = train_r2s
     results["test_r2s"] = test_r2s
     results["y_hat"] = yhat_query
-    results["outlier_stats"] = outlier_stats if cfg.training.use_outlier_filtering else None
+    results["outlier_stats"] = (
+        outlier_stats if cfg.training.use_outlier_filtering else None
+    )
     results["y"] = y_query
     results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
@@ -517,26 +509,22 @@ def test_time_adaptation(
     data_train,
     epochs=1000,
     data_test=None,
-    lr=None,
-    weight_decay=None,
-    grad_clip=None,
 ) -> torch.Tensor:
 
     model.eval()
 
-    lr = lr or cfg.film.training.optim.lr
-    weight_decay = weight_decay or cfg.film.training.optim.weight_decay
-    grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     device = model.device
 
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
     _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
-    
+
     # Apply outlier filtering to training data
     data_train, filter_stats = utils.filter_batch_outliers(data_train, model.norms, cfg)
     if cfg.training.use_outlier_filtering:
-        print(f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept")
+        print(
+            f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
+        )
 
     # TODO: need to do the AE warm starting here.
 
@@ -544,10 +532,8 @@ def test_time_adaptation(
         model,
         data_train,
         embeddings_rest,
+        cfg,
         inner_steps=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        grad_clip=grad_clip,
         quiet=False,
     )
 
@@ -563,14 +549,14 @@ def test_time_adaptation(
                 device,
                 track_per_session_r2=True,
             )
-            
-            r2_test = test_results['r2']
-            loss = test_results['loss']
-            final_test_r2s = test_results['per_session_r2']
-            y_hat_test = test_results['y_hat']
-            test_batch = test_results['y_test']
-            
-            if test_results['outlier_stats'] is not None:
+
+            r2_test = test_results["r2"]
+            loss = test_results["loss"]
+            final_test_r2s = test_results["per_session_r2"]
+            y_hat_test = test_results["y_hat"]
+            test_batch = test_results["y_test"]
+
+            if test_results["outlier_stats"] is not None:
                 print(
                     f"TTA: Test data filtered: {test_results['outlier_stats']['total_kept']}/"
                     f"{test_results['outlier_stats']['total_samples']} "
