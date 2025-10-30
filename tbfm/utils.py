@@ -316,3 +316,149 @@ def log_grad_norms(model):
                 f"weight_norm={weight_norm:.4e}, "
                 f"ratio={ratio:.4e}"
             )
+
+
+def create_outlier_mask(
+    data,
+    iqr_multiplier=7.0,
+    center="median",
+    max_outliers_per_trial=5,
+    return_counts=False,
+):
+    """
+    Create a boolean mask identifying trials (batch elements) with too many outliers.
+    
+    This function detects outlier timepoints by measuring how far each sample deviates 
+    from the center (median or mean) in terms of IQR. Then it rejects entire trials
+    that have more than max_outliers_per_trial outlier timepoints.
+    
+    Args:
+        data: Tensor of shape (batch, time, channels) or (batch, channels)
+            The data to check for outliers (should be normalized)
+        iqr_multiplier: float, default=7.0
+            Number of IQRs from center beyond which timepoints are outliers
+            Typical values: 3.0 (aggressive), 7.0 (moderate), 15.0 (conservative)
+        center: str, one of ["median", "mean"], default="median"
+            How to compute the center for deviation measurement
+        max_outliers_per_trial: int, default=5
+            Maximum number of outlier timepoints allowed in a trial
+            Trials with more outliers than this are rejected entirely
+            Suggested: 5-10 for trials with 50-100 timepoints
+        return_counts: bool, default=False
+            If True, also return the outlier count per trial
+    
+    Returns:
+        mask: Boolean tensor of shape (batch,)
+            True = keep trial (< max_outliers), False = reject trial (>= max_outliers)
+        counts: (optional) Integer tensor of shape (batch,)
+            Number of outlier timepoints detected in each trial
+            Only returned if return_counts=True
+        
+    Example:
+        >>> data = torch.randn(100, 164, 50)  # (batch=100 trials, time=164, channels=50)
+        >>> mask = create_outlier_mask(data, iqr_multiplier=7.0, max_outliers_per_trial=5)
+        >>> clean_data = data[mask]  # Keep only clean trials
+        >>> print(f"Kept {mask.sum()}/{len(mask)} trials")
+        >>> 
+        >>> # Or get counts to see how many outliers each trial has
+        >>> mask, counts = create_outlier_mask(data, return_counts=True)
+        >>> print(f"Max outliers in any trial: {counts.max()}")
+    """
+    # Handle both 2D and 3D inputs
+    if data.ndim == 3:
+        batch_size, time_size, n_channels = data.shape
+        flat_data = data.flatten(end_dim=1)  # (batch*time, channels)
+    elif data.ndim == 2:
+        batch_size = data.shape[0]
+        time_size = 1
+        n_channels = data.shape[1]
+        flat_data = data
+    else:
+        raise ValueError(f"Expected 2D or 3D tensor, got shape {data.shape}")
+    
+    # Compute center (median or mean) and IQR across all samples
+    if center == "median":
+        q = torch.tensor([0.25, 0.5, 0.75], device=data.device, dtype=data.dtype)
+        quantiles = torch.quantile(flat_data, q, dim=0)  # [3, channels]
+        q25, q50, q75 = quantiles[0], quantiles[1], quantiles[2]
+        center_val = q50
+        iqr = q75 - q25
+    elif center == "mean":
+        center_val = flat_data.mean(dim=0)  # [channels]
+        q = torch.tensor([0.25, 0.75], device=data.device, dtype=data.dtype)
+        quantiles = torch.quantile(flat_data, q, dim=0)  # [2, channels]
+        iqr = quantiles[1] - quantiles[0]
+    else:
+        raise ValueError(f"center must be 'median' or 'mean', got {center}")
+    
+    # Compute deviation from center for each timepoint
+    deviation = torch.abs(flat_data - center_val)  # (batch*time, channels)
+    
+    # Threshold: iqr_multiplier * IQR
+    # Add small epsilon to avoid division by zero for constant channels
+    threshold = iqr_multiplier * iqr.clamp_min(1e-6)
+    
+    # A timepoint is an outlier if ANY channel exceeds the threshold
+    is_outlier_timepoint = (deviation > threshold).any(dim=-1)  # (batch*time,)
+    
+    # Reshape to (batch, time) and count outliers per trial
+    if data.ndim == 3:
+        is_outlier_timepoint = is_outlier_timepoint.view(batch_size, time_size)
+        outlier_counts = is_outlier_timepoint.sum(dim=1)  # (batch,)
+    else:
+        # For 2D data, each "trial" is just one sample
+        outlier_counts = is_outlier_timepoint.long()
+    
+    # Accept trials with <= max_outliers_per_trial outliers
+    mask = outlier_counts <= max_outliers_per_trial
+    
+    if return_counts:
+        return mask, outlier_counts
+    else:
+        return mask
+
+
+def apply_outlier_mask_to_batch(batch_dict, masks_dict):
+    """
+    Apply outlier masks to a batch dictionary, filtering out outlier trials.
+    
+    Args:
+        batch_dict: dict {session_id: (runway, covariates, targets)}
+            Each element is a tuple of tensors with shape (batch, time, channels)
+        masks_dict: dict {session_id: mask_tensor}
+            Each mask is boolean tensor of shape (batch,)
+            True = keep trial, False = reject trial
+    
+    Returns:
+        filtered_batch: dict {session_id: (runway, covariates, targets)}
+            Same structure but with outlier trials removed
+        counts: dict {session_id: (kept, total)}
+            Number of trials kept vs total for each session
+    """
+    filtered_batch = {}
+    counts = {}
+    
+    for session_id, data in batch_dict.items():
+        if session_id not in masks_dict:
+            # No mask for this session, keep all data
+            filtered_batch[session_id] = data
+            batch_size = data[0].shape[0]
+            counts[session_id] = (batch_size, batch_size)
+            continue
+        
+        mask = masks_dict[session_id]  # Shape: (batch,)
+        
+        # Apply trial-level mask to each component of the tuple
+        filtered_data = []
+        for component in data:
+            # component has shape (batch, time, channels) or (batch, channels)
+            # mask has shape (batch,)
+            filtered_component = component[mask]
+            filtered_data.append(filtered_component)
+        
+        filtered_batch[session_id] = tuple(filtered_data)
+        total = mask.shape[0]  # Number of trials
+        kept = mask.sum().item()  # Number of trials kept
+        counts[session_id] = (kept, total)
+    
+    return filtered_batch, counts

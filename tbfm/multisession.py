@@ -228,6 +228,11 @@ def train_from_cfg(
     lambda_cov = cfg.ae.two_stage.get("lambda_cov", 0.0)
     device = model.device
 
+    # Outlier filtering settings
+    use_outlier_filtering = cfg.training.get("use_outlier_filtering", False)
+    outlier_iqr_multiplier = cfg.training.get("outlier_iqr_multiplier", 7.0)
+    outlier_center = cfg.training.get("outlier_center", "median")
+
     embeddings_stim = None  # default
     iter_train = iter(data_train)
 
@@ -236,11 +241,46 @@ def train_from_cfg(
     test_losses = []
     test_r2s = []
     min_test_r2 = 1e99
+
+    # Track outlier statistics
+    outlier_stats = {
+        "train_filtered_per_epoch": [],
+        "test_filtered_per_epoch": [],
+    }
+
     for eidx in range(epochs):
         model.train()
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
         )
+
+        # Apply outlier filtering to training data if enabled
+        if use_outlier_filtering:
+            # Create masks based on normalized targets
+            outlier_masks = {}
+            for sid, d in _data_train.items():
+                y = d[2]  # targets
+                # Normalize for outlier detection
+                y_norm = model.norms.instances[sid](y)
+                mask = utils.create_outlier_mask(
+                    y_norm,
+                    iqr_multiplier=outlier_iqr_multiplier,
+                    center=outlier_center,
+                )
+                outlier_masks[sid] = mask
+
+            # Filter the data
+            _data_train, filter_counts = utils.apply_outlier_mask_to_batch(
+                _data_train, outlier_masks
+            )
+
+            # Log filtering statistics occasionally
+            if eidx % 100 == 0:
+                total_kept = sum(c[0] for c in filter_counts.values())
+                total_samples = sum(c[1] for c in filter_counts.values())
+                outlier_stats["train_filtered_per_epoch"].append(
+                    (eidx, total_kept, total_samples)
+                )
 
         # split into support/query
         support, query = split_support_query_sessions(
@@ -464,8 +504,31 @@ def train_from_cfg(
         r2_outer = 0
         test_batch_count = 0
         final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
+        test_outlier_total_kept = 0
+        test_outlier_total_samples = 0
+
         for test_batch in data_test:
             test_batch = utils.move_batch(test_batch, device=device)
+
+            # Apply outlier filtering to test data if enabled
+            if use_outlier_filtering:
+                outlier_masks = {}
+                for sid, d in test_batch.items():
+                    y = d[2]
+                    y_norm = model.norms.instances[sid](y)
+                    mask = utils.create_outlier_mask(
+                        y_norm,
+                        iqr_multiplier=outlier_iqr_multiplier,
+                        center=outlier_center,
+                    )
+                    outlier_masks[sid] = mask
+
+                test_batch, filter_counts = utils.apply_outlier_mask_to_batch(
+                    test_batch, outlier_masks
+                )
+                test_outlier_total_kept += sum(c[0] for c in filter_counts.values())
+                test_outlier_total_samples += sum(c[1] for c in filter_counts.values())
+
             tb_norm = {}
             for session_id, d in test_batch.items():
                 y_test = model.norms.instances[session_id](d[2])
@@ -504,6 +567,16 @@ def train_from_cfg(
             for session_id, r2 in final_test_r2s.items()
         }
 
+        # Log outlier filtering stats for test set
+        if use_outlier_filtering and test_outlier_total_samples > 0:
+            outlier_stats["test_filtered_per_epoch"].append(
+                (epochs - 1, test_outlier_total_kept, test_outlier_total_samples)
+            )
+            print(
+                f"Test outlier filtering: kept {test_outlier_total_kept}/{test_outlier_total_samples} "
+                f"({100*test_outlier_total_kept/test_outlier_total_samples:.1f}%)"
+            )
+
         if r2_test < min_test_r2:
             min_test_r2 = r2_test
             if model_save_path:
@@ -517,6 +590,7 @@ def train_from_cfg(
     results["train_r2s"] = train_r2s
     results["test_r2s"] = test_r2s
     results["y_hat"] = yhat_query
+    results["outlier_stats"] = outlier_stats if use_outlier_filtering else None
     results["y"] = y_query
     results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
