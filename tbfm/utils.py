@@ -462,3 +462,252 @@ def apply_outlier_mask_to_batch(batch_dict, masks_dict):
         counts[session_id] = (kept, total)
     
     return filtered_batch, counts
+
+
+def filter_batch_outliers(batch_dict, model_norms, cfg):
+    """
+    Complete outlier filtering pipeline: normalize, detect, filter, and track stats.
+    
+    This function encapsulates the entire outlier filtering workflow:
+    1. Normalizes batch targets using model normalizers
+    2. Detects outliers using IQR criterion from config
+    3. Filters out outlier trials
+    4. Tracks statistics about filtering
+    
+    Args:
+        batch_dict: dict {session_id: (runway, covariates, targets)}
+            Raw batch data with unnormalized targets
+        model_norms: normalizers module with .instances[session_id]
+            Normalizers for each session
+        cfg: configuration object
+            Must have training.use_outlier_filtering, outlier_iqr_multiplier,
+            outlier_center, and max_outliers_per_trial
+    
+    Returns:
+        filtered_batch: dict {session_id: (runway, covariates, targets)}
+            Batch with outlier trials removed (targets still unnormalized)
+        stats: dict with keys:
+            'total_kept': int, total trials kept across all sessions
+            'total_samples': int, total trials before filtering
+            'per_session': dict {session_id: (kept, total)}
+    
+    Example:
+        >>> filtered_batch, stats = filter_batch_outliers(batch, model.norms, cfg)
+        >>> print(f"Kept {stats['total_kept']}/{stats['total_samples']} trials")
+    """
+    use_outlier_filtering = cfg.training.use_outlier_filtering
+    
+    if not use_outlier_filtering:
+        # Return batch unchanged with full counts
+        stats = {
+            'total_kept': sum(d[0].shape[0] for d in batch_dict.values()),
+            'total_samples': sum(d[0].shape[0] for d in batch_dict.values()),
+            'per_session': {sid: (d[0].shape[0], d[0].shape[0]) for sid, d in batch_dict.items()},
+        }
+        return batch_dict, stats
+    
+    # Get outlier filtering parameters from config
+    iqr_multiplier = cfg.training.outlier_iqr_multiplier
+    center = cfg.training.outlier_center
+    max_outliers_per_trial = cfg.training.max_outliers_per_trial
+    
+    # Create outlier masks based on normalized targets
+    outlier_masks = {}
+    for sid, d in batch_dict.items():
+        y = d[2]  # targets
+        # Normalize for outlier detection
+        y_norm = model_norms.instances[sid](y)
+        mask = create_outlier_mask(
+            y_norm,
+            iqr_multiplier=iqr_multiplier,
+            center=center,
+            max_outliers_per_trial=max_outliers_per_trial,
+        )
+        outlier_masks[sid] = mask
+    
+    # Filter the batch
+    filtered_batch, per_session_counts = apply_outlier_mask_to_batch(
+        batch_dict, outlier_masks
+    )
+    
+    # Aggregate statistics
+    total_kept = sum(c[0] for c in per_session_counts.values())
+    total_samples = sum(c[1] for c in per_session_counts.values())
+    
+    stats = {
+        'total_kept': total_kept,
+        'total_samples': total_samples,
+        'per_session': per_session_counts,
+    }
+    
+    return filtered_batch, stats
+
+
+def normalize_batch_targets(batch_dict, model_norms):
+    """
+    Normalize the targets (third element) of each session in a batch dict.
+    
+    Args:
+        batch_dict: dict {session_id: (runway, covariates, targets)}
+            Batch with unnormalized targets
+        model_norms: normalizers module with .instances[session_id]
+            Normalizers for each session
+    
+    Returns:
+        normalized_batch: dict {session_id: (runway, covariates, targets_normalized)}
+            Batch with normalized targets, other elements unchanged
+    
+    Example:
+        >>> norm_batch = normalize_batch_targets(batch, model.norms)
+    """
+    normalized_batch = {}
+    for session_id, d in batch_dict.items():
+        y_norm = model_norms.instances[session_id](d[2])
+        normalized_batch[session_id] = (d[0], d[1], y_norm)
+    return normalized_batch
+
+
+def evaluate_test_batches(
+    model,
+    data_test,
+    embeddings_rest,
+    embeddings_stim,
+    model_norms,
+    cfg,
+    device,
+    track_per_session_r2=False,
+):
+    """
+    Evaluate model on test data with optional outlier filtering.
+    
+    This function runs a complete test evaluation loop:
+    1. Iterate through test batches
+    2. Apply outlier filtering if enabled
+    3. Normalize targets
+    4. Run model forward pass
+    5. Compute loss and R2 metrics
+    6. Aggregate results across batches
+    
+    Args:
+        model: The model to evaluate (should be in eval mode)
+        data_test: DataLoader or iterable of test batches
+        embeddings_rest: dict {session_id: embedding} for rest embeddings
+        embeddings_stim: dict {session_id: embedding} for stim embeddings
+        model_norms: normalizers module with .instances[session_id]
+        cfg: configuration object for outlier filtering settings
+        device: torch device
+        track_per_session_r2: bool, whether to track R2 per session (default False)
+    
+    Returns:
+        results: dict with keys:
+            'loss': float, mean test loss
+            'r2': float, mean test R2
+            'y_hat': dict {session_id: predictions}, from last batch
+            'y_test': dict {session_id: (runway, covariates, targets_norm)}, from last batch
+            'per_session_r2': dict {session_id: r2}, only if track_per_session_r2=True
+            'outlier_stats': dict or None, outlier filtering statistics
+    
+    Example:
+        >>> with torch.no_grad():
+        >>>     model.eval()
+        >>>     results = evaluate_test_batches(model, data_test, ...)
+        >>> print(f"Test R2: {results['r2']:.4f}")
+    """
+    from torch import nn
+    from tbfm.test import r2_score
+    
+    loss_outer = 0
+    r2_outer = 0
+    test_batch_count = 0
+    per_session_r2 = {} if track_per_session_r2 else None
+    
+    # Outlier filtering stats
+    use_outlier_filtering = cfg.training.use_outlier_filtering
+    outlier_total_kept = 0
+    outlier_total_samples = 0
+    
+    # Will store results from last batch
+    y_hat_test = None
+    test_batch = None
+    
+    for batch in data_test:
+        batch = move_batch(batch, device=device)
+        
+        # Initialize per-session R2 tracking
+        if track_per_session_r2 and per_session_r2 == {}:
+            per_session_r2 = {session_id: 0.0 for session_id in batch.keys()}
+        
+        # Apply outlier filtering if enabled
+        if use_outlier_filtering:
+            batch, filter_stats = filter_batch_outliers(batch, model_norms, cfg)
+            outlier_total_kept += filter_stats['total_kept']
+            outlier_total_samples += filter_stats['total_samples']
+        
+        # Normalize targets
+        batch = normalize_batch_targets(batch, model_norms)
+        
+        # Forward pass
+        y_hat_test = model(
+            batch,
+            embeddings_rest=embeddings_rest,
+            embeddings_stim=embeddings_stim,
+        )
+        
+        # Compute loss and R2
+        loss = 0
+        r2_test = 0
+        for session_id, d in batch.items():
+            y_test = d[2]
+            loss += nn.MSELoss()(y_hat_test[session_id], y_test)
+            _r2_test = r2_score(
+                y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
+                y_test.permute(0, 2, 1).flatten(end_dim=1),
+            )
+            r2_test += _r2_test
+            if track_per_session_r2:
+                per_session_r2[session_id] += _r2_test.item()
+        
+        loss /= len(batch)
+        r2_test /= len(batch)
+        
+        r2_outer += r2_test.item()
+        loss_outer += loss.item()
+        test_batch_count += 1
+        
+        # Save last batch for return
+        test_batch = batch
+    
+    # Aggregate results
+    if test_batch_count > 0:
+        r2_final = r2_outer / test_batch_count
+        loss_final = loss_outer / test_batch_count
+        if track_per_session_r2:
+            per_session_r2 = {
+                sid: r2 / test_batch_count for sid, r2 in per_session_r2.items()
+            }
+    else:
+        r2_final = 0.0
+        loss_final = 0.0
+        per_session_r2 = {}
+    
+    # Prepare outlier stats
+    outlier_stats = None
+    if use_outlier_filtering and outlier_total_samples > 0:
+        outlier_stats = {
+            'total_kept': outlier_total_kept,
+            'total_samples': outlier_total_samples,
+            'pct_kept': 100.0 * outlier_total_kept / outlier_total_samples,
+        }
+    
+    results = {
+        'loss': loss_final,
+        'r2': r2_final,
+        'y_hat': y_hat_test,
+        'y_test': test_batch,
+        'outlier_stats': outlier_stats,
+    }
+    
+    if track_per_session_r2:
+        results['per_session_r2'] = per_session_r2
+    
+    return results

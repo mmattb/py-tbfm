@@ -684,7 +684,7 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
         device: torch device
     """
     # Check if using two-stage architecture
-    use_two_stage = cfg.ae.get("use_two_stage", False)
+    use_two_stage = cfg.ae.use_two_stage
 
     if use_two_stage:
         # Build two-stage AE
@@ -697,8 +697,8 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
             session_dims=session_dims,
             canonical_dim=cfg.ae.two_stage.canonical_dim,
             latent_dim=cfg.ae.module.latent_dim,
-            use_adapter_bias=cfg.ae.two_stage.get("use_adapter_bias", True),
-            use_encoder_bias=cfg.ae.two_stage.get("use_encoder_bias", True),
+            use_adapter_bias=cfg.ae.two_stage.use_adapter_bias,
+            use_encoder_bias=cfg.ae.two_stage.use_encoder_bias,
             device=device,
         )
 
@@ -707,7 +707,7 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
                 ae.identity_warm_start()
             else:
                 # PCA warm-start on adapters and encoder
-                max_samples = cfg.ae.two_stage.get("max_samples_for_encoder_pca", 10000)
+                max_samples = cfg.ae.two_stage.max_samples_for_encoder_pca
                 ae.pca_warm_start(data, max_samples_for_encoder=max_samples)
 
         return ae

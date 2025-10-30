@@ -94,7 +94,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         raise NotImplementedError("No normalizer adaptation yet")
 
     if cfg.ae.training.coadapt:
-        use_two_stage = cfg.ae.get("use_two_stage", False)
+        use_two_stage = cfg.ae.use_two_stage
 
         if use_two_stage:
             # Two-stage AE returns a single optimizer with param groups
@@ -222,16 +222,11 @@ def train_from_cfg(
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
     support_size = support_size or cfg.film.training.support_size
-    ae_freeze_epoch = cfg.ae.training.get("ae_freeze_epoch", None)
-    lambda_ae_recon = cfg.ae.training.get("lambda_ae_recon", 0.0)
-    lambda_mu = cfg.ae.two_stage.get("lambda_mu", 0.0)
-    lambda_cov = cfg.ae.two_stage.get("lambda_cov", 0.0)
+    ae_freeze_epoch = cfg.ae.training.ae_freeze_epoch
+    lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+    lambda_mu = cfg.ae.two_stage.lambda_mu
+    lambda_cov = cfg.ae.two_stage.lambda_cov
     device = model.device
-
-    # Outlier filtering settings
-    use_outlier_filtering = cfg.training.get("use_outlier_filtering", False)
-    outlier_iqr_multiplier = cfg.training.get("outlier_iqr_multiplier", 7.0)
-    outlier_center = cfg.training.get("outlier_center", "median")
 
     embeddings_stim = None  # default
     iter_train = iter(data_train)
@@ -255,38 +250,22 @@ def train_from_cfg(
         )
 
         # Apply outlier filtering to training data if enabled
-        if use_outlier_filtering:
-            # Create masks based on normalized targets
-            outlier_masks = {}
-            for sid, d in _data_train.items():
-                y = d[2]  # targets
-                # Normalize for outlier detection
-                y_norm = model.norms.instances[sid](y)
-                mask = utils.create_outlier_mask(
-                    y_norm,
-                    iqr_multiplier=outlier_iqr_multiplier,
-                    center=outlier_center,
-                )
-                outlier_masks[sid] = mask
-
-            # Filter the data
-            _data_train, filter_counts = utils.apply_outlier_mask_to_batch(
-                _data_train, outlier_masks
+        _data_train, filter_stats = utils.filter_batch_outliers(
+            _data_train, model.norms, cfg
+        )
+        
+        # Log filtering statistics occasionally
+        if cfg.training.use_outlier_filtering and eidx % 100 == 0:
+            outlier_stats["train_filtered_per_epoch"].append(
+                (eidx, filter_stats['total_kept'], filter_stats['total_samples'])
             )
-
-            # Log filtering statistics occasionally
-            if eidx % 100 == 0:
-                total_kept = sum(c[0] for c in filter_counts.values())
-                total_samples = sum(c[1] for c in filter_counts.values())
-                outlier_stats["train_filtered_per_epoch"].append(
-                    (eidx, total_kept, total_samples)
-                )
 
         # split into support/query
         support, query = split_support_query_sessions(
             _data_train,
             support_size=support_size,
         )
+
 
         with torch.no_grad():
             y_query = {sid: d[2] for sid, d in query.items()}
@@ -327,7 +306,7 @@ def train_from_cfg(
         train_losses.append((eidx, cur_loss.item()))
 
         # Add AE reconstruction loss (optional)
-        use_two_stage = cfg.ae.get("use_two_stage", False)
+        use_two_stage = cfg.ae.use_two_stage
 
         if lambda_ae_recon > 0:
             runways_normalized, runways_recon = model.forward_reconstruct(query)
@@ -386,12 +365,12 @@ def train_from_cfg(
         # Also: freeze AE after specified epoch to prevent late-stage overfitting
         skip_groups = []
 
-        use_two_stage = cfg.ae.get("use_two_stage", False)
+        use_two_stage = cfg.ae.use_two_stage
 
         if ae_freeze_epoch is not None and eidx >= ae_freeze_epoch:
             if use_two_stage:
                 # For two-stage: optionally freeze only shared encoder/decoder, keep adapters trainable
-                freeze_only_shared = cfg.ae.two_stage.get("freeze_only_shared", False)
+                freeze_only_shared = cfg.ae.two_stage.freeze_only_shared
 
                 if freeze_only_shared:
                     # Freeze shared encoder/decoder parameters
@@ -425,43 +404,19 @@ def train_from_cfg(
             model_optims.zero_grad(set_to_none=True)
             with torch.no_grad():
                 model.eval()
-                loss_outer = 0
-                r2_outer = 0
-                test_batch_count = 0
-                for test_batch in data_test:
-                    test_batch = utils.move_batch(test_batch, device=device)
-
-                    tb_norm = {}
-                    for session_id, d in test_batch.items():
-                        y_test = model.norms.instances[session_id](d[2])
-                        new_d = (d[0], d[1], y_test)
-                        tb_norm[session_id] = new_d
-                    test_batch = tb_norm
-
-                    y_hat_test = model(
-                        test_batch,
-                        embeddings_rest=embeddings_rest,
-                        embeddings_stim=embeddings_stim,
-                    )
-
-                    loss = 0
-                    r2_test = 0
-                    for session_id, d in test_batch.items():
-                        y_test = d[2]
-                        loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                        r2_test += r2_score(
-                            y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                            y_test.permute(0, 2, 1).flatten(end_dim=1),
-                        )
-                    loss /= len(test_batch)
-                    r2_test /= len(test_batch)
-
-                    r2_outer += r2_test.item()
-                    loss_outer += loss.item()
-                    test_batch_count += 1
-
-                r2_test = r2_outer / test_batch_count
-                loss = loss_outer / test_batch_count
+                test_results = utils.evaluate_test_batches(
+                    model,
+                    data_test,
+                    embeddings_rest,
+                    embeddings_stim,
+                    model.norms,
+                    cfg,
+                    device,
+                    track_per_session_r2=False,
+                )
+                
+                loss = test_results['loss']
+                r2_test = test_results['r2']
                 test_losses.append((eidx, loss))
                 test_r2s.append((eidx, r2_test))
                 print(
@@ -477,6 +432,7 @@ def train_from_cfg(
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
+    use_film = cfg.tbfm.module.use_film_bases
     if use_film:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
@@ -497,84 +453,38 @@ def train_from_cfg(
             weight_decay=embed_stim_weight_decay,
         )
 
+    # Final test evaluation
     model_optims.zero_grad(set_to_none=True)
     with torch.no_grad():
         model.eval()
-        loss_outer = 0
-        r2_outer = 0
-        test_batch_count = 0
-        final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
-        test_outlier_total_kept = 0
-        test_outlier_total_samples = 0
-
-        for test_batch in data_test:
-            test_batch = utils.move_batch(test_batch, device=device)
-
-            # Apply outlier filtering to test data if enabled
-            if use_outlier_filtering:
-                outlier_masks = {}
-                for sid, d in test_batch.items():
-                    y = d[2]
-                    y_norm = model.norms.instances[sid](y)
-                    mask = utils.create_outlier_mask(
-                        y_norm,
-                        iqr_multiplier=outlier_iqr_multiplier,
-                        center=outlier_center,
-                    )
-                    outlier_masks[sid] = mask
-
-                test_batch, filter_counts = utils.apply_outlier_mask_to_batch(
-                    test_batch, outlier_masks
-                )
-                test_outlier_total_kept += sum(c[0] for c in filter_counts.values())
-                test_outlier_total_samples += sum(c[1] for c in filter_counts.values())
-
-            tb_norm = {}
-            for session_id, d in test_batch.items():
-                y_test = model.norms.instances[session_id](d[2])
-                new_d = (d[0], d[1], y_test)
-                tb_norm[session_id] = new_d
-            test_batch = tb_norm
-
-            y_hat_test = model(
-                test_batch,
-                embeddings_rest=embeddings_rest,
-                embeddings_stim=embeddings_stim,
-            )
-
-            loss = 0
-            r2_test = 0
-            for session_id, d in test_batch.items():
-                y_test = d[2]
-                loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                _r2_test = r2_score(
-                    y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                    y_test.permute(0, 2, 1).flatten(end_dim=1),
-                )
-                r2_test += _r2_test
-                final_test_r2s[session_id] += _r2_test.item()
-            loss /= len(test_batch)
-            r2_test /= len(test_batch)
-
-            r2_outer += r2_test.item()
-            loss_outer += loss.item()
-            test_batch_count += 1
-
-        r2_test = r2_outer / test_batch_count
-        loss = loss_outer / test_batch_count
-        final_test_r2s = {
-            session_id: r2 / test_batch_count
-            for session_id, r2 in final_test_r2s.items()
-        }
-
+        final_test_results = utils.evaluate_test_batches(
+            model,
+            data_test,
+            embeddings_rest,
+            embeddings_stim,
+            model.norms,
+            cfg,
+            device,
+            track_per_session_r2=True,
+        )
+        
+        loss = final_test_results['loss']
+        r2_test = final_test_results['r2']
+        final_test_r2s = final_test_results['per_session_r2']
+        y_hat_test = final_test_results['y_hat']
+        test_batch = final_test_results['y_test']
+        
         # Log outlier filtering stats for test set
-        if use_outlier_filtering and test_outlier_total_samples > 0:
+        if final_test_results['outlier_stats'] is not None:
             outlier_stats["test_filtered_per_epoch"].append(
-                (epochs - 1, test_outlier_total_kept, test_outlier_total_samples)
+                (epochs - 1, 
+                 final_test_results['outlier_stats']['total_kept'],
+                 final_test_results['outlier_stats']['total_samples'])
             )
             print(
-                f"Test outlier filtering: kept {test_outlier_total_kept}/{test_outlier_total_samples} "
-                f"({100*test_outlier_total_kept/test_outlier_total_samples:.1f}%)"
+                f"Test outlier filtering: kept {final_test_results['outlier_stats']['total_kept']}/"
+                f"{final_test_results['outlier_stats']['total_samples']} "
+                f"({final_test_results['outlier_stats']['pct_kept']:.1f}%)"
             )
 
         if r2_test < min_test_r2:
@@ -590,7 +500,7 @@ def train_from_cfg(
     results["train_r2s"] = train_r2s
     results["test_r2s"] = test_r2s
     results["y_hat"] = yhat_query
-    results["outlier_stats"] = outlier_stats if use_outlier_filtering else None
+    results["outlier_stats"] = outlier_stats if cfg.training.use_outlier_filtering else None
     results["y"] = y_query
     results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
@@ -622,6 +532,11 @@ def test_time_adaptation(
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
     _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
+    
+    # Apply outlier filtering to training data
+    data_train, filter_stats = utils.filter_batch_outliers(data_train, model.norms, cfg)
+    if cfg.training.use_outlier_filtering:
+        print(f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept")
 
     # TODO: need to do the AE warm starting here.
 
@@ -638,53 +553,35 @@ def test_time_adaptation(
 
     if data_test:
         with torch.no_grad():
-            loss_outer = 0
-            r2_outer = 0
-            test_batch_count = 0
-            final_test_r2s = {session_id: 0 for session_id in data_train.keys()}
-            for test_batch in data_test:
-                test_batch = utils.move_batch(test_batch, device=device)
-                tb_norm = {}
-                for session_id, d in test_batch.items():
-                    y_test = model.norms.instances[session_id](d[2])
-                    new_d = (d[0], d[1], y_test)
-                    tb_norm[session_id] = new_d
-                test_batch = tb_norm
-
-                y_hat_test = model(
-                    test_batch,
-                    embeddings_rest=embeddings_rest,
-                    embeddings_stim=embeddings_stim,
+            test_results = utils.evaluate_test_batches(
+                model,
+                data_test,
+                embeddings_rest,
+                embeddings_stim,
+                model.norms,
+                cfg,
+                device,
+                track_per_session_r2=True,
+            )
+            
+            r2_test = test_results['r2']
+            loss = test_results['loss']
+            final_test_r2s = test_results['per_session_r2']
+            y_hat_test = test_results['y_hat']
+            test_batch = test_results['y_test']
+            
+            if test_results['outlier_stats'] is not None:
+                print(
+                    f"TTA: Test data filtered: {test_results['outlier_stats']['total_kept']}/"
+                    f"{test_results['outlier_stats']['total_samples']} "
+                    f"({test_results['outlier_stats']['pct_kept']:.1f}%)"
                 )
-
-                loss = 0
-                r2_test = 0
-                for session_id, d in test_batch.items():
-                    y_test = d[2]
-                    loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                    _r2_test = r2_score(
-                        y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                        y_test.permute(0, 2, 1).flatten(end_dim=1),
-                    )
-                    r2_test += _r2_test
-                    final_test_r2s[session_id] += _r2_test.item()
-                loss /= len(test_batch)
-                r2_test /= len(test_batch)
-
-                r2_outer += r2_test.item()
-                loss_outer += loss.item()
-                test_batch_count += 1
-
-            r2_test = r2_outer / test_batch_count
-            loss = loss_outer / test_batch_count
-            final_test_r2s = {
-                session_id: r2 / test_batch_count
-                for session_id, r2 in final_test_r2s.items()
-            }
     else:
         r2_test = None
         final_test_r2s = None
         loss = None
+        y_hat_test = None
+        test_batch = None
 
     results = {}
     results["final_test_r2"] = r2_test
