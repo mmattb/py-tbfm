@@ -140,11 +140,11 @@ def inner_update_stopgrad(
 
     Args:
         inner_steps: Optional override for number of inner steps.
-                             If None, uses cfg.film.training.inner_steps
+                             If None, uses cfg.meta.training.inner_steps
     """
     # Extract parameters from config
     inner_steps = (
-        inner_steps if inner_steps is not None else cfg.film.training.inner_steps
+        inner_steps if inner_steps is not None else cfg.meta.training.inner_steps
     )
     lr = cfg.meta.training.optim.lr
     weight_decay = cfg.meta.training.optim.weight_decay
