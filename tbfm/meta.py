@@ -130,7 +130,7 @@ def inner_update_stopgrad(
     data_support,
     embeddings_rest,
     cfg,
-    inner_steps_override: int = None,
+    inner_steps: int = None,
     quiet=True,
 ) -> torch.Tensor:
     """
@@ -139,12 +139,12 @@ def inner_update_stopgrad(
     Returns a detached stim_embed to use on the QUERY pass.
 
     Args:
-        inner_steps_override: Optional override for number of inner steps.
-                             If None, uses cfg.meta.training.inner_steps
+        inner_steps: Optional override for number of inner steps.
+                             If None, uses cfg.film.training.inner_steps
     """
     # Extract parameters from config
     inner_steps = (
-        inner_steps_override if inner_steps_override is not None else cfg.meta.training.inner_steps
+        inner_steps if inner_steps is not None else cfg.film.training.inner_steps
     )
     lr = cfg.meta.training.optim.lr
     weight_decay = cfg.meta.training.optim.weight_decay
