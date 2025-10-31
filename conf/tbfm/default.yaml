@@ -14,6 +14,9 @@ tbfm:
     zscore: false
     use_meta_learning: true
     proj_meta_dim: 32
+    is_basis_residual: ${meta.is_basis_residual}
+    basis_residual_rank: ${meta.basis_residual_rank}
+    residual_mlp_hidden: ${meta.residual_mlp_hidden}
     basis_gen_dropout: 0.3
     embed_dim_rest: 3
     embed_dim_stim: 15

@@ -2,6 +2,11 @@
 # Meta-learning configuration
 
 meta:
+  # Residual-based meta-learning (MAML-style)
+  is_basis_residual: false  # If true, use low-rank residual mode: bases += W*f(embed_stim)
+  basis_residual_rank: 5     # Rank of residual subspace
+  residual_mlp_hidden: 16    # Hidden dimension for residual MLP
+  
   training:
     inner_steps: 20
     support_size: 300
