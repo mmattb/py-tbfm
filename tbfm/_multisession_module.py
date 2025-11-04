@@ -47,3 +47,38 @@ class TBFMMultisession(nn.Module):
 
     def normalize(self, y):
         return self.norms(y)
+
+    def eval(self, ae=True):
+        """
+        Set model to eval mode.
+        
+        Args:
+            ae: If True, set AE to eval mode. If False, keep AE in training mode.
+        """
+        self.model.eval()
+        self.norms.eval()
+        if ae:
+            self.ae.eval()
+        else:
+            self.ae.train()
+        return self
+    
+    def train(self, mode=True, ae=True):
+        """
+        Set model to train mode.
+        
+        Args:
+            mode: If True, set to train mode. If False, set to eval mode.
+            ae: If True, apply mode to AE. If False, keep AE in opposite mode.
+        """
+        if mode:
+            self.model.train()
+            self.norms.train()
+            if ae:
+                self.ae.train()
+            else:
+                self.ae.eval()
+        else:
+            # If mode=False, call eval
+            self.eval(ae=ae)
+        return self
