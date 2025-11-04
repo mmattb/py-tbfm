@@ -511,6 +511,8 @@ def test_time_adaptation(
     ae_warm_start: bool = True,
     adapt_ae: bool = True,
     embeddings_stim=None,
+    support_size: int | None = None,
+    quiet: bool = False,
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -525,6 +527,7 @@ def test_time_adaptation(
         ae_warm_start: If True, warm start AE with PCA initialization
         adapt_ae: If True, optimize the autoencoder weights
         embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
+        support_size: Override cfg.meta.training.support_size if provided.
 
     Returns:
         embeddings_stim: Session embeddings (optimized or provided)
@@ -535,6 +538,8 @@ def test_time_adaptation(
     model.eval(ae=not adapt_ae)
 
     device = model.device
+
+    support_size = support_size or cfg.meta.training.support_size
 
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
@@ -547,11 +552,15 @@ def test_time_adaptation(
             f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
         )
 
-    # AE warm start initialization
+    # Split into support/query if support_size is provided
+    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    print(f"TTA: Using {support_size} samples for adaptation (support set)")
+
+    # AE warm start initialization using support data
     if ae_warm_start:
         print("TTA: Warm starting autoencoder...")
         with torch.no_grad():
-            for session_id, data in data_train.items():
+            for session_id, data in data_for_adaptation.items():
                 runway = data[0]  # (batch, time, channels)
                 runway_normalized = model.norms({session_id: runway})
 
@@ -568,20 +577,45 @@ def test_time_adaptation(
     # Determine if we need to optimize embeddings
     optimize_embeddings = embeddings_stim is None
 
-    if optimize_embeddings:
-        # Train new embeddings
+    # Sequential optimization: optimize embeddings first if doing joint with warm-started AE
+    # This gives embeddings a good initialization based on the PCA-warmed AE
+    # Skip if AE wasn't warm-started (would learn embeddings for bad AE)
+    if optimize_embeddings and adapt_ae and ae_warm_start:
+        print("TTA: Pre-optimizing embeddings with warm-started AE...")
         embeddings_stim, _ = meta.inner_update_stopgrad(
             model,
-            data_train,
+            data_for_adaptation,
+            embeddings_rest,
+            cfg,
+            inner_steps=epochs // 2,  # Half the steps for pre-optimization
+            quiet=False,
+        )
+    elif optimize_embeddings and not adapt_ae:
+        # Only optimizing embeddings (not AE)
+        print("TTA: Optimizing embeddings...")
+        embeddings_stim, _ = meta.inner_update_stopgrad(
+            model,
+            data_for_adaptation,
             embeddings_rest,
             cfg,
             inner_steps=epochs,
-            quiet=False,
+            quiet=quiet,
         )
 
-    # Joint adaptation: both AE and embeddings
+    # AE optimization (alone or jointly with embeddings)
     if adapt_ae:
         print("TTA: Optimizing autoencoder...")
+
+        # If we need embeddings but don't have them yet, initialize them
+        if optimize_embeddings and embeddings_stim is None:
+            print("  Initializing embeddings for joint optimization...")
+            embed_dim_stim = model.model.bases.embed_dim_stim
+            embeddings_stim = {}
+            for session_id in data_train.keys():
+                emb = torch.randn(embed_dim_stim, device=device) * 0.1
+                emb.requires_grad = True
+                embeddings_stim[session_id] = emb
+
         # Set up optimizers for AE
         ae_optims = []
         for session_id in data_train.keys():
@@ -596,7 +630,7 @@ def test_time_adaptation(
 
         # If optimizing both AE and embeddings
         if optimize_embeddings:
-            print("TTA: Joint optimization of AE and embeddings...")
+            print("  Joint optimization of AE and embeddings...")
             embed_optims = [
                 torch.optim.AdamW(
                     [emb],
@@ -606,7 +640,7 @@ def test_time_adaptation(
                 for emb in embeddings_stim.values()
             ]
         else:
-            print("TTA: Optimizing AE only (embeddings fixed)...")
+            print("  Optimizing AE only (embeddings fixed)...")
             embed_optims = []
 
         # Optimization loop
@@ -617,27 +651,32 @@ def test_time_adaptation(
 
             # Forward pass
             yhat = model(
-                data_train,
+                data_for_adaptation,
                 embeddings_rest=embeddings_rest,
                 embeddings_stim=embeddings_stim,
             )
 
             # Compute loss
             loss = 0
-            for session_id, data in data_train.items():
+            ys = {}
+            for session_id, data in data_for_adaptation.items():
                 y = data[2]
                 loss += nn.MSELoss()(yhat[session_id], y)
-            loss = loss / len(data_train)
+                ys[session_id] = y.detach()
+            loss = loss / len(data_for_adaptation)
 
             # Backward and step
             loss.backward()
             for opt in ae_optims + embed_optims:
                 opt.step()
 
-            if step % 100 == 0 and not cfg.training.quiet:
+            if step % 100 == 0 and not quiet:
                 print(f"  TTA step {step}/{epochs}, loss: {loss.item():.6f}")
 
         print(f"TTA: Optimization complete. Final loss: {loss.item():.6f}")
+    else:
+        ys = None
+        yhat = None
 
     if data_test:
         with torch.no_grad():
@@ -664,6 +703,7 @@ def test_time_adaptation(
                     f"{test_results['outlier_stats']['total_samples']} "
                     f"({test_results['outlier_stats']['pct_kept']:.1f}%)"
                 )
+            print(f"TTA: Test results - Loss: {loss:.6f}, R2: {r2_test:.4f}")
     else:
         r2_test = None
         final_test_r2s = None
@@ -675,9 +715,10 @@ def test_time_adaptation(
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    results["y"] = ys
     results["y_hat"] = yhat
-    results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
+    results["y_hat_test"] = y_hat_test
     return embeddings_stim, results
 
 
