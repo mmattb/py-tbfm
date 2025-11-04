@@ -702,7 +702,7 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
             device=device,
         )
 
-        if warm_start:
+        if cfg.should_warm_start:
             if cfg.ae.warm_start_is_identity:
                 ae.identity_warm_start()
             else:

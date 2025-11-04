@@ -28,7 +28,7 @@ def build_from_cfg(
     quiet=False,
     device=None,
 ):
-    latent_dim = cfg["latent_dim"]
+    latent_dim = cfg.latent_dim
 
     with torch.no_grad():
         # Normalizers ------
@@ -45,7 +45,6 @@ def build_from_cfg(
             use_lora=shared_ae,
             latent_dim=latent_dim,
             shared=shared_ae,
-            warm_start=True,
             device=device,
         )
 
