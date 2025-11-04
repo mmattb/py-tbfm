@@ -558,16 +558,12 @@ def test_time_adaptation(
                 # Get session-specific AE instance
                 ae_instance = model.ae.instances.get(session_id)
                 if ae_instance is not None:
-                    # Get channel mask for this session
-                    mask = model.ae.channel_masks.get(session_id)
-                    if mask is not None:
-                        ae_instance.pca_warm_start(
-                            runway_normalized[session_id],
-                            mask,
-                            center="median",
-                            whiten=False,
-                            keep_rest=True,
-                        )
+                    ae_instance.pca_warm_start(
+                        runway_normalized[session_id],
+                        center="median",
+                        whiten=False,
+                    )
+                    print(f"  Warm started AE for {session_id}")
 
     # Determine if we need to optimize embeddings
     optimize_embeddings = embeddings_stim is None

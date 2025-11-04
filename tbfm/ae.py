@@ -59,20 +59,13 @@ class LinearChannelAE(nn.Module):
     def pca_warm_start(
         self,
         x: torch.Tensor,  # [B, T, C]
-        mask: torch.Tensor,  # []     (long indices into [0..C_max-1])
         center: str = "median",  # "median" or "mean"
         whiten: bool = False,  # scale by 1/singular_value
         eps: float = 1e-8,
-        keep_rest: bool = True,  # keep other columns of W_enc unchanged
     ):
         """
-        Initialize the session slice of W_enc with PCA directions:
-          W_enc[:, mask] <- V_k^T  (rows are principal axes)
+        Initialize W_enc with PCA directions.
         If whiten=True, rows are scaled by 1/sigma_k to give unit-variance components.
-
-        Notes:
-        - Other columns of W_enc are left as-is (keep_rest=True). Set keep_rest=False if
-          you want to zero them first (rarely needed).
         """
         with torch.no_grad():
             x = x.flatten(end_dim=1)
@@ -89,31 +82,25 @@ class LinearChannelAE(nn.Module):
                 raise ValueError("center must be 'median' or 'mean'")
             Xc = Xs - c
 
-            # SVD: Xc = U S Vh  (Vh: [min(N,C_s), C_s])
+            # SVD: Xc = U S Vh  (Vh: [min(N,C), C])
             U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
             # Principal axes (columns of V): V = Vh^T, take top-k
-            C_s = Xs.shape[1]
-            k = min(self.latent_dim, C_s)
+            C = Xs.shape[1]
+            k = min(self.latent_dim, C)
 
-            V_top = Vh[:k, :]  # [k, C_s]  (rows are top-k PCs^T)
+            V_top = Vh[:k, :]  # [k, C]  (rows are top-k PCs^T)
             if whiten:
                 # Whitening: scale each row by 1/sigma
                 S_top = S[:k].clamp_min(eps)  # [k]
                 V_top = V_top / S_top.unsqueeze(1)
 
-            # Optionally zero the slice first
-            if not keep_rest:
-                self.w_enc[:, mask] = 0.0
+            # Write PCA rows into W_enc
+            self.w_enc[:k, :] = V_top  # rows 0..k-1 get PCA directions
 
-            # Write PCA rows into the session slice
-            self.w_enc[:k, mask] = V_top  # rows 0..k-1 get PCA directions
-            # (If self.C_star > k, we leave remaining rows as-is.)
-
-            # Optional: row-orthonormalize the *written* rows of the slice for numerical niceness
-            W_slice = self.w_enc[:k, mask]  # [k, C_s]
-            # Orthonormalize rows via QR on transpose (columns orthonormal -> rows orthonormal after T)
-            Q, _ = torch.linalg.qr(W_slice.t(), mode="reduced")  # [C_s, k]
-            self.w_enc[:k, mask] = Q.t()  # [k, C_s]
+            # Optional: row-orthonormalize for numerical stability
+            W_slice = self.w_enc[:k, :]  # [k, C]
+            Q, _ = torch.linalg.qr(W_slice.t(), mode="reduced")  # [C, k]
+            self.w_enc[:k, :] = Q.t()  # [k, C]
 
     def identity_warm_start(self):
         with torch.no_grad():
@@ -122,59 +109,24 @@ class LinearChannelAE(nn.Module):
             i = torch.eye(m_dim)
             self.w_enc[:] = i[:d1, :d2]
 
-    @staticmethod
-    def _indices_from_mask(mask: torch.Tensor) -> torch.Tensor:
-        # mask: (in_dim,) bool → indices where True
-        if mask.dtype == torch.bool:
-            return torch.nonzero(mask, as_tuple=False).squeeze(-1)
-        elif mask.dtype in (torch.int32, torch.int64):
-            return mask
-        else:
-            raise ValueError("mask must be bool or int index tensor")
-
-    def session_mats(
-        self,
-        mask: Union[torch.Tensor, list],
-        lora_alpha: Optional[torch.Tensor] = None,
-    ):
-        """
-        Build session-specific encoder/decoder matrices by selecting present channels.
-        Optionally add rank-1 LoRA: W_s = w_sel + alpha * a_sel_outer
-
-        Returns:
-            w_enc_s: (latent_dim, C_s)
-            w_dec_s: (C_s, latent_dim)  (tied transpose)
-        """
-        if isinstance(mask, list):
-            idx = torch.tensor(mask, device=self.w_enc.device, dtype=torch.long)
-        else:
-            idx = self._indices_from_mask(mask).to(self.w_enc.device)
-
-        w_sel = self.w_enc[:, idx]  # (latent_dim, C_s); selected dims only
-
-        if self.use_lora and lora_alpha is not None:
-            # LoRA rank-1 update on the selected columns
-            a = self.a.view(self.latent_dim, 1)  # (latent_dim, 1)
-            b_sel = self.b[idx].view(1, -1)  # (1, C_s)
-            w_sel = w_sel + lora_alpha * (a @ b_sel)
-
-        # Tied decoder
-        w_enc_s = w_sel
-        w_dec_s = w_sel.t().contiguous()  # (C_s, latent_dim)
-        return w_enc_s, w_dec_s, idx
-
     def encode(
         self,
         x: torch.Tensor,
-        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        x: (..., C_s)
+        x: (..., C)
         returns h: (..., latent_dim)
         """
-        w_enc_s, _, _ = self.session_mats(mask, lora_alpha)
-        h = x @ w_enc_s.t()  # (..., C_s) @ (C_s, latent_dim) -> (..., latent_dim)
+        w_enc = self.w_enc
+
+        if self.use_lora and lora_alpha is not None:
+            # LoRA rank-1 update
+            a = self.a.view(self.latent_dim, 1)  # (latent_dim, 1)
+            b = self.b.view(1, -1)  # (1, C)
+            w_enc = w_enc + lora_alpha * (a @ b)
+
+        h = x @ w_enc.t()  # (..., C) @ (C, latent_dim) -> (..., latent_dim)
         if self.b_enc is not None:
             h = h + self.b_enc
         return h
@@ -182,33 +134,39 @@ class LinearChannelAE(nn.Module):
     def decode(
         self,
         h: torch.Tensor,
-        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         h: (..., latent_dim)
-        returns x_hat: (..., C_s)
+        returns x_hat: (..., C)
         """
-        _, w_dec_s, _ = self.session_mats(mask, lora_alpha)
-        x_hat = h @ w_dec_s.t()  # (..., latent_dim) @ (latent_dim, C_s) -> (..., C_s)
+        w_enc = self.w_enc
+
+        if self.use_lora and lora_alpha is not None:
+            # LoRA rank-1 update
+            a = self.a.view(self.latent_dim, 1)  # (latent_dim, 1)
+            b = self.b.view(1, -1)  # (1, C)
+            w_enc = w_enc + lora_alpha * (a @ b)
+
+        w_dec = w_enc.t().contiguous()  # Tied decoder
+        x_hat = h @ w_dec.t()  # (..., latent_dim) @ (latent_dim, C) -> (..., C)
         return x_hat
 
     def reconstruct(
         self,
         x: torch.Tensor,
-        mask: Union[torch.Tensor, list],
         lora_alpha: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        return self.decode(self.encode(x, mask, lora_alpha), mask, lora_alpha)
+        return self.decode(self.encode(x, lora_alpha), lora_alpha)
 
     @staticmethod
-    def orthogonality_penalty(w_enc_s: torch.Tensor) -> torch.Tensor:
+    def orthogonality_penalty(w_enc: torch.Tensor) -> torch.Tensor:
         """
         Soft orthogonality on encoder rows (latent axes), promoting identifiability.
-        w_enc_s: (latent_dim, C_s)
+        w_enc: (latent_dim, C)
         """
         # Normalize rows
-        R = w_enc_s / (w_enc_s.norm(dim=1, keepdim=True) + 1e-8)
+        R = w_enc / (w_enc.norm(dim=1, keepdim=True) + 1e-8)
         G = R @ R.t()  # (latent_dim, latent_dim)
         I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
         return ((G - I) ** 2).sum()
@@ -607,7 +565,6 @@ class SessionDispatcherLinearAE(SessionDispatcher):
         "decode",
         "pca_warm_start",
         "reconstruct",
-        "session_mats",
     ]
 
     def register_closure(self, name, values):
@@ -619,11 +576,8 @@ class SessionDispatcherLinearAE(SessionDispatcher):
     def register_lora_alphas(self, lora_alphas: dict):
         return self.register_closure("lora_alpha", lora_alphas)
 
-    def register_masks(self, masks: dict):
-        return self.register_closure("mask", masks)
 
-
-def dispatch_warm_start(aes, masks, data, is_identity=False, device=None):
+def dispatch_warm_start(aes, data, is_identity=False, device=None):
     for session_id in data.keys():
         if not isinstance(data, dict):
             d = rotate_session_from_batch(data, session_id, device=device)
@@ -633,19 +587,8 @@ def dispatch_warm_start(aes, masks, data, is_identity=False, device=None):
         if is_identity:
             aes.instances[session_id].identity_warm_start()
         else:
-            mask = masks[session_id]
-            x = torch.cat((d[0], d[2]), dim=1)  # 20, 164 -> 184
-            aes.instances[session_id].pca_warm_start(x, mask=mask)
-
-
-def make_masks(data, device=None):
-    masks = {}
-
-    for session_id in data.session_ids:
-        masks[session_id] = torch.arange(data.get_session_num_feats(session_id)).to(
-            device
-        )
-    return masks
+            x = torch.cat((d[0], d[2]), dim=1)  # runway + targets: 20, 164 -> 184
+            aes.instances[session_id].pca_warm_start(x)
 
 
 def from_cfg_single(cfg, in_dim, device=None, **kwargs):
@@ -720,13 +663,10 @@ def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **k
         }
 
         aes = from_cfg_and_in_dims(cfg, in_dims, shared=shared, device=device, **kwargs)
-        masks = make_masks(data, device=device)
-        aes.register_masks(masks)
 
         if warm_start:
             dispatch_warm_start(
                 aes,
-                masks,
                 data,
                 device=device,
                 is_identity=cfg.ae.warm_start_is_identity,
