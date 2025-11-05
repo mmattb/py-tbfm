@@ -12,7 +12,7 @@ import builtins
 import torch
 import torch.nn as nn
 from tbfm.multisession import split_support_query_sessions, r2_score
-from tbfm import multisession, film, utils
+from tbfm import multisession, meta, utils
 from typing import Optional, Dict, Any, Tuple
 
 
@@ -376,14 +376,14 @@ def train_with_spatial_ae_recon(
     """
     # Same setup as original
     test_interval = test_interval or cfg.training.test_interval
-    embed_stim_lr = embed_stim_lr or cfg.film.training.optim.lr
-    embed_stim_weight_decay = embed_stim_weight_decay or cfg.film.training.optim.weight_decay
-    inner_steps = inner_steps or cfg.film.training.inner_steps
-    use_film = cfg.tbfm.module.use_film_bases
+    embed_stim_lr = embed_stim_lr or cfg.meta.training.optim.lr
+    embed_stim_weight_decay = embed_stim_weight_decay or cfg.meta.training.optim.weight_decay
+    inner_steps = inner_steps or cfg.meta.training.inner_steps
+    use_meta_learning = cfg.tbfm.module.use_meta_learning
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
-    support_size = support_size or cfg.film.training.support_size
+    support_size = support_size or cfg.meta.training.support_size
     device = model.device
 
     def _ensure_saved_models_dir():
@@ -415,9 +415,9 @@ def train_with_spatial_ae_recon(
             y_query = {sid: d[2] for sid, d in query.items()}
             y_query = model.norms(y_query)
 
-        if use_film:
+        if use_meta_learning:
             model.eval()
-            embeddings_stim = film.inner_update_stopgrad(
+            embeddings_stim = meta.inner_update_stopgrad(
                 model, support, embeddings_rest, inner_steps=inner_steps,
                 lr=embed_stim_lr, weight_decay=embed_stim_weight_decay,
             )
@@ -506,7 +506,7 @@ def train_with_spatial_ae_recon(
             if update_basis_gen:
                 model_optims.step()
             else:
-                model_optims.step(skip=["bg", "film"])
+                model_optims.step(skip=["bg", "meta"])
         else:
             model_optims.step()
 

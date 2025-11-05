@@ -611,7 +611,7 @@ def load_stim_batched(
     batch_size=1000,
     window_size=184,
     session_subdir="torchraw",
-    data_dir="/home/danmuir/Projects/tbfm_multisession/data",
+    data_dir="/var/data/opto-coproc/",
     held_in_session_ids=None,
     num_held_out_sessions=10,
     unpack_stiminds=True,
@@ -638,7 +638,7 @@ def load_stim_batched(
 
 
 def load_rest_embeddings(
-    session_ids, in_dir="data", in_subdir="embedding_rest", device=None
+    session_ids, in_dir="/var/data/opto-coproc/", in_subdir="embedding_rest", device=None
 ):
     """
     See meta.cache_rest_embeds.
