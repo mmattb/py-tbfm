@@ -119,44 +119,42 @@ class LinearChannelAE(nn.Module):
         - Other columns of W_enc are left as-is (keep_rest=True). Set keep_rest=False if
           you want to zero them first (rarely needed).
         """
-        x = x.flatten(end_dim=1)
-        device = self.w_enc.device
-        dtype = self.w_enc.dtype
+        with torch.no_grad():
+            x = x.flatten(end_dim=1)
+            device = self.w_enc.device
+            dtype = self.w_enc.dtype
 
-        Xs = x.to(device=device, dtype=dtype)  # [N, C]
-        # Robust or standard centering
-        if center == "median":
-            c = Xs.median(dim=0).values
-        elif center == "mean":
-            c = Xs.mean(dim=0)
-        else:
-            raise ValueError("center must be 'median' or 'mean'")
-        Xc = Xs - c
+            Xs = x.to(device=device, dtype=dtype)  # [N, C]
+            # Robust or standard centering
+            if center == "median":
+                c = Xs.median(dim=0).values
+            elif center == "mean":
+                c = Xs.mean(dim=0)
+            else:
+                raise ValueError("center must be 'median' or 'mean'")
+            Xc = Xs - c
 
-        # SVD: Xc = U S Vh  (Vh: [min(N,C_s), C_s])
-        U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
-        # Principal axes (columns of V): V = Vh^T, take top-k
-        C_s = Xs.shape[1]
-        k = min(self.latent_dim, C_s)
+            # SVD: Xc = U S Vh  (Vh: [min(N,C_s), C_s])
+            U, S, Vh = torch.linalg.svd(Xc, full_matrices=False)
+            # Principal axes (columns of V): V = Vh^T, take top-k
+            C_s = Xs.shape[1]
+            k = min(self.latent_dim, C_s)
 
-        V_top = Vh[:k, :]  # [k, C_s]  (rows are top-k PCs^T)
-        if whiten:
-            # Whitening: scale each row by 1/sigma
-            S_top = S[:k].clamp_min(eps)  # [k]
-            V_top = V_top / S_top.unsqueeze(1)
+            V_top = Vh[:k, :]  # [k, C_s]  (rows are top-k PCs^T)
+            if whiten:
+                # Whitening: scale each row by 1/sigma
+                S_top = S[:k].clamp_min(eps)  # [k]
+                V_top = V_top / S_top.unsqueeze(1)
 
-        # Optionally zero the slice first
-        if not keep_rest:
-            with torch.no_grad():
+            # Optionally zero the slice first
+            if not keep_rest:
                 self.w_enc[:, mask] = 0.0
 
-        # Write PCA rows into the session slice
-        with torch.no_grad():
+            # Write PCA rows into the session slice
             self.w_enc[:k, mask] = V_top  # rows 0..k-1 get PCA directions
             # (If self.C_star > k, we leave remaining rows as-is.)
 
-        # Optional: row-orthonormalize the *written* rows of the slice for numerical niceness
-        with torch.no_grad():
+            # Optional: row-orthonormalize the *written* rows of the slice for numerical niceness
             W_slice = self.w_enc[:k, mask]  # [k, C_s]
             # Orthonormalize rows via QR on transpose (columns orthonormal -> rows orthonormal after T)
             Q, _ = torch.linalg.qr(W_slice.t(), mode="reduced")  # [C_s, k]
@@ -350,7 +348,7 @@ class LinearChannelAE(nn.Module):
         # Normalize rows
         R = w_enc_s / (w_enc_s.norm(dim=1, keepdim=True) + 1e-8)
         G = R @ R.t()  # (latent_dim, latent_dim)
-        I = torch.eye(G.size(0), device=G.device).to(self.device)
+        I = torch.eye(G.size(0), device=G.device, dtype=G.dtype)
         return ((G - I) ** 2).sum()
 
     def get_optim(
@@ -378,6 +376,360 @@ class LinearChannelAE(nn.Module):
         """
         if mask_present is not None:
             # Broadcast mask over batch/time
+            while mask_present.ndim < x.ndim:
+                mask_present = mask_present.unsqueeze(0)
+            diff2 = ((x - x_hat) ** 2) * mask_present
+            denom = mask_present.sum().clamp_min(1.0)
+            return diff2.sum() / denom
+        else:
+            return nn.functional.mse_loss(x_hat, x)
+
+
+class TwoStageAffineAE(nn.Module):
+    """
+    Two-stage linear autoencoder with session-specific adapters and shared encoder/decoder.
+
+    Architecture:
+        x_s ∈ ℝ^{d_s} → A_s (adapter) → h_s ∈ ℝ^{d_c} → W_e (encoder) → z ∈ ℝ^{d_z}
+        z → W_d (decoder) → h_s → A_s^T → x̂_s
+
+    Args:
+        session_dims: dict mapping session_id → input dimensionality
+        canonical_dim: intermediate canonical dimension (d_c)
+        latent_dim: latent dimension (d_z)
+        use_adapter_bias: whether adapters have bias terms
+        use_encoder_bias: whether shared encoder/decoder have bias terms
+    """
+
+    def __init__(
+        self,
+        session_dims: dict,
+        canonical_dim: int,
+        latent_dim: int,
+        use_adapter_bias: bool = True,
+        use_encoder_bias: bool = True,
+        device=None,
+    ):
+        super().__init__()
+        self.session_dims = session_dims
+        self.session_ids = list(session_dims.keys())
+        self.canonical_dim = canonical_dim
+        self.latent_dim = latent_dim
+        self.use_adapter_bias = use_adapter_bias
+        self.use_encoder_bias = use_encoder_bias
+        self.device = device
+
+        # Session-specific adapters: d_s → d_c
+        self.adapters = nn.ModuleDict()
+        for session_id, d_s in session_dims.items():
+            adapter = nn.Linear(
+                d_s, canonical_dim, bias=use_adapter_bias, device=device
+            )
+            # Orthogonal initialization for adapters
+            nn.init.orthogonal_(adapter.weight)
+            if use_adapter_bias:
+                nn.init.zeros_(adapter.bias)
+            self.adapters[session_id] = adapter
+
+        # Shared encoder: d_c → d_z
+        self.encoder = nn.Linear(
+            canonical_dim, latent_dim, bias=use_encoder_bias, device=device
+        )
+        nn.init.kaiming_uniform_(self.encoder.weight, a=5**0.5)
+        if use_encoder_bias:
+            nn.init.zeros_(self.encoder.bias)
+
+    def encode(self, x, session_id=None):
+        """
+        Encode input through adapter then shared encoder.
+
+        Args:
+            x: input tensor (..., d_s) or dict {session_id: (..., d_s)}
+            session_id: if x is tensor, which session it belongs to
+
+        Returns:
+            z: latent tensor (..., d_z) or dict {session_id: (..., d_z)}
+        """
+        if isinstance(x, dict):
+            return {sid: self.encode(x_s, session_id=sid) for sid, x_s in x.items()}
+
+        # x: (..., d_s) → adapter → (..., d_c)
+        h = self.adapters[session_id](x)
+        # h: (..., d_c) → encoder → (..., d_z)
+        z = self.encoder(h)
+        return z
+
+    def decode(self, z, session_id=None):
+        """
+        Decode latent through shared decoder then adapter transpose.
+
+        Decoder uses tied weights (W_d = W_e^T) and symmetric bias handling:
+        - If encoder has bias b_e, decode as: h = W_e^T @ (z - b_e)
+        - If adapter has bias b_a, we need to invert it: x = A^T @ (h - b_a)
+
+        Args:
+            z: latent tensor (..., d_z) or dict {session_id: (..., d_z)}
+            session_id: if z is tensor, which session to decode to
+
+        Returns:
+            x_hat: reconstruction (..., d_s) or dict {session_id: (..., d_s)}
+        """
+        if isinstance(z, dict):
+            return {sid: self.decode(z_s, session_id=sid) for sid, z_s in z.items()}
+
+        # z: (..., d_z) → decoder (tied) → (..., d_c)
+        # Symmetric bias handling: h = W_e^T @ (z - b_e)
+        if self.encoder.bias is not None:
+            z_unbiased = z - self.encoder.bias
+            h = z_unbiased @ self.encoder.weight  # (z - b_e) @ W_e^T
+        else:
+            h = z @ self.encoder.weight  # z @ W_e^T
+
+        # h: (..., d_c) → adapter^T → (..., d_s)
+        # Invert adapter: x = A^T @ (h - b_a)
+        adapter = self.adapters[session_id]
+        if self.use_adapter_bias and adapter.bias is not None:
+            h_unbiased = h - adapter.bias  # Remove bias before transpose
+            x_hat = h_unbiased @ adapter.weight
+        else:
+            x_hat = h @ adapter.weight
+
+        return x_hat
+
+    def reconstruct(self, x, session_id=None):
+        """Full reconstruction: encode then decode."""
+        if isinstance(x, dict):
+            return {
+                sid: self.reconstruct(x_s, session_id=sid) for sid, x_s in x.items()
+            }
+        return self.decode(self.encode(x, session_id=session_id), session_id=session_id)
+
+    def pca_warm_start(
+        self,
+        data,
+        center: str = "median",
+        whiten: bool = False,
+        eps: float = 1e-8,
+        max_samples_for_encoder: int = 10000,  # Limit samples for shared encoder PCA
+    ):
+        """
+        Initialize adapters and encoder with PCA.
+
+        Strategy:
+        1. For each session, run PCA on session data to initialize adapter
+        2. Project all data through adapters to canonical space
+        3. Sample from canonical space and run PCA to initialize shared encoder
+
+        Args:
+            data: dict {session_id: tensor [B, T, C_s]} or similar structure
+            center: 'median' or 'mean' for centering
+            whiten: whether to scale by inverse singular values
+            max_samples_for_encoder: max samples to use for encoder PCA (to avoid OOM)
+        """
+        # Step 1: Initialize adapters with per-session PCA
+        canonical_data = {}
+
+        with torch.no_grad():
+            for session_id in self.session_ids:
+                # Extract session data
+                if isinstance(data, dict) and session_id in data:
+                    x_s = data[session_id]
+                    if isinstance(x_s, (tuple, list)):
+                        # Handle (runway, covariates, y) format
+                        x_s = torch.cat(
+                            [x_s[0], x_s[2]], dim=1
+                        )  # concat runway + targets
+                else:
+                    # Might be a data object with rotation method
+                    d = rotate_session_from_batch(data, session_id, device=self.device)
+                    x_s = torch.cat((d[0], d[2]), dim=1)
+
+                # Flatten to [N, C_s]
+                x_s = x_s.flatten(end_dim=-2).to(
+                    device=self.device, dtype=self.encoder.weight.dtype
+                )
+
+                # Center
+                if center == "median":
+                    c = x_s.median(dim=0).values
+                elif center == "mean":
+                    c = x_s.mean(dim=0)
+                else:
+                    raise ValueError("center must be 'median' or 'mean'")
+                x_c = x_s - c
+
+                # SVD for PCA
+                U, S, Vh = torch.linalg.svd(x_c, full_matrices=False)
+                k = min(self.canonical_dim, x_c.shape[1])
+
+                # Principal components (rows of Vh are PCs in input space)
+                V_top = Vh[:k, :]  # [k, C_s]
+                if whiten:
+                    S_top = S[:k].clamp_min(eps)
+                    V_top = V_top / S_top.unsqueeze(1)
+
+                # Initialize adapter weight with PCs
+                self.adapters[session_id].weight[:k, :] = V_top
+                # Orthonormalize in case k < canonical_dim
+                if k < self.canonical_dim:
+                    # Fill remaining rows with random orthogonal vectors
+                    remaining = self.canonical_dim - k
+                    rand_vecs = torch.randn(remaining, x_c.shape[1], device=self.device)
+                    Q, _ = torch.linalg.qr(rand_vecs.T)
+                    self.adapters[session_id].weight[k:, :] = Q.T[:remaining, :]
+
+                # Project to canonical space for step 2
+                h_s = self.adapters[session_id](x_s)
+                canonical_data[session_id] = h_s
+
+            # Step 2: Initialize shared encoder with PCA on canonical data
+            # Concatenate all canonical data and sample if needed
+            h_all = torch.cat([canonical_data[sid] for sid in self.session_ids], dim=0)
+
+            # Sample if we have too many samples (to avoid OOM)
+            n_samples = h_all.shape[0]
+            if n_samples > max_samples_for_encoder:
+                # Random sample without replacement
+                indices = torch.randperm(n_samples)[:max_samples_for_encoder]
+                h_all = h_all[indices]
+
+            # Center
+            if center == "median":
+                c_h = h_all.median(dim=0).values
+            elif center == "mean":
+                c_h = h_all.mean(dim=0)
+            h_centered = h_all - c_h
+
+            # SVD
+            U, S, Vh = torch.linalg.svd(h_centered, full_matrices=False)
+            k = min(self.latent_dim, self.canonical_dim)
+
+            V_top = Vh[:k, :]  # [k, d_c]
+            if whiten:
+                S_top = S[:k].clamp_min(eps)
+                V_top = V_top / S_top.unsqueeze(1)
+
+            # Initialize encoder weight with PCA directions
+            with torch.no_grad():
+                self.encoder.weight[:k, :] = V_top
+
+                # Orthonormalize the rows we just initialized
+                W_slice = self.encoder.weight[:k, :]  # [k, d_c]
+                Q, _ = torch.linalg.qr(W_slice.T, mode="reduced")  # [d_c, k]
+                self.encoder.weight[:k, :] = Q.T  # [k, d_c]
+                # Remaining rows (if k < latent_dim) keep their Kaiming initialization
+
+    def identity_warm_start(self):
+        """Initialize with identity-like mappings (for debugging)."""
+        with torch.no_grad():
+            # Adapters: make them as close to identity as possible
+            for session_id, d_s in self.session_dims.items():
+                w = self.adapters[session_id].weight
+                d_min = min(self.canonical_dim, d_s)
+                w.zero_()
+                w[:d_min, :d_min] = torch.eye(d_min, device=self.device)
+
+            # Encoder: identity mapping
+            d_min = min(self.latent_dim, self.canonical_dim)
+            self.encoder.weight.zero_()
+            self.encoder.weight[:d_min, :d_min] = torch.eye(d_min, device=self.device)
+
+    @staticmethod
+    def moment_matching_loss(z: torch.Tensor) -> tuple:
+        """
+        Compute moment matching losses to encourage standard Gaussian latent.
+
+        L_mu = ||mean(z)||^2 / d_z  (mean squared deviation from zero, normalized)
+        L_cov = ||cov(z) - I||^2 / d_z^2  (mean squared deviation from identity, normalized)
+
+        Args:
+            z: latent tensor [N, d_z]
+
+        Returns:
+            (L_mu, L_cov)
+        """
+        # Flatten batch/time dimensions if needed
+        if z.ndim > 2:
+            z = z.flatten(end_dim=-2)
+
+        d_z = z.shape[1]
+
+        # Zero mean loss (normalized by number of dimensions)
+        mu = z.mean(dim=0)
+        L_mu = (mu**2).sum() / d_z
+
+        # Identity covariance loss (normalized by number of matrix elements)
+        z_centered = z - mu
+        N = z.shape[0]
+        cov = (z_centered.T @ z_centered) / (N - 1)
+        I = torch.eye(d_z, device=z.device, dtype=z.dtype)
+        L_cov = ((cov - I) ** 2).sum() / (d_z * d_z)
+
+        return L_mu, L_cov
+
+    def adapter_orthogonality_penalty(self, session_id: str = None) -> torch.Tensor:
+        """
+        Compute ||A^T A - I||^2 to encourage orthogonal adapter columns.
+
+        Args:
+            session_id: specific session, or None for sum over all sessions
+        """
+        if session_id is not None:
+            A = self.adapters[session_id].weight  # [d_c, d_s]
+            G = A.T @ A  # [d_s, d_s]
+            I = torch.eye(G.shape[0], device=G.device, dtype=G.dtype)
+            return ((G - I) ** 2).sum()
+        else:
+            # Sum over all sessions
+            total = 0.0
+            for sid in self.session_ids:
+                total = total + self.adapter_orthogonality_penalty(sid)
+            return total
+
+    def get_optim(
+        self,
+        adapter_lr=1e-4,
+        encoder_lr=1e-5,
+        betas=(0.5, 0.99),
+        eps=1e-8,
+        weight_decay=0.0,
+        amsgrad=True,
+    ):
+        """
+        Create optimizer with separate learning rates for adapters vs shared encoder.
+        """
+        param_groups = [
+            {
+                "params": self.adapters.parameters(),
+                "lr": adapter_lr,
+            },
+            {
+                "params": [self.encoder.weight],
+                "lr": encoder_lr,
+            },
+        ]
+
+        if self.encoder.bias is not None:
+            param_groups[1]["params"] = [self.encoder.weight, self.encoder.bias]
+
+        return torch.optim.AdamW(
+            param_groups,
+            betas=betas,
+            eps=eps,
+            weight_decay=weight_decay,
+            amsgrad=amsgrad,
+        )
+
+    @staticmethod
+    def reconstruction_loss(
+        x: torch.Tensor,
+        x_hat: torch.Tensor,
+        mask_present: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        MSE reconstruction loss (same as LinearChannelAE for compatibility).
+        """
+        if mask_present is not None:
             while mask_present.ndim < x.ndim:
                 mask_present = mask_present.unsqueeze(0)
             diff2 = ((x - x_hat) ** 2) * mask_present
@@ -459,20 +811,63 @@ def from_cfg_and_in_dims(cfg, in_dims: dict, shared=False, device=None, **kwargs
 
 def from_cfg_and_data(cfg, data, shared=False, warm_start=True, device=None, **kwargs):
     """
-    datas: {session_id: data (batch, time, ch)}
+    Create autoencoder from config and data.
+    Supports both single-stage (LinearChannelAE) and two-stage (TwoStageAffineAE).
+
+    Args:
+        cfg: hydra config with ae settings
+        data: data object with session_ids and get_session_num_feats method
+        shared: for single-stage, whether to share AE across sessions
+        warm_start: whether to initialize with PCA
+        device: torch device
     """
-    in_dims = {
-        session_id: data.get_session_num_feats(session_id)
-        for session_id in data.session_ids
-    }
+    # Check if using two-stage architecture
+    use_two_stage = cfg.ae.use_two_stage
 
-    aes = from_cfg_and_in_dims(cfg, in_dims, shared=shared, device=device, **kwargs)
-    masks = make_masks(data, device=device)
-    aes.register_masks(masks)
+    if use_two_stage:
+        # Build two-stage AE
+        session_dims = {
+            session_id: data.get_session_num_feats(session_id)
+            for session_id in data.session_ids
+        }
 
-    if warm_start:
-        dispatch_warm_start(
-            aes, masks, data, device=device, is_identity=cfg.ae.warm_start_is_identity
+        ae = TwoStageAffineAE(
+            session_dims=session_dims,
+            canonical_dim=cfg.ae.two_stage.canonical_dim,
+            latent_dim=cfg.ae.module.latent_dim,
+            use_adapter_bias=cfg.ae.two_stage.use_adapter_bias,
+            use_encoder_bias=cfg.ae.two_stage.use_encoder_bias,
+            device=device,
         )
 
-    return aes
+        if warm_start:
+            if cfg.ae.warm_start_is_identity:
+                ae.identity_warm_start()
+            else:
+                # PCA warm-start on adapters and encoder
+                max_samples = cfg.ae.two_stage.max_samples_for_encoder_pca
+                ae.pca_warm_start(data, max_samples_for_encoder=max_samples)
+
+        return ae
+
+    else:
+        # Original single-stage logic
+        in_dims = {
+            session_id: data.get_session_num_feats(session_id)
+            for session_id in data.session_ids
+        }
+
+        aes = from_cfg_and_in_dims(cfg, in_dims, shared=shared, device=device, **kwargs)
+        masks = make_masks(data, device=device)
+        aes.register_masks(masks)
+
+        if warm_start:
+            dispatch_warm_start(
+                aes,
+                masks,
+                data,
+                device=device,
+                is_identity=cfg.ae.warm_start_is_identity,
+            )
+
+        return aes

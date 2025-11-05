@@ -10,6 +10,77 @@ from . import utils
 from ._multisession_module import TBFMMultisession
 
 
+# Basis Residual Network ------------------------------------------------------
+
+
+class BasisResidualNet(nn.Module):
+    """
+    Small MLP that maps stim embeddings to low-rank basis residuals.
+
+    Architecture:
+        embed_stim -> MLP -> basis_residual_rank -> W -> trial_len * num_bases
+
+    The output is reshaped to (batch, trial_len, num_bases) and added to base bases.
+    """
+
+    def __init__(
+        self,
+        embed_dim_stim: int,
+        basis_residual_rank: int,
+        trial_len: int,
+        num_bases: int,
+        residual_mlp_hidden: int = 16,
+        device=None,
+    ):
+        super().__init__()
+
+        self.embed_dim_stim = embed_dim_stim
+        self.basis_residual_rank = basis_residual_rank
+        self.trial_len = trial_len
+        self.num_bases = num_bases
+
+        # Small MLP: embed_stim -> hidden -> rank
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim_stim, residual_mlp_hidden),
+            nn.Tanh(),
+            nn.Linear(residual_mlp_hidden, basis_residual_rank),
+        )
+
+        # Tall skinny projection: rank -> trial_len * num_bases
+        self.W = nn.Linear(basis_residual_rank, trial_len * num_bases, bias=False)
+
+        # Initialize W with small weights to start with near-zero residuals
+        nn.init.normal_(self.W.weight, mean=0, std=0.01)
+
+        self.to(device)
+
+    def forward(self, embedding_stim: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            embedding_stim: (batch, embed_dim_stim) or (embed_dim_stim,)
+                           If 1D, will be expanded to batch dimension
+
+        Returns:
+            residual: (batch, trial_len, num_bases)
+        """
+        # Handle both batched and single embedding
+        if embedding_stim.dim() == 1:
+            embedding_stim = embedding_stim.unsqueeze(0)
+
+        # MLP: (batch, embed_dim_stim) -> (batch, rank)
+        h = self.mlp(embedding_stim)
+
+        # Project: (batch, rank) -> (batch, trial_len * num_bases)
+        residual_flat = self.W(h)
+
+        # Reshape: (batch, trial_len * num_bases) -> (batch, trial_len, num_bases)
+        residual = residual_flat.unflatten(
+            dim=1, sizes=(self.trial_len, self.num_bases)
+        )
+
+        return residual
+
+
 def dispatch(data, func):
     d_out = {}
     for sid, d in data.items():
@@ -129,17 +200,27 @@ def inner_update_stopgrad(
     model: nn.Module,
     data_support,
     embeddings_rest,
-    inner_steps: int = 100,
-    lr: float = 5e-2,
-    weight_decay: float = 1e-5,  # Reduced from 1e-3 to let embeddings escape zero
-    grad_clip: int = 1.0,
+    cfg,
+    inner_steps: int = None,
     quiet=True,
 ) -> torch.Tensor:
     """
     Optimize a per-episode stim_embed on SUPPORT ONLY.
     Does NOT backprop through the inner loop (two-backprop variant).
     Returns a detached stim_embed to use on the QUERY pass.
+
+    Args:
+        inner_steps: Optional override for number of inner steps.
+                             If None, uses cfg.meta.training.inner_steps
     """
+    # Extract parameters from config
+    inner_steps = (
+        inner_steps if inner_steps is not None else cfg.meta.training.inner_steps
+    )
+    lr = cfg.meta.training.optim.lr
+    weight_decay = cfg.meta.training.optim.weight_decay
+    grad_clip = cfg.training.grad_clip
+
     embed_dim_stim = model.model.bases.embed_dim_stim
     # Split out y values for loss fn
 
@@ -156,7 +237,7 @@ def inner_update_stopgrad(
 
     optimizer_inner = utils.OptimCollection(
         {
-            "film": {
+            "meta": {
                 "optimizers": [
                     torch.optim.AdamW((se,), lr=lr, weight_decay=weight_decay)
                     for se in embeddings_stim.values()
@@ -195,8 +276,15 @@ def inner_update_stopgrad(
             print(eidx, loss.item())
             losses.append((eidx, loss.item()))
 
-        # if regularizer_fn is not None:
-        #    loss = loss + regularizer_fn(model, rest_embed_support, stim_b)
+        # Optional L2 penalty to maintain a small sorta trust region
+        # Using mean() for dimension normalization so penalty is scale-invariant
+        lambda_l2 = cfg.meta.training.lambda_l2
+        if lambda_l2:
+            l2_reg = 0.0
+            for emb in embeddings_stim.values():
+                l2_reg = l2_reg + (emb**2).mean()
+            l2_reg /= len(embeddings_stim)
+            loss = loss + (lambda_l2 * l2_reg)
 
         # Only gradients w.r.t. embeddings_stim (model params frozen, embeddings_rest detached)
         loss.backward()
@@ -212,7 +300,6 @@ def inner_update_stopgrad(
     }
     if quiet:
         return embeddings_stim
-
     return embeddings_stim, losses
 
 

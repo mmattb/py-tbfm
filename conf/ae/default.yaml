@@ -2,6 +2,9 @@
 # Autoencoder configuration
 
 ae:
+  # Architecture selection
+  use_two_stage: false  # Toggle between single-stage (LinearChannelAE) and two-stage (TwoStageAffineAE)
+
   module:
     _target_: tbfm.ae.LinearChannelAE
     latent_dim: ${latent_dim}
@@ -14,14 +17,39 @@ ae:
   dispatcher:
     _target_: tbfm.ae.SessionDispatcherLinearAE
   
+  # Two-stage specific configuration (only used when use_two_stage=true)
+  two_stage:
+    canonical_dim: 65  # Intermediate canonical dimension (approx median of 40-92 channel range)
+    use_adapter_bias: true   # Adapters handle session-specific centering
+    use_encoder_bias: false  # Shared encoder uses tied weights without bias (cleaner geometry)
+    
+    # PCA warm-start
+    max_samples_for_encoder_pca: 10000  # Max samples for encoder PCA (to avoid OOM on large datasets)
+    
+    # Freezing strategy
+    freeze_only_shared: true  # If true, freeze only encoder/decoder after ae_freeze_epoch (keep adapters trainable)
+    
+    # Moment matching regularization
+    lambda_mu: 0.0     # Weight for zero-mean constraint on latent (e.g., 1e-3 to 1e-2)
+    lambda_cov: 0.0    # Weight for identity covariance constraint (e.g., 1e-3 to 1e-2)
+    
+    # Adapter regularization
+    lambda_adapter_ortho: 0.0  # Penalty for ||A^T A - I||^2 (encourages orthogonal adapters)
+    
+    # Optimizer settings (can differ from shared encoder)
+    adapter_lr: 1e-4   # Learning rate for session adapters
+    encoder_lr: 1e-4   # Learning rate for shared encoder/decoder
+  
   sharing:
     is_shared: false
     lora_dim: 1
 
   training:
     coadapt: true # If true, we will adapt in a supervised manner after PCA warm-up
+    ae_freeze_epoch: 5000    # Freeze AE after this epoch to prevent late-stage overfit
+    lambda_ae_recon: 0.01     # Weight for AE reconstruction loss (0 = disabled)
     optim:
-      lr: 1e-5
+      lr: 1e-4
       eps: 1e-8
       weight_decay: 0.0
       amsgrad: true

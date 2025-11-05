@@ -3,14 +3,14 @@ defaults:
   - tbfm: default
   - normalizers: default
   - ae: default
-  - film: default
+  - meta: default
 
 # General settings
 name: tbfm_experiment
 debug: false
 
 # TBFM lives in this space by default
-latent_dim: 50
+latent_dim: 80
 covariate_dim: 3 # e.g. dim of stim parameters
 
 data:
@@ -26,6 +26,12 @@ training:
   num_held_out_sessions: 15
   grad_clip: 2.0
   bw_steps_per_bg_step: 3  # Update basis weights this many times per basis update
+  
+  # Outlier detection and filtering
+  use_outlier_filtering: true # Enable outlier detection and masking
+  outlier_iqr_multiplier: 10.0   # Number of IQRs from median to consider outlier (3=aggressive, 7=moderate, 15=conservative)
+  outlier_center: median        # Use 'median' or 'mean' for center calculation
+  max_outliers_per_trial: 5     # Maximum outlier timepoints allowed in a trial before rejecting it (5-10 typical)
 
 # Device settings
 device: auto  # auto, cpu, cuda

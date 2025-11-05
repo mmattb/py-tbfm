@@ -11,7 +11,7 @@ from typing import Dict, Tuple, List
 
 from . import ae
 from . import dataset
-from . import film
+from . import meta
 from . import flow_ae  # Normalizing flow autoencoder support
 from . import normalizers
 from . import tbfm
@@ -107,19 +107,35 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         raise NotImplementedError("No normalizer adaptation yet")
 
     if cfg.ae.training.coadapt:
-        optims_aes = list(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
+        use_two_stage = cfg.ae.use_two_stage
+
+        if use_two_stage:
+            # Two-stage AE returns a single optimizer with param groups
+            optim_ae = model_ms.ae.get_optim(
+                adapter_lr=cfg.ae.two_stage.adapter_lr,
+                encoder_lr=cfg.ae.two_stage.encoder_lr,
+                eps=cfg.ae.training.optim.eps,
+                weight_decay=cfg.ae.training.optim.weight_decay,
+                amsgrad=cfg.ae.training.optim.amsgrad,
+            )
+            optims_aes = [optim_ae]
+        else:
+            # Single-stage AE dispatcher returns dict of optimizers
+            optims_aes = list(model_ms.ae.get_optim(**cfg.ae.training.optim).values())
     else:
         optims_aes = []
 
     # Will have only 1 elem if tbfm is shared.
     optims_model = model_ms.model.get_optim_custom_base(**cfg.tbfm.training.optim)
 
-    def warmup_cos(warmup):
+    def warmup_cos(warmup, cos=True):
         def _inner(step):
             if step < warmup:
                 return (step + 1) / max(1, warmup)
-            t = (step - warmup) / max(1, cfg.training.epochs - warmup)
-            return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+            if cos:
+                t = (step - warmup) / max(1, cfg.training.epochs - warmup)
+                return 0.5 * (1 + math.cos(math.pi * t))  # → goes to ~0
+            return 1.0
 
         return _inner
 
@@ -128,19 +144,19 @@ def get_optims(cfg, model_ms: TBFMMultisession):
     bw_schedulers = []
     bg_optims = []
     bg_schedulers = []
-    film_optims = []
+    meta_optims = []
 
     for sid, optims in optims_model.items():
-        optim_bw, optim_bg, optim_film = optims
+        optim_bw, optim_bg, optim_meta = optims
 
         bw_optims.append(optim_bw)
-        bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500)))
+        bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500, cos=False)))
 
         bg_optims.append(optim_bg)
-        bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(3000)))
+        bg_schedulers.append(LambdaLR(optim_bg, lr_lambda=warmup_cos(5000)))
 
-        if optim_film is not None:
-            film_optims.append(optim_film)
+        if optim_meta is not None:
+            meta_optims.append(optim_meta)
 
     # Create named optimizer groups
     groups = {
@@ -148,7 +164,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         "ae": {"optimizers": optims_aes, "schedulers": []},
         "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
         "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
-        "film": {"optimizers": film_optims, "schedulers": []},
+        "meta": {"optimizers": meta_optims, "schedulers": []},
     }
 
     return utils.OptimCollection(groups)
@@ -177,12 +193,9 @@ def train_from_cfg(
     model_optims,
     embeddings_rest,
     data_test=None,
-    inner_steps: int | None = None,
     epochs: int = 10000,
     test_interval: int | None = None,
     support_size: int = 300,
-    embed_stim_lr: int | None = None,
-    embed_stim_weight_decay: float = None,
     device: str = "cuda",
     grad_clip: float | None = None,
     alternating_updates: bool = True,  # Use alternating basis weight / basis gen updates
@@ -209,16 +222,15 @@ def train_from_cfg(
     """
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
-    embed_stim_lr = embed_stim_lr or cfg.film.training.optim.lr
-    embed_stim_weight_decay = (
-        embed_stim_weight_decay or cfg.film.training.optim.weight_decay
-    )
-    inner_steps = inner_steps or cfg.film.training.inner_steps
-    use_film = cfg.tbfm.module.use_film_bases
+    use_meta = cfg.tbfm.module.use_meta_learning
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
-    support_size = support_size or cfg.film.training.support_size
+    support_size = support_size or cfg.meta.training.support_size
+    ae_freeze_epoch = cfg.ae.training.ae_freeze_epoch
+    lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+    lambda_mu = cfg.ae.two_stage.lambda_mu
+    lambda_cov = cfg.ae.two_stage.lambda_cov
     device = model.device
 
     embeddings_stim = None  # default
@@ -229,11 +241,29 @@ def train_from_cfg(
     test_losses = []
     test_r2s = []
     min_test_r2 = 1e99
+
+    # Track outlier statistics
+    outlier_stats = {
+        "train_filtered_per_epoch": [],
+        "test_filtered_per_epoch": [],
+    }
+
     for eidx in range(epochs):
         model.train()
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
         )
+
+        # Apply outlier filtering to training data if enabled
+        _data_train, filter_stats = utils.filter_batch_outliers(
+            _data_train, model.norms, cfg
+        )
+
+        # Log filtering statistics occasionally
+        if cfg.training.use_outlier_filtering and eidx % 100 == 0:
+            outlier_stats["train_filtered_per_epoch"].append(
+                (eidx, filter_stats["total_kept"], filter_stats["total_samples"])
+            )
 
         # split into support/query
         support, query = split_support_query_sessions(
@@ -246,15 +276,13 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
-        if use_film:
+        if use_meta:
             model.eval()
-            embeddings_stim = film.inner_update_stopgrad(
+            embeddings_stim = meta.inner_update_stopgrad(
                 model,
                 support,
                 embeddings_rest,
-                inner_steps=inner_steps,
-                lr=embed_stim_lr,
-                weight_decay=embed_stim_weight_decay,
+                cfg,
             )
             model.train()
 
@@ -277,6 +305,44 @@ def train_from_cfg(
             r2_trains.append(r2_train.item())
 
         cur_loss = sum(losses.values()) / len(y_query)
+        train_losses.append((eidx, cur_loss.item()))
+
+        # Add AE reconstruction loss (optional)
+        use_two_stage = cfg.ae.use_two_stage
+
+        if lambda_ae_recon > 0:
+            runways_normalized, runways_recon = model.forward_reconstruct(query)
+            ae_recon_loss = 0.0
+            for sid, rn in runways_normalized.items():
+                rr = runways_recon[sid]
+                ae_recon_loss += nn.functional.mse_loss(rr, rn)
+            ae_recon_loss /= len(query)
+
+            cur_loss += lambda_ae_recon * ae_recon_loss
+        else:
+            runways_normalized = None
+
+        # Add moment matching losses for two-stage AE (optional)
+        if use_two_stage:
+            if lambda_mu > 0 or lambda_cov > 0:
+                # Normalize runways if not already done
+                if runways_normalized is None:
+                    runways = {sid: d[0] for sid, d in query.items()}
+                    runways_normalized = model.norms(runways)
+
+                # Collect latents from all query sessions
+                all_z = []
+                for sid, runway_norm in runways_normalized.items():
+                    z = model.ae.encode(runway_norm, session_id=sid)
+                    all_z.append(z.flatten(end_dim=-2))  # Flatten batch/time
+
+                z_batch = torch.cat(all_z, dim=0)  # [total_samples, latent_dim]
+                L_mu, L_cov = model.ae.moment_matching_loss(z_batch)
+
+                if lambda_mu > 0:
+                    cur_loss += lambda_mu * L_mu
+                if lambda_cov > 0:
+                    cur_loss += lambda_cov * L_cov
 
         tbfm_regs = model.model.get_weighting_reg()
         cur_loss += (
@@ -292,31 +358,47 @@ def train_from_cfg(
 
         loss = cur_loss
 
-        train_losses.append((eidx, loss.item()))
-
         loss.backward()
 
         if grad_clip is not None:
             model_optims.clip_grad(value=grad_clip)
 
-        # if eidx == 3000:
-        #    utils.log_grad_norms(model.model.instances["MonkeyG_20150925_Session2_S1"])
-        #    utils.log_grad_norms(model.ae.instances["MonkeyG_20150925_Session2_S1"])
-
         # Alternating updates: update basis weights more frequently than basis generator
+        # Also: freeze AE after specified epoch to prevent late-stage overfitting
+        skip_groups = []
+
+        use_two_stage = cfg.ae.use_two_stage
+
+        if ae_freeze_epoch is not None and eidx >= ae_freeze_epoch:
+            if use_two_stage:
+                # For two-stage: optionally freeze only shared encoder/decoder, keep adapters trainable
+                freeze_only_shared = cfg.ae.two_stage.freeze_only_shared
+
+                if freeze_only_shared:
+                    # Freeze shared encoder/decoder parameters
+                    for param in model.ae.encoder.parameters():
+                        param.requires_grad = False
+                    # Adapters remain trainable - don't skip "ae" group
+                else:
+                    # Freeze entire AE (adapters + encoder/decoder)
+                    skip_groups.append("ae")
+            else:
+                # Single-stage: freeze all AE instances
+                skip_groups.append("ae")
+
         if alternating_updates:
             # Every basis_weight_steps_per_basis iterations, update both
             # Otherwise, only update basis weights
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
             if update_basis_gen:
-                # Update everything (basis weights, basis gen, film, ae, norm)
-                model_optims.step()
+                # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
+                model_optims.step(skip=skip_groups)
             else:
-                # Update only basis weights (skip basis gen and film)
-                model_optims.step(skip=["bg", "film"])
+                # Update only basis weights (skip basis gen and meta) minus frozen groups
+                model_optims.step(skip=["bg", "meta"] + skip_groups)
         else:
-            model_optims.step()
+            model_optims.step(skip=skip_groups)
 
         if data_test is not None and (eidx % test_interval) == 0:
             train_r2s.append((eidx, sum(r2_trains) / len(y_query)))
@@ -324,43 +406,19 @@ def train_from_cfg(
             model_optims.zero_grad(set_to_none=True)
             with torch.no_grad():
                 model.eval()
-                loss_outer = 0
-                r2_outer = 0
-                test_batch_count = 0
-                for test_batch in data_test:
-                    test_batch = utils.move_batch(test_batch, device=device)
+                test_results = utils.evaluate_test_batches(
+                    model,
+                    data_test,
+                    embeddings_rest,
+                    embeddings_stim,
+                    model.norms,
+                    cfg,
+                    device,
+                    track_per_session_r2=False,
+                )
 
-                    tb_norm = {}
-                    for session_id, d in test_batch.items():
-                        y_test = model.norms.instances[session_id](d[2])
-                        new_d = (d[0], d[1], y_test)
-                        tb_norm[session_id] = new_d
-                    test_batch = tb_norm
-
-                    y_hat_test = model(
-                        test_batch,
-                        embeddings_rest=embeddings_rest,
-                        embeddings_stim=embeddings_stim,
-                    )
-
-                    loss = 0
-                    r2_test = 0
-                    for session_id, d in test_batch.items():
-                        y_test = d[2]
-                        loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                        r2_test += r2_score(
-                            y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                            y_test.permute(0, 2, 1).flatten(end_dim=1),
-                        )
-                    loss /= len(test_batch)
-                    r2_test /= len(test_batch)
-
-                    r2_outer += r2_test.item()
-                    loss_outer += loss.item()
-                    test_batch_count += 1
-
-                r2_test = r2_outer / test_batch_count
-                loss = loss_outer / test_batch_count
+                loss = test_results["loss"]
+                r2_test = test_results["r2"]
                 test_losses.append((eidx, loss))
                 test_r2s.append((eidx, r2_test))
                 print(
@@ -376,7 +434,8 @@ def train_from_cfg(
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
-    if use_film:
+    use_meta = cfg.tbfm.module.use_meta_learning
+    if use_meta:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
         )
@@ -387,61 +446,49 @@ def train_from_cfg(
         )
 
         model_optims.zero_grad(set_to_none=True)
-        embeddings_stim = film.inner_update_stopgrad(
+        embeddings_stim = meta.inner_update_stopgrad(
             model,
             support,
             embeddings_rest,
-            inner_steps=(3 * inner_steps),
-            lr=embed_stim_lr,
-            weight_decay=embed_stim_weight_decay,
+            cfg,
+            inner_steps=(3 * cfg.meta.training.inner_steps),
         )
 
+    # Final test evaluation
     model_optims.zero_grad(set_to_none=True)
     with torch.no_grad():
         model.eval()
-        loss_outer = 0
-        r2_outer = 0
-        test_batch_count = 0
-        final_test_r2s = {session_id: 0 for session_id in test_batch.keys()}
-        for test_batch in data_test:
-            test_batch = utils.move_batch(test_batch, device=device)
-            tb_norm = {}
-            for session_id, d in test_batch.items():
-                y_test = model.norms.instances[session_id](d[2])
-                new_d = (d[0], d[1], y_test)
-                tb_norm[session_id] = new_d
-            test_batch = tb_norm
+        final_test_results = utils.evaluate_test_batches(
+            model,
+            data_test,
+            embeddings_rest,
+            embeddings_stim,
+            model.norms,
+            cfg,
+            device,
+            track_per_session_r2=True,
+        )
 
-            y_hat_test = model(
-                test_batch,
-                embeddings_rest=embeddings_rest,
-                embeddings_stim=embeddings_stim,
-            )
+        loss = final_test_results["loss"]
+        r2_test = final_test_results["r2"]
+        final_test_r2s = final_test_results["per_session_r2"]
+        y_hat_test = final_test_results["y_hat"]
+        test_batch = final_test_results["y_test"]
 
-            loss = 0
-            r2_test = 0
-            for session_id, d in test_batch.items():
-                y_test = d[2]
-                loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                _r2_test = r2_score(
-                    y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                    y_test.permute(0, 2, 1).flatten(end_dim=1),
+        # Log outlier filtering stats for test set
+        if final_test_results["outlier_stats"] is not None:
+            outlier_stats["test_filtered_per_epoch"].append(
+                (
+                    epochs - 1,
+                    final_test_results["outlier_stats"]["total_kept"],
+                    final_test_results["outlier_stats"]["total_samples"],
                 )
-                r2_test += _r2_test
-                final_test_r2s[session_id] += _r2_test.item()
-            loss /= len(test_batch)
-            r2_test /= len(test_batch)
-
-            r2_outer += r2_test.item()
-            loss_outer += loss.item()
-            test_batch_count += 1
-
-        r2_test = r2_outer / test_batch_count
-        loss = loss_outer / test_batch_count
-        final_test_r2s = {
-            session_id: r2 / test_batch_count
-            for session_id, r2 in final_test_r2s.items()
-        }
+            )
+            print(
+                f"Test outlier filtering: kept {final_test_results['outlier_stats']['total_kept']}/"
+                f"{final_test_results['outlier_stats']['total_samples']} "
+                f"({final_test_results['outlier_stats']['pct_kept']:.1f}%)"
+            )
 
         if r2_test < min_test_r2:
             min_test_r2 = r2_test
@@ -456,6 +503,9 @@ def train_from_cfg(
     results["train_r2s"] = train_r2s
     results["test_r2s"] = test_r2s
     results["y_hat"] = yhat_query
+    results["outlier_stats"] = (
+        outlier_stats if cfg.training.use_outlier_filtering else None
+    )
     results["y"] = y_query
     results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
@@ -472,82 +522,65 @@ def test_time_adaptation(
     data_train,
     epochs=1000,
     data_test=None,
-    lr=None,
-    weight_decay=None,
-    grad_clip=None,
 ) -> torch.Tensor:
 
     model.eval()
 
-    lr = lr or cfg.film.training.optim.lr
-    weight_decay = weight_decay or cfg.film.training.optim.weight_decay
-    grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     device = model.device
 
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
     _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
 
-    embeddings_stim, _ = film.inner_update_stopgrad(
+    # Apply outlier filtering to training data
+    data_train, filter_stats = utils.filter_batch_outliers(data_train, model.norms, cfg)
+    if cfg.training.use_outlier_filtering:
+        print(
+            f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
+        )
+
+    # TODO: need to do the AE warm starting here.
+
+    embeddings_stim, _ = meta.inner_update_stopgrad(
         model,
         data_train,
         embeddings_rest,
+        cfg,
         inner_steps=epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        grad_clip=grad_clip,
         quiet=False,
     )
 
     if data_test:
         with torch.no_grad():
-            loss_outer = 0
-            r2_outer = 0
-            test_batch_count = 0
-            final_test_r2s = {session_id: 0 for session_id in data_train.keys()}
-            for test_batch in data_test:
-                test_batch = utils.move_batch(test_batch, device=device)
-                tb_norm = {}
-                for session_id, d in test_batch.items():
-                    y_test = model.norms.instances[session_id](d[2])
-                    new_d = (d[0], d[1], y_test)
-                    tb_norm[session_id] = new_d
-                test_batch = tb_norm
+            test_results = utils.evaluate_test_batches(
+                model,
+                data_test,
+                embeddings_rest,
+                embeddings_stim,
+                model.norms,
+                cfg,
+                device,
+                track_per_session_r2=True,
+            )
 
-                y_hat_test = model(
-                    test_batch,
-                    embeddings_rest=embeddings_rest,
-                    embeddings_stim=embeddings_stim,
+            r2_test = test_results["r2"]
+            loss = test_results["loss"]
+            final_test_r2s = test_results["per_session_r2"]
+            y_hat_test = test_results["y_hat"]
+            test_batch = test_results["y_test"]
+
+            if test_results["outlier_stats"] is not None:
+                print(
+                    f"TTA: Test data filtered: {test_results['outlier_stats']['total_kept']}/"
+                    f"{test_results['outlier_stats']['total_samples']} "
+                    f"({test_results['outlier_stats']['pct_kept']:.1f}%)"
                 )
-
-                loss = 0
-                r2_test = 0
-                for session_id, d in test_batch.items():
-                    y_test = d[2]
-                    loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-                    _r2_test = r2_score(
-                        y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                        y_test.permute(0, 2, 1).flatten(end_dim=1),
-                    )
-                    r2_test += _r2_test
-                    final_test_r2s[session_id] += _r2_test.item()
-                loss /= len(test_batch)
-                r2_test /= len(test_batch)
-
-                r2_outer += r2_test.item()
-                loss_outer += loss.item()
-                test_batch_count += 1
-
-            r2_test = r2_outer / test_batch_count
-            loss = loss_outer / test_batch_count
-            final_test_r2s = {
-                session_id: r2 / test_batch_count
-                for session_id, r2 in final_test_r2s.items()
-            }
     else:
         r2_test = None
         final_test_r2s = None
         loss = None
+        y_hat_test = None
+        test_batch = None
 
     results = {}
     results["final_test_r2"] = r2_test
@@ -608,7 +641,7 @@ def load_rest_embeddings(
     session_ids, in_dir="data", in_subdir="embedding_rest", device=None
 ):
     """
-    See film.cache_rest_embeds.
+    See meta.cache_rest_embeds.
     """
     embeddings_rest = {}
     for session_id in session_ids:
@@ -616,7 +649,3 @@ def load_rest_embeddings(
         er = torch.load(path).to(device)
         embeddings_rest[session_id] = er
     return embeddings_rest
-
-
-# TODO: inner loop regularization
-# TODO: AE regularization including orthogonality
