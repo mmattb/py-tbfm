@@ -524,6 +524,8 @@ def test_time_adaptation(
     ae_warm_start: bool = True,
     adapt_ae: bool = True,
     embeddings_stim=None,
+    support_size: int | None = None,
+    quiet: bool = False,
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -538,6 +540,7 @@ def test_time_adaptation(
         ae_warm_start: If True, warm start AE with PCA initialization
         adapt_ae: If True, optimize the autoencoder weights
         embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
+        support_size: Override cfg.meta.training.support_size if provided.
 
     Returns:
         embeddings_stim: Session embeddings (optimized or provided)
@@ -548,6 +551,9 @@ def test_time_adaptation(
     model.eval(ae=not adapt_ae)
 
     device = model.device
+
+    support_size = support_size or cfg.meta.training.support_size
+    inner_steps = cfg.meta.training.inner_steps
 
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
@@ -560,11 +566,15 @@ def test_time_adaptation(
             f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
         )
 
-    # AE warm start initialization
+    # Split into support/query if support_size is provided
+    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    print(f"TTA: Using {support_size} samples for adaptation (support set)")
+
+    # AE warm start initialization using support data
     if ae_warm_start:
         print("TTA: Warm starting autoencoder...")
         with torch.no_grad():
-            for session_id, data in data_train.items():
+            for session_id, data in data_for_adaptation.items():
                 runway = data[0]  # (batch, time, channels)
                 runway_normalized = model.norms({session_id: runway})
 
@@ -581,23 +591,30 @@ def test_time_adaptation(
     # Determine if we need to optimize embeddings
     optimize_embeddings = embeddings_stim is None
 
-    if optimize_embeddings:
-        # Train new embeddings
+    if optimize_embeddings and not adapt_ae:
+        # Only optimizing embeddings (not AE)
+        print("TTA: Optimizing embeddings...")
         embeddings_stim, _ = meta.inner_update_stopgrad(
             model,
-            data_train,
+            data_for_adaptation,
             embeddings_rest,
             cfg,
             inner_steps=epochs,
-            quiet=False,
+            quiet=quiet,
         )
 
-    # Joint adaptation: both AE and embeddings
+    # AE optimization (alone or jointly with embeddings)
+    # AE optimization using meta-learning approach
     if adapt_ae:
-        print("TTA: Optimizing autoencoder...")
-        # Set up optimizers for AE
+        print("TTA: Meta-learning style AE optimization...")
+
+        # Outer loop: adapt AE parameters
+        # Inner loop: adapt embeddings
+        # Both loops use data_for_adaptation (the tiny support set)
+
+        # Set up AE optimizers
         ae_optims = []
-        for session_id in data_train.keys():
+        for session_id in data_for_adaptation.keys():
             ae_instance = model.ae.instances.get(session_id)
             if ae_instance is not None:
                 ae_optim = torch.optim.AdamW(
@@ -607,50 +624,71 @@ def test_time_adaptation(
                 )
                 ae_optims.append(ae_optim)
 
-        # If optimizing both AE and embeddings
-        if optimize_embeddings:
-            print("TTA: Joint optimization of AE and embeddings...")
-            embed_optims = [
-                torch.optim.AdamW(
-                    [emb],
-                    lr=cfg.meta.training.optim.lr,
-                    weight_decay=cfg.meta.training.optim.weight_decay,
-                )
-                for emb in embeddings_stim.values()
-            ]
-        else:
-            print("TTA: Optimizing AE only (embeddings fixed)...")
-            embed_optims = []
+        print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
+        print(
+            f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
+        )
 
-        # Optimization loop
-        for step in range(epochs):
-            # Zero gradients
-            for opt in ae_optims + embed_optims:
-                opt.zero_grad()
-
-            # Forward pass
-            yhat = model(
-                data_train,
-                embeddings_rest=embeddings_rest,
-                embeddings_stim=embeddings_stim,
+        for outer_step in range(epochs):
+            # Inner loop: optimize embeddings on data_for_adaptation
+            embeddings_stim_adapted = meta.inner_update_stopgrad(
+                model,
+                data_for_adaptation,
+                embeddings_rest,
+                cfg,
+                inner_steps=inner_steps,
+                quiet=True,
             )
 
-            # Compute loss
-            loss = 0
-            for session_id, data in data_train.items():
-                y = data[2]
-                loss += nn.MSELoss()(yhat[session_id], y)
-            loss = loss / len(data_train)
+            # Outer step: update AE on data_for_adaptation using adapted embeddings
+            for opt in ae_optims:
+                opt.zero_grad()
 
-            # Backward and step
+            # Forward on data_for_adaptation with adapted embeddings
+            yhat = model(
+                data_for_adaptation,
+                embeddings_rest=embeddings_rest,
+                embeddings_stim=embeddings_stim_adapted,
+            )
+
+            # Normalize y values for loss computation (similar to train_from_cfg line 260)
+            # Note: inner_update_stopgrad already normalizes internally, so we only normalize here
+            y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
+            y_normalized = model.norms(y_data)
+
+            # Compute loss on data_for_adaptation
+            loss = 0
+            ys = {}
+            for session_id in data_for_adaptation.keys():
+                y = y_normalized[session_id]
+                loss += nn.MSELoss()(yhat[session_id], y)
+                ys[session_id] = y.detach()
+            loss = loss / len(data_for_adaptation)
+
+            # Backward and update AE
             loss.backward()
-            for opt in ae_optims + embed_optims:
+            for opt in ae_optims:
                 opt.step()
 
-            if step % 100 == 0 and not cfg.training.quiet:
-                print(f"  TTA step {step}/{epochs}, loss: {loss.item():.6f}")
+            if outer_step % 1000 == 0 and not quiet:
+                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
 
-        print(f"TTA: Optimization complete. Final loss: {loss.item():.6f}")
+        # After outer loop, do final inner optimization for embeddings to return
+        embeddings_stim, _ = meta.inner_update_stopgrad(
+            model,
+            data_for_adaptation,
+            embeddings_rest,
+            cfg,
+            inner_steps=inner_steps,
+            quiet=False,
+        )
+
+        print(
+            f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
+        )
+    else:
+        ys = None
+        yhat = None
 
     if data_test:
         with torch.no_grad():
@@ -677,6 +715,7 @@ def test_time_adaptation(
                     f"{test_results['outlier_stats']['total_samples']} "
                     f"({test_results['outlier_stats']['pct_kept']:.1f}%)"
                 )
+            print(f"TTA: Test results - Loss: {loss:.6f}, R2: {r2_test:.4f}")
     else:
         r2_test = None
         final_test_r2s = None
@@ -688,9 +727,10 @@ def test_time_adaptation(
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    results["y"] = ys
     results["y_hat"] = yhat
-    results["y_hat_test"] = y_hat_test
     results["y_test"] = test_batch
+    results["y_hat_test"] = y_hat_test
     return embeddings_stim, results
 
 
