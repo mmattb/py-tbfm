@@ -28,8 +28,19 @@ EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
 
-def main(num_bases, num_sessions, gpu):
-    print("-----------", num_bases, num_sessions, gpu, "--")
+def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
+
+    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
+    if basis_residual_rank_in is not None:
+        my_out_dir += f"_rr{basis_residual_rank_in}"
+
+    try:
+        shutil.rmtree(my_out_dir)
+    except OSError:
+        pass
+    os.makedirs(my_out_dir)
+
+    print(f"----------- Device: {gpu}, out: {my_out_dir} ------------")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
 
@@ -44,38 +55,41 @@ def main(num_bases, num_sessions, gpu):
     WINDOW_SIZE = cfg.data.trial_len
     NUM_HELD_OUT_SESSIONS = cfg.training.num_held_out_sessions
 
-    held_in_session_ids = [
-        "MonkeyJ_20160426_Session2_S1",
-        "MonkeyG_20150914_Session1_S1",
-        "MonkeyG_20150915_Session3_S1",
-        "MonkeyG_20150915_Session5_S1",
-        "MonkeyG_20150916_Session4_S1",
-        "MonkeyG_20150917_Session1_M1",
-        "MonkeyG_20150917_Session1_S1",
-        "MonkeyG_20150917_Session2_M1",
-        "MonkeyG_20150917_Session2_S1",
-        "MonkeyG_20150921_Session3_S1",
-        "MonkeyG_20150921_Session5_S1",
-        "MonkeyG_20150922_Session1_S1",
-        "MonkeyG_20150922_Session2_S1",
-        "MonkeyG_20150925_Session1_S1",
-        "MonkeyG_20150925_Session2_S1",
-        "MonkeyJ_20160426_Session3_S1",
-        "MonkeyJ_20160428_Session3_S1",
-        "MonkeyJ_20160429_Session1_S1",
-        "MonkeyJ_20160502_Session1_S1",
-        "MonkeyJ_20160624_Session3_S1",
-        "MonkeyJ_20160625_Session4_S1",
-        "MonkeyJ_20160625_Session5_S1",
-        "MonkeyJ_20160627_Session1_S1",
-        "MonkeyJ_20160630_Session3_S1",
-        "MonkeyJ_20160702_Session2_S1",
-    ][:num_sessions]
+    if num_sessions == 40:
+        held_in_session_ids = None
+    elif num_sessions < 40:
+        held_in_session_ids = [
+            "MonkeyJ_20160426_Session2_S1",
+            "MonkeyG_20150914_Session1_S1",
+            "MonkeyG_20150915_Session3_S1",
+            "MonkeyG_20150915_Session5_S1",
+            "MonkeyG_20150916_Session4_S1",
+            "MonkeyG_20150917_Session1_M1",
+            "MonkeyG_20150917_Session1_S1",
+            "MonkeyG_20150917_Session2_M1",
+            "MonkeyG_20150917_Session2_S1",
+            "MonkeyG_20150921_Session3_S1",
+            "MonkeyG_20150921_Session5_S1",
+            "MonkeyG_20150922_Session1_S1",
+            "MonkeyG_20150922_Session2_S1",
+            "MonkeyG_20150925_Session1_S1",
+            "MonkeyG_20150925_Session2_S1",
+            "MonkeyJ_20160426_Session3_S1",
+            "MonkeyJ_20160428_Session3_S1",
+            "MonkeyJ_20160429_Session1_S1",
+            "MonkeyJ_20160502_Session1_S1",
+            "MonkeyJ_20160624_Session3_S1",
+            "MonkeyJ_20160625_Session4_S1",
+            "MonkeyJ_20160625_Session5_S1",
+            "MonkeyJ_20160627_Session1_S1",
+            "MonkeyJ_20160630_Session3_S1",
+            "MonkeyJ_20160702_Session2_S1",
+        ][:num_sessions]
 
-    num_sessions = len(held_in_session_ids)
-
-    MAX_BATCH_SIZE = 62500 // 2
-    batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        MAX_BATCH_SIZE = 62500 // 4
+        batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+    else:
+        raise ValueError("blah")
 
     d, held_out_session_ids = multisession.load_stim_batched(
         window_size=WINDOW_SIZE,
@@ -150,9 +164,12 @@ def main(num_bases, num_sessions, gpu):
     cfg.ae.two_stage.lambda_cov = 0.01
     cfg.tbfm.training.lambda_fro = 75.0
 
-    cfg.meta.is_basis_residual = True
-    cfg.meta.basis_residual_rank = 16
-    cfg.meta.training.lambda_l2 = 1e-2
+    if basis_residual_rank_in == 0:
+        cfg.meta.is_basis_residual = False
+    else:
+        cfg.meta.is_basis_residual = True
+        cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
+        cfg.meta.training.lambda_l2 = 1e-2
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
     model_optims = multisession.get_optims(cfg, ms)
@@ -168,16 +185,10 @@ def main(num_bases, num_sessions, gpu):
         epochs=cfg.training.epochs,
     )
 
-    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
-    try:
-        shutil.rmtree(my_out_dir)
-    except OSError:
-        pass
-    os.makedirs(my_out_dir)
-    torch.save(embeddings_stim, os.path.join(my_out_dir, "es_nf_1.torch"))
-    torch.save(results, os.path.join(my_out_dir, "r_nf_1.torch"))
-    torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi_nf_1.torch"))
-    multisession.save_model(ms, os.path.join(my_out_dir, "model_nf_1.torch"))
+    torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
+    torch.save(results, os.path.join(my_out_dir, "r.torch"))
+    torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi.torch"))
+    multisession.save_model(ms, os.path.join(my_out_dir, "model.torch"))
 
     txt = [t[0] for t in results["train_losses"]]
     tlt = [t[1] for t in results["train_losses"]]
@@ -244,4 +255,13 @@ def main(num_bases, num_sessions, gpu):
 if __name__ == "__main__":
     import sys
 
-    main(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3])
+    basis_residual_rank = None
+    if len(sys.argv) > 4:
+        basis_residual_rank = int(sys.argv[4])
+
+    main(
+        int(sys.argv[1]),
+        int(sys.argv[2]),
+        sys.argv[3],
+        basis_residual_rank_in=basis_residual_rank,
+    )
