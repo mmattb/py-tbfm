@@ -21,14 +21,14 @@ from tbfm import meta
 from tbfm import multisession
 from tbfm import utils
 
-DATA_DIR = "/home/mmattb/Projects/opto-coproc/data"
+DATA_DIR = "/var/data/opto-coproc/"
 
 OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc folder.
 EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
 
-def main(num_bases, num_sessions, gpu):
+def main(num_bases, num_sessions, gpu, coadapt=False):
     print("-----------", num_bases, num_sessions, gpu, "--")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
@@ -153,9 +153,22 @@ def main(num_bases, num_sessions, gpu):
     cfg.meta.is_basis_residual = True
     cfg.meta.basis_residual_rank = 16
     cfg.meta.training.lambda_l2 = 1e-2
+    cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
-    model_optims = multisession.get_optims(cfg, ms)
+
+    # Initialize trainable stim embeddings for co-adaptation if enabled
+    if cfg.meta.training.coadapt:
+        embed_dim_stim = ms.model.bases.embed_dim_stim
+        embeddings_stim_init = {}
+        for session_id in held_in_session_ids:
+            emb = torch.randn(embed_dim_stim, device=DEVICE) * 0.1
+            emb.requires_grad = True
+            embeddings_stim_init[session_id] = emb
+    else:
+        embeddings_stim_init = None
+
+    model_optims = multisession.get_optims(cfg, ms, embeddings_stim=embeddings_stim_init)
 
     embeddings_stim, results = multisession.train_from_cfg(
         cfg,
@@ -163,12 +176,13 @@ def main(num_bases, num_sessions, gpu):
         data_train,
         model_optims,
         embeddings_rest,
+        embeddings_stim=embeddings_stim_init,
         data_test=data_test,
         test_interval=1000,
         epochs=cfg.training.epochs,
     )
 
-    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
+    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}_{'coadapt' if coadapt else 'inner'}")
     try:
         shutil.rmtree(my_out_dir)
     except OSError:
@@ -244,4 +258,4 @@ def main(num_bases, num_sessions, gpu):
 if __name__ == "__main__":
     import sys
 
-    main(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3])
+    main(int(sys.argv[1]), int(sys.argv[2]), sys.argv[3], sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False)

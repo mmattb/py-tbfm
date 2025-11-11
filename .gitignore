@@ -164,3 +164,4 @@ cython_debug/
 saved_models/
 data/
 logs/
+test/

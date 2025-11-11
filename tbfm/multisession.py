@@ -100,7 +100,7 @@ def save_model(model, path, tbfm_only=True):
         torch.save(model_tbfm.state_dict(), path)
 
 
-def get_optims(cfg, model_ms: TBFMMultisession):
+def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     optims_norms = tuple()
     if cfg.normalizers.training.coadapt:
         raise NotImplementedError("No normalizer adaptation yet")
@@ -157,6 +157,18 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         if optim_meta is not None:
             meta_optims.append(optim_meta)
 
+    # Add embeddings optimizer if co-adapting
+    embed_optims = []
+    if embeddings_stim is not None:
+        embed_lr = cfg.meta.training.optim.lr
+        embed_wd = cfg.meta.training.optim.weight_decay
+        embed_optim = torch.optim.AdamW(
+            list(embeddings_stim.values()), 
+            lr=embed_lr, 
+            weight_decay=embed_wd
+        )
+        embed_optims.append(embed_optim)
+
     # Create named optimizer groups
     groups = {
         "norm": {"optimizers": optims_norms, "schedulers": []},
@@ -164,6 +176,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
         "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
         "meta": {"optimizers": meta_optims, "schedulers": []},
+        "embed": {"optimizers": embed_optims, "schedulers": []},
     }
 
     return utils.OptimCollection(groups)
@@ -191,6 +204,7 @@ def train_from_cfg(
     data_train,  # yields per-session batches (stiminds, runways, y)
     model_optims,
     embeddings_rest,
+    embeddings_stim=None,  # Pre-initialized embeddings for co-adaptation
     data_test=None,
     epochs: int = 10000,
     test_interval: int | None = None,
@@ -201,20 +215,23 @@ def train_from_cfg(
     bw_steps_per_bg_step: (
         int | None
     ) = None,  # How many basis weight updates per basis update
+    embed_steps_per_other_step: int = 5,  # How many other updates per embedding update
     model_save_path: str | None = None,
 ):
     """
     One epoch over sessions with:
-      - inner loop on support to adapt stim_embed (per-episode latent)
+      - inner loop on support to adapt stim_embed (per-episode latent) OR co-adaptation
       - outer update on query for shared params
       - slow AE updates every step (small lr)
       - optional alternating updates: update basis weights more frequently than basis generator
+      - optional co-adaptation of embeddings instead of inner loop
 
     Alternating updates rationale:
       - Basis weights have large gradients and adapt quickly
       - Basis generator (Bases) changes more slowly
       - By updating basis weights N times per basis generator update, we let the
         weighting layer stabilize to the current bases before changing the bases
+      - When co-adapting embeddings, alternate between embeddings and other parameters
 
     Notes:
       • To add EMA for AE: keep a shadow copy of AE params and update with EMA after each optimizer.step().
@@ -222,6 +239,8 @@ def train_from_cfg(
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
     use_meta = cfg.tbfm.module.use_meta_learning
+    coadapt_embeddings = cfg.meta.training.coadapt if use_meta else False
+    embed_steps_per_other_step = embed_steps_per_other_step or cfg.meta.training.get('embed_steps_per_other_step', 5)
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
@@ -232,7 +251,23 @@ def train_from_cfg(
     lambda_cov = cfg.ae.two_stage.lambda_cov
     device = model.device
 
+    # Initialize embeddings_stim as trainable parameters if co-adapting
+    if embeddings_stim is None and use_meta and coadapt_embeddings:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
     embeddings_stim = None  # default
+    if use_meta:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
+
     iter_train = iter(data_train)
 
     train_losses = []
@@ -275,7 +310,7 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
-        if use_meta:
+        if use_meta and not coadapt_embeddings:
             model.eval()
             embeddings_stim = meta.inner_update_stopgrad(
                 model,
@@ -390,12 +425,29 @@ def train_from_cfg(
             # Otherwise, only update basis weights
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
-            if update_basis_gen:
-                # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
-                model_optims.step(skip=skip_groups)
+            if coadapt_embeddings:
+                # When co-adapting embeddings, alternate between embeddings and other params
+                update_embeddings = (eidx % embed_steps_per_other_step) == 0 or eidx < 200
+                
+                if update_embeddings and update_basis_gen:
+                    # Update everything minus frozen groups
+                    model_optims.step(skip=skip_groups)
+                elif update_embeddings:
+                    # Update embeddings and basis weights, skip basis gen and meta
+                    model_optims.step(skip=["bg", "meta"] + skip_groups)
+                elif update_basis_gen:
+                    # Update basis gen and meta, skip embeddings
+                    model_optims.step(skip=["embed"] + skip_groups)
+                else:
+                    # Update basis weights only, skip basis gen, meta, and embeddings
+                    model_optims.step(skip=["bg", "meta", "embed"] + skip_groups)
             else:
-                # Update only basis weights (skip basis gen and meta) minus frozen groups
-                model_optims.step(skip=["bg", "meta"] + skip_groups)
+                if update_basis_gen:
+                    # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
+                    model_optims.step(skip=skip_groups)
+                else:
+                    # Update only basis weights (skip basis gen and meta) minus frozen groups
+                    model_optims.step(skip=["bg", "meta"] + skip_groups)
         else:
             model_optims.step(skip=skip_groups)
 
