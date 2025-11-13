@@ -165,3 +165,4 @@ saved_models/
 data/
 logs/
 test/
+training_log.txt
