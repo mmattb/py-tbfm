@@ -657,19 +657,27 @@ def evaluate_test_batches(
         # Compute loss and R2
         loss = 0
         r2_test = 0
+        valid_sessions = 0
         for session_id, d in batch.items():
             y_test = d[2]
             loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-            _r2_test = r2_score(
-                y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                y_test.permute(0, 2, 1).flatten(end_dim=1),
-            )
-            r2_test += _r2_test
-            if track_per_session_r2:
-                per_session_r2[session_id] += _r2_test.item()
+            yhat_flat = y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1)
+            y_flat = y_test.permute(0, 2, 1).flatten(end_dim=1)
+            if yhat_flat.shape[0] >= 2:
+                _r2_test = r2_score(yhat_flat, y_flat)
+                r2_test += _r2_test
+                valid_sessions += 1
+                if track_per_session_r2:
+                    per_session_r2[session_id] += _r2_test.item()
+            else:
+                if track_per_session_r2:
+                    per_session_r2[session_id] += 0.0
 
         loss /= len(batch)
-        r2_test /= len(batch)
+        if valid_sessions > 0:
+            r2_test /= valid_sessions
+        else:
+            r2_test = 0.0
 
         r2_outer += r2_test.item()
         loss_outer += loss.item()

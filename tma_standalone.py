@@ -32,7 +32,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 
     my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
     if basis_residual_rank_in is not None:
-        my_out_dir += f"_rr{basis_residual_rank_in}"
+        my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
 
     try:
         shutil.rmtree(my_out_dir)
@@ -86,7 +86,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
             "MonkeyJ_20160702_Session2_S1",
         ][:num_sessions]
 
-        MAX_BATCH_SIZE = 62500 // 4
+        MAX_BATCH_SIZE = 62500 // 8
         batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
     else:
         raise ValueError("blah")
@@ -269,13 +269,15 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 if __name__ == "__main__":
     import sys
 
+
     basis_residual_rank = None
     if len(sys.argv) > 4:
-        basis_residual_rank = int(sys.argv[4])
-
+        basis_residual_rank = int(sys.argv[5])
+    
     main(
         int(sys.argv[1]),
         int(sys.argv[2]),
         sys.argv[3],
+        sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False,
         basis_residual_rank_in=basis_residual_rank,
-    , sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False)
+    )

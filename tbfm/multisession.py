@@ -332,11 +332,13 @@ def train_from_cfg(
             _loss = nn.MSELoss()(yhat_query[sid], y)
             losses[sid] = _loss
 
-            r2_train = r2_score(
-                yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1),
-                y.permute(0, 2, 1).flatten(end_dim=1),
-            )
-            r2_trains.append(r2_train.item())
+            yhat_flat = yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1)
+            y_flat = y.permute(0, 2, 1).flatten(end_dim=1)
+            if yhat_flat.shape[0] >= 2:
+                r2_train = r2_score(yhat_flat, y_flat)
+                r2_trains.append(r2_train.item())
+            else:
+                r2_trains.append(0.0)
 
         cur_loss = sum(losses.values()) / len(y_query)
         train_losses.append((eidx, cur_loss.item()))
@@ -578,6 +580,7 @@ def test_time_adaptation(
     embeddings_stim=None,
     support_size: int | None = None,
     quiet: bool = False,
+    coadapt_embeddings: bool = False,
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -593,6 +596,8 @@ def test_time_adaptation(
         adapt_ae: If True, optimize the autoencoder weights
         embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
         support_size: Override cfg.meta.training.support_size if provided.
+        quiet: If True, suppress progress messages
+        coadapt_embeddings: If True, optimize embeddings jointly with AE parameters
 
     Returns:
         embeddings_stim: Session embeddings (optimized or provided)
@@ -643,7 +648,16 @@ def test_time_adaptation(
     # Determine if we need to optimize embeddings
     optimize_embeddings = embeddings_stim is None
 
-    if optimize_embeddings and not adapt_ae:
+    # Initialize embeddings as trainable parameters if co-adapting
+    if optimize_embeddings and coadapt_embeddings:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
+
+    if optimize_embeddings and not adapt_ae and not coadapt_embeddings:
         # Only optimizing embeddings (not AE)
         print("TTA: Optimizing embeddings...")
         embeddings_stim, _ = meta.inner_update_stopgrad(
@@ -656,12 +670,14 @@ def test_time_adaptation(
         )
 
     # AE optimization (alone or jointly with embeddings)
-    # AE optimization using meta-learning approach
     if adapt_ae:
-        print("TTA: Meta-learning style AE optimization...")
+        if coadapt_embeddings:
+            print("TTA: Joint optimization of AE and embeddings...")
+        else:
+            print("TTA: Meta-learning style AE optimization...")
 
-        # Outer loop: adapt AE parameters
-        # Inner loop: adapt embeddings
+        # Outer loop: adapt AE parameters (and embeddings if co-adapting)
+        # Inner loop: adapt embeddings (only if not co-adapting)
         # Both loops use data_for_adaptation (the tiny support set)
 
         # Set up AE optimizers
@@ -676,68 +692,132 @@ def test_time_adaptation(
                 )
                 ae_optims.append(ae_optim)
 
-        print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
-        print(
-            f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
-        )
+        # Set up embeddings optimizer if co-adapting
+        embed_optim = None
+        if coadapt_embeddings and optimize_embeddings:
+            embed_params = [emb for emb in embeddings_stim.values()]
+            embed_optim = torch.optim.AdamW(
+                embed_params,
+                lr=cfg.meta.training.optim.lr,
+                weight_decay=cfg.meta.training.optim.weight_decay,
+            )
+
+        # Initialize variables for results
+        ys = None
+        yhat = None
+
+        if coadapt_embeddings:
+            print(f"  Running {epochs} joint optimization steps")
+            print(
+                f"  Using data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
+            )
+        else:
+            print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
+            print(
+                f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
+            )
 
         for outer_step in range(epochs):
-            # Inner loop: optimize embeddings on data_for_adaptation
-            embeddings_stim_adapted = meta.inner_update_stopgrad(
+            if coadapt_embeddings:
+                # Joint optimization: update both AE and embeddings together
+                for opt in ae_optims:
+                    opt.zero_grad()
+                if embed_optim:
+                    embed_optim.zero_grad()
+
+                # Forward on data_for_adaptation with current embeddings
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim,
+                )
+
+                # Normalize y values for loss computation
+                y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
+                y_normalized = model.norms(y_data)
+
+                # Compute loss on data_for_adaptation
+                loss = 0
+                for session_id in data_for_adaptation.keys():
+                    y = y_normalized[session_id]
+                    loss += nn.MSELoss()(yhat[session_id], y)
+                loss = loss / len(data_for_adaptation)
+
+                # Backward and update both AE and embeddings
+                loss.backward()
+                for opt in ae_optims:
+                    opt.step()
+                if embed_optim:
+                    embed_optim.step()
+
+                if outer_step % 1000 == 0 and not quiet:
+                    print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f}")
+
+            else:
+                # Inner loop: optimize embeddings on data_for_adaptation
+                embeddings_stim_adapted = meta.inner_update_stopgrad(
+                    model,
+                    data_for_adaptation,
+                    embeddings_rest,
+                    cfg,
+                    inner_steps=inner_steps,
+                    quiet=True,
+                )
+
+                # Outer step: update AE on data_for_adaptation using adapted embeddings
+                for opt in ae_optims:
+                    opt.zero_grad()
+
+                # Forward on data_for_adaptation with adapted embeddings
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim_adapted,
+                )
+
+                # Normalize y values for loss computation (similar to train_from_cfg line 260)
+                # Note: inner_update_stopgrad already normalizes internally, so we only normalize here
+                y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
+                y_normalized = model.norms(y_data)
+
+                # Compute loss on data_for_adaptation
+                loss = 0
+                for session_id in data_for_adaptation.keys():
+                    y = y_normalized[session_id]
+                    loss += nn.MSELoss()(yhat[session_id], y)
+                loss = loss / len(data_for_adaptation)
+
+                # Backward and update AE
+                loss.backward()
+                for opt in ae_optims:
+                    opt.step()
+
+                if outer_step % 1000 == 0 and not quiet:
+                    print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
+
+        # Store final predictions for results
+        ys = {session_id: y_normalized[session_id].detach() for session_id in data_for_adaptation.keys()}
+        # yhat is already set from the last forward pass
+
+        # After outer loop, do final inner optimization for embeddings to return (if not co-adapting)
+        if not coadapt_embeddings:
+            embeddings_stim, _ = meta.inner_update_stopgrad(
                 model,
                 data_for_adaptation,
                 embeddings_rest,
                 cfg,
                 inner_steps=inner_steps,
-                quiet=True,
+                quiet=False,
             )
 
-            # Outer step: update AE on data_for_adaptation using adapted embeddings
-            for opt in ae_optims:
-                opt.zero_grad()
-
-            # Forward on data_for_adaptation with adapted embeddings
-            yhat = model(
-                data_for_adaptation,
-                embeddings_rest=embeddings_rest,
-                embeddings_stim=embeddings_stim_adapted,
+        if coadapt_embeddings:
+            print(
+                f"TTA: Joint optimization complete. Final loss: {loss.item():.6f}"
             )
-
-            # Normalize y values for loss computation (similar to train_from_cfg line 260)
-            # Note: inner_update_stopgrad already normalizes internally, so we only normalize here
-            y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
-            y_normalized = model.norms(y_data)
-
-            # Compute loss on data_for_adaptation
-            loss = 0
-            ys = {}
-            for session_id in data_for_adaptation.keys():
-                y = y_normalized[session_id]
-                loss += nn.MSELoss()(yhat[session_id], y)
-                ys[session_id] = y.detach()
-            loss = loss / len(data_for_adaptation)
-
-            # Backward and update AE
-            loss.backward()
-            for opt in ae_optims:
-                opt.step()
-
-            if outer_step % 1000 == 0 and not quiet:
-                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
-
-        # After outer loop, do final inner optimization for embeddings to return
-        embeddings_stim, _ = meta.inner_update_stopgrad(
-            model,
-            data_for_adaptation,
-            embeddings_rest,
-            cfg,
-            inner_steps=inner_steps,
-            quiet=False,
-        )
-
-        print(
-            f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
-        )
+        else:
+            print(
+                f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
+            )
     else:
         ys = None
         yhat = None
