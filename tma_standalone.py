@@ -28,11 +28,16 @@ EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
 
-def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None):
+def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False):
 
     my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
     if basis_residual_rank_in is not None:
         my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
+
+    # Add train_size and shuffle to folder name
+    my_out_dir += f"_ts{train_size}"
+    if shuffle:
+        my_out_dir += "_shuffle"
 
     try:
         shutil.rmtree(my_out_dir)
@@ -100,7 +105,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         batch_size=batch_size,
         num_held_out_sessions=NUM_HELD_OUT_SESSIONS,
     )
-    data_train, data_test = d.train_test_split(1000, test_cut=2500)
+    data_train, data_test = d.train_test_split(train_size, test_cut=2500)
 
     held_in_session_ids = data_train.session_ids
 
@@ -197,6 +202,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         data_test=data_test,
         test_interval=1000,
         epochs=cfg.training.epochs,
+        random_sample_support=shuffle,
     )
 
     torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
@@ -269,15 +275,22 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 if __name__ == "__main__":
     import sys
 
+    # Parse command line arguments
+    # Usage: python tma_standalone.py <num_bases> <num_sessions> <gpu> [coadapt] [basis_residual_rank] [train_size] [shuffle]
+    num_bases = int(sys.argv[1])
+    num_sessions = int(sys.argv[2])
+    gpu = sys.argv[3]
+    coadapt = sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False
+    basis_residual_rank = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else None
+    train_size = int(sys.argv[6]) if len(sys.argv) > 6 else 1000
+    shuffle = sys.argv[7].lower() == 'true' if len(sys.argv) > 7 else False
 
-    basis_residual_rank = None
-    if len(sys.argv) > 4:
-        basis_residual_rank = int(sys.argv[5])
-    
     main(
-        int(sys.argv[1]),
-        int(sys.argv[2]),
-        sys.argv[3],
-        sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False,
+        num_bases,
+        num_sessions,
+        gpu,
+        coadapt=coadapt,
         basis_residual_rank_in=basis_residual_rank,
+        train_size=train_size,
+        shuffle=shuffle,
     )

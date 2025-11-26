@@ -102,6 +102,12 @@ def parse_args():
         help="Specific model names to evaluate (if not provided, uses all)"
     )
     parser.add_argument(
+        "--model-paths",
+        nargs="+",
+        type=str,
+        help="Custom model paths in format 'name:path' (e.g., '100_5_inner:test/100_5_rr16_inner_ts1000')"
+    )
+    parser.add_argument(
         "--include-vanilla-tbfm",
         action="store_true",
         help="Include vanilla TBFM baseline trained on support set for comparison"
@@ -1109,15 +1115,29 @@ def main():
     window_size = cfg.data.trial_len
 
     # Get model paths
-    all_model_paths = get_model_paths()
-    if args.models:
-        model_paths = {k: v for k, v in all_model_paths.items() if k in args.models}
-        if not model_paths:
-            print(f"Error: None of the specified models found: {args.models}")
-            print(f"Available models: {list(all_model_paths.keys())}")
-            sys.exit(1)
+    if args.model_paths:
+        # Parse custom model paths from command line
+        model_paths = {}
+        for model_spec in args.model_paths:
+            if ':' not in model_spec:
+                print(f"Error: Model path specification must be in format 'name:path', got: {model_spec}")
+                sys.exit(1)
+            name, path = model_spec.split(':', 1)
+            model_paths[name] = Path(path).resolve()
+            if not model_paths[name].exists():
+                print(f"Error: Model path does not exist: {model_paths[name]}")
+                sys.exit(1)
+        print(f"Using custom model paths: {list(model_paths.keys())}")
     else:
-        model_paths = all_model_paths
+        all_model_paths = get_model_paths()
+        if args.models:
+            model_paths = {k: v for k, v in all_model_paths.items() if k in args.models}
+            if not model_paths:
+                print(f"Error: None of the specified models found: {args.models}")
+                print(f"Available models: {list(all_model_paths.keys())}")
+                sys.exit(1)
+        else:
+            model_paths = all_model_paths
 
     print(f"Evaluating models: {list(model_paths.keys())}")
 

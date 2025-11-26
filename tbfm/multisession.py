@@ -188,12 +188,21 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
 def split_support_query_sessions(
     data_train,
     support_size: int,
+    random_sample: bool = False
 ):
     support = {}
     query = {}
     for session_id, d in data_train.items():
-        support[session_id] = tuple(dd[:support_size] for dd in d)
-        query[session_id] = tuple(dd[support_size:] for dd in d)
+        if random_sample:
+            n_samples = len(d[0])
+            indices = torch.randperm(n_samples)
+            support_indices = indices[:support_size]
+            query_indices = indices[support_size:]
+            support[session_id] = tuple(dd[support_indices] for dd in d)
+            query[session_id] = tuple(dd[query_indices] for dd in d)
+        else:
+            support[session_id] = tuple(dd[:support_size] for dd in d)
+            query[session_id] = tuple(dd[support_size:] for dd in d)
 
     return support, query
 
@@ -217,6 +226,7 @@ def train_from_cfg(
     ) = None,  # How many basis weight updates per basis update
     embed_steps_per_other_step: int = 5,  # How many other updates per embedding update
     model_save_path: str | None = None,
+    random_sample_support: bool = False,  # Randomly sample support set instead of sequential
 ):
     """
     One epoch over sessions with:
@@ -303,6 +313,7 @@ def train_from_cfg(
         support, query = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
         )
 
         with torch.no_grad():
@@ -516,6 +527,7 @@ def train_from_cfg(
         support, _ = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
         )
 
         model_optims.zero_grad(set_to_none=True)
