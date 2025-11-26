@@ -100,7 +100,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         batch_size=batch_size,
         num_held_out_sessions=NUM_HELD_OUT_SESSIONS,
     )
-    data_train, data_test = d.train_test_split(5000, test_cut=2500)
+    data_train, data_test = d.train_test_split(1000, test_cut=2500)
 
     held_in_session_ids = data_train.session_ids
 

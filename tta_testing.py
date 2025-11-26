@@ -65,7 +65,13 @@ def parse_args():
         "--tta-epochs",
         type=int,
         default=7001,
-        help="Number of epochs for TTA"
+        help="Number of epochs for TTA (outer steps)"
+    )
+    parser.add_argument(
+        "--tta-inner-steps",
+        type=int,
+        default=20,
+        help="Number of inner steps for MAML strategy"
     )
     parser.add_argument(
         "--batch-size-per-session",
@@ -141,7 +147,7 @@ def load_configuration(config_dir: Path):
     # Apply model-specific configuration overrides
     cfg.training.epochs = 12001
     cfg.latent_dim = 85
-    cfg.tbfm.module.num_bases = 50
+    cfg.tbfm.module.num_bases = 100
     cfg.ae.training.lambda_ae_recon = 0.03
     cfg.ae.use_two_stage = False
     cfg.ae.two_stage.freeze_only_shared = False
@@ -159,12 +165,12 @@ def load_configuration(config_dir: Path):
 def get_model_paths() -> Dict[str, Path]:
     """Return dictionary of available model paths."""
     return {
-        "50_5_coadapt": Path("test/50_5_coadapt").resolve(),
-        "50_5_inner": Path("test/50_5_inner").resolve(),
-        "50_25_coadapt": Path("test/50_25_coadapt").resolve(),
-        "50_25_inner": Path("test/50_25_inner").resolve(),
-        # "100_25_rr32_coadapt": Path("test/100_25_rr32_coadapt").resolve(),
-        # "100_25_rr32_inner": Path("test/100_25_rr32_inner").resolve(),
+        # "50_5_coadapt": Path("test/50_5_coadapt").resolve(),
+        # "50_5_inner": Path("test/50_5_inner").resolve(),
+        # "50_25_coadapt": Path("test/50_25_coadapt").resolve(),
+        # "50_25_inner": Path("test/50_25_inner").resolve(),
+        "100_25_rr32_coadapt": Path("test/100_25_rr32_coadapt").resolve(),
+        "100_25_rr16_inner": Path("test/100_25_rr16_inner_5k").resolve(),
     }
 
 
@@ -926,9 +932,11 @@ def run_tta_sweep(
                     f"Support={support_size:>5} | Model={model_key:<20} | R²={final_r2:.4f}"
                 )
 
-                # Release GPU memory
+                # Release GPU memory immediately after each strategy
                 del ms_eval
+                del strategy_results
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()  # Ensure GPU operations complete
 
         log_line("\n" + "=" * 80)
         log_line("TTA Sweep Complete - Summary")
@@ -1094,6 +1102,10 @@ def main():
 
     # Load configuration
     cfg = load_configuration(args.config_dir)
+    
+    # Override inner_steps from command line
+    cfg.meta.training.inner_steps = args.tta_inner_steps
+    
     window_size = cfg.data.trial_len
 
     # Get model paths
@@ -1120,31 +1132,72 @@ def main():
         args.adapt_session
     )
 
-    # Prepare data
-    data_train, data_test, embeddings_rest = prepare_data(
-        adapt_session_ids,
-        window_size,
-        args.batch_size_per_session,
-        device
-    )
+    # Process sessions in groups of 5 to manage memory
+    SESSION_GROUP_SIZE = 5
+    session_groups = [
+        adapt_session_ids[i:i + SESSION_GROUP_SIZE]
+        for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
+    ]
 
-    # Run TTA sweep
-    results = run_tta_sweep(
-        model_paths,
-        held_in_sessions_map,
-        args.support_sizes,
-        adapt_session_ids,
-        cfg,
-        data_train,
-        data_test,
-        args.tta_epochs,
-        device,
-        args.output_dir,
-        include_vanilla_tbfm=args.include_vanilla_tbfm,
-        vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
-        include_fresh_tbfm=args.include_fresh_tbfm,
-        fresh_tbfm_epochs=args.fresh_tbfm_epochs,
-    )
+    print(f"\nProcessing {len(adapt_session_ids)} sessions in {len(session_groups)} group(s) of up to {SESSION_GROUP_SIZE}")
+
+    # Run TTA for each group and aggregate results
+    all_results = []
+    for group_idx, session_group in enumerate(session_groups):
+        print(f"\n{'='*80}")
+        print(f"Processing group {group_idx + 1}/{len(session_groups)}: {len(session_group)} sessions")
+        print(f"{'='*80}\n")
+
+        # Prepare data for this group
+        data_train, data_test, embeddings_rest = prepare_data(
+            session_group,
+            window_size,
+            args.batch_size_per_session,
+            device
+        )
+
+        # Run TTA sweep for this group
+        group_results = run_tta_sweep(
+            model_paths,
+            held_in_sessions_map,
+            args.support_sizes,
+            session_group,
+            cfg,
+            data_train,
+            data_test,
+            args.tta_epochs,
+            device,
+            args.output_dir,
+            include_vanilla_tbfm=args.include_vanilla_tbfm,
+            vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
+            include_fresh_tbfm=args.include_fresh_tbfm,
+            fresh_tbfm_epochs=args.fresh_tbfm_epochs,
+        )
+
+        all_results.append(group_results)
+
+        # Clean up GPU memory between groups
+        del data_train, data_test, embeddings_rest
+        torch.cuda.empty_cache()
+
+    # Aggregate results from all groups
+    print(f"\n{'='*80}")
+    print(f"Aggregating results from {len(session_groups)} group(s)")
+    print(f"{'='*80}\n")
+
+    # Combine results (use first group's metadata and baselines, merge TTA runs)
+    results = all_results[0]
+    for group_results in all_results[1:]:
+        results["runs"].extend(group_results["runs"])
+        # Merge grid results (dict of model -> strategy -> list of (support_size, r2))
+        for model_key in group_results["grid"]:
+            for strategy_key in group_results["grid"][model_key]:
+                results["grid"][model_key][strategy_key].extend(
+                    group_results["grid"][model_key][strategy_key]
+                )
+
+    # Update metadata to reflect all sessions
+    results["metadata"]["adapt_session_ids"] = adapt_session_ids
 
     # Save and plot results
     save_results(results, args.output_dir)

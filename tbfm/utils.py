@@ -580,6 +580,7 @@ def evaluate_test_batches(
     cfg,
     device,
     track_per_session_r2=False,
+    support_contexts=None,
 ):
     """
     Evaluate model on test data with optional outlier filtering.
@@ -652,6 +653,7 @@ def evaluate_test_batches(
             batch,
             embeddings_rest=embeddings_rest,
             embeddings_stim=embeddings_stim,
+            support_contexts=support_contexts,
         )
 
         # Compute loss and R2

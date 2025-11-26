@@ -310,20 +310,37 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
+        use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+        support_contexts = None
+
         if use_meta and not coadapt_embeddings:
             model.eval()
-            embeddings_stim = meta.inner_update_stopgrad(
-                model,
-                support,
-                embeddings_rest,
-                cfg,
-            )
+            if use_hypernetwork:
+                # Hypernetwork mode: encode support set to contexts (single forward pass)
+                support_contexts = meta.hypernetwork_adapt(
+                    model,
+                    support,
+                    embeddings_rest,
+                    cfg,
+                )
+                embeddings_stim = None  # Not used in hypernetwork mode
+            else:
+                # MAML mode: optimize embeddings via gradient descent
+                embeddings_stim = meta.inner_update_stopgrad(
+                    model,
+                    support,
+                    embeddings_rest,
+                    cfg,
+                )
             model.train()
 
         model_optims.zero_grad(set_to_none=True)
 
         yhat_query = model(
-            query, embeddings_rest=embeddings_rest, embeddings_stim=embeddings_stim
+            query,
+            embeddings_rest=embeddings_rest,
+            embeddings_stim=embeddings_stim,
+            support_contexts=support_contexts,
         )
 
         losses = {}
@@ -468,6 +485,7 @@ def train_from_cfg(
                     cfg,
                     device,
                     track_per_session_r2=False,
+                    support_contexts=support_contexts,
                 )
 
                 loss = test_results["loss"]
@@ -488,6 +506,8 @@ def train_from_cfg(
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
     use_meta = cfg.tbfm.module.use_meta_learning
+    use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+
     if use_meta:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
@@ -499,13 +519,26 @@ def train_from_cfg(
         )
 
         model_optims.zero_grad(set_to_none=True)
-        embeddings_stim = meta.inner_update_stopgrad(
-            model,
-            support,
-            embeddings_rest,
-            cfg,
-            inner_steps=(3 * cfg.meta.training.inner_steps),
-        )
+
+        if use_hypernetwork:
+            # Final hypernetwork encoding
+            support_contexts = meta.hypernetwork_adapt(
+                model,
+                support,
+                embeddings_rest,
+                cfg,
+            )
+            embeddings_stim = None
+        else:
+            # Final MAML adaptation
+            embeddings_stim = meta.inner_update_stopgrad(
+                model,
+                support,
+                embeddings_rest,
+                cfg,
+                inner_steps=(3 * cfg.meta.training.inner_steps),
+            )
+            support_contexts = None
 
     # Final test evaluation
     model_optims.zero_grad(set_to_none=True)
@@ -520,6 +553,7 @@ def train_from_cfg(
             cfg,
             device,
             track_per_session_r2=True,
+            support_contexts=support_contexts,
         )
 
         loss = final_test_results["loss"]
@@ -645,11 +679,13 @@ def test_time_adaptation(
                     )
                     print(f"  Warm started AE for {session_id}")
 
-    # Determine if we need to optimize embeddings
+    # Determine if we need to optimize embeddings or use hypernetwork
     optimize_embeddings = embeddings_stim is None
+    use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+    support_contexts = None
 
-    # Initialize embeddings as trainable parameters if co-adapting
-    if optimize_embeddings and coadapt_embeddings:
+    # Initialize embeddings as trainable parameters if co-adapting (MAML mode only)
+    if optimize_embeddings and coadapt_embeddings and not use_hypernetwork:
         embed_dim_stim = model.model.bases.embed_dim_stim
         embeddings_stim = {}
         for session_id in embeddings_rest.keys():
@@ -658,11 +694,23 @@ def test_time_adaptation(
             embeddings_stim[session_id] = emb
 
     if optimize_embeddings and not adapt_ae and not coadapt_embeddings:
-        # Only optimizing embeddings (not AE)
-        print("TTA: Optimizing embeddings...")
-        embeddings_stim, _ = meta.inner_update_stopgrad(
-            model,
-            data_for_adaptation,
+        # Only adapting meta-learning component (not AE)
+        if use_hypernetwork:
+            # Hypernetwork mode: encode support set to contexts
+            print("TTA: Encoding support set with hypernetwork...")
+            support_contexts = meta.hypernetwork_adapt(
+                model,
+                data_for_adaptation,
+                embeddings_rest,
+                cfg,
+            )
+            embeddings_stim = None  # Not used in hypernetwork mode
+        else:
+            # MAML mode: optimize embeddings via gradient descent
+            print("TTA: Optimizing embeddings...")
+            embeddings_stim, _ = meta.inner_update_stopgrad(
+                model,
+                data_for_adaptation,
             embeddings_rest,
             cfg,
             inner_steps=epochs,
@@ -720,12 +768,13 @@ def test_time_adaptation(
         for outer_step in range(epochs):
             if coadapt_embeddings:
                 # Joint optimization: update both AE and embeddings together
+                # Process all sessions in one batched forward pass (like training)
                 for opt in ae_optims:
                     opt.zero_grad()
                 if embed_optim:
                     embed_optim.zero_grad()
 
-                # Forward on data_for_adaptation with current embeddings
+                # Forward pass with all sessions at once
                 yhat = model(
                     data_for_adaptation,
                     embeddings_rest=embeddings_rest,
@@ -733,24 +782,26 @@ def test_time_adaptation(
                 )
 
                 # Normalize y values for loss computation
-                y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
                 y_normalized = model.norms(y_data)
 
-                # Compute loss on data_for_adaptation
-                loss = 0
-                for session_id in data_for_adaptation.keys():
-                    y = y_normalized[session_id]
-                    loss += nn.MSELoss()(yhat[session_id], y)
-                loss = loss / len(data_for_adaptation)
+                # Compute combined loss across all sessions
+                losses = {}
+                for sid, y in y_normalized.items():
+                    losses[sid] = nn.MSELoss()(yhat[sid], y)
 
-                # Backward and update both AE and embeddings
+                loss = sum(losses.values()) / len(data_for_adaptation)
+
+                # Single backward pass
                 loss.backward()
+
+                # Update parameters
                 for opt in ae_optims:
                     opt.step()
                 if embed_optim:
                     embed_optim.step()
 
-                if outer_step % 1000 == 0 and not quiet:
+                if outer_step % 100 == 0 and not quiet:
                     print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f}")
 
             else:
@@ -765,39 +816,49 @@ def test_time_adaptation(
                 )
 
                 # Outer step: update AE on data_for_adaptation using adapted embeddings
+                # Process all sessions in one batched forward pass (like training)
                 for opt in ae_optims:
                     opt.zero_grad()
 
-                # Forward on data_for_adaptation with adapted embeddings
+                # Forward pass with all sessions at once
                 yhat = model(
                     data_for_adaptation,
                     embeddings_rest=embeddings_rest,
                     embeddings_stim=embeddings_stim_adapted,
                 )
 
-                # Normalize y values for loss computation (similar to train_from_cfg line 260)
-                # Note: inner_update_stopgrad already normalizes internally, so we only normalize here
-                y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
+                # Normalize y values for loss computation
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
                 y_normalized = model.norms(y_data)
 
-                # Compute loss on data_for_adaptation
-                loss = 0
-                for session_id in data_for_adaptation.keys():
-                    y = y_normalized[session_id]
-                    loss += nn.MSELoss()(yhat[session_id], y)
-                loss = loss / len(data_for_adaptation)
+                # Compute combined loss across all sessions
+                losses = {}
+                for sid, y in y_normalized.items():
+                    losses[sid] = nn.MSELoss()(yhat[sid], y)
 
-                # Backward and update AE
+                loss = sum(losses.values()) / len(data_for_adaptation)
+
+                # Single backward pass
                 loss.backward()
+
+                # Update AE parameters
                 for opt in ae_optims:
                     opt.step()
 
-                if outer_step % 1000 == 0 and not quiet:
+                if outer_step % 100 == 0 and not quiet:
                     print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
 
-        # Store final predictions for results
-        ys = {session_id: y_normalized[session_id].detach() for session_id in data_for_adaptation.keys()}
-        # yhat is already set from the last forward pass
+        # Store final predictions for results (recompute with all sessions at once)
+        if coadapt_embeddings or not optimize_embeddings:
+            with torch.no_grad():
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim,
+                )
+
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
+                ys = model.norms(y_data)
 
         # After outer loop, do final inner optimization for embeddings to return (if not co-adapting)
         if not coadapt_embeddings:
@@ -816,7 +877,7 @@ def test_time_adaptation(
             )
         else:
             print(
-                f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
+                f"TTA: Meta-learning optimization complete."
             )
     else:
         ys = None
@@ -833,6 +894,7 @@ def test_time_adaptation(
                 cfg,
                 device,
                 track_per_session_r2=True,
+                support_contexts=support_contexts,
             )
 
             r2_test = test_results["r2"]
