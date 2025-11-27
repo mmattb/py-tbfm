@@ -28,16 +28,28 @@ EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
 
-def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False):
+def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
+         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None):
 
-    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
-    if basis_residual_rank_in is not None:
-        my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
+    if out_dir is None:
+        my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
+        if basis_residual_rank_in is not None:
+            my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
 
-    # Add train_size and shuffle to folder name
-    my_out_dir += f"_ts{train_size}"
-    if shuffle:
-        my_out_dir += "_shuffle"
+        # Add train_size and shuffle to folder name
+        my_out_dir += f"_ts{train_size}"
+        if shuffle:
+            my_out_dir += "_shuffle"
+        
+        # Add hyperparameter info to folder name
+        if latent_dim is not None:
+            my_out_dir += f"_ld{latent_dim}"
+        if batch_size_per_session is not None:
+            my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
+        if residual_mlp_hidden is not None:
+            my_out_dir += f"_mlp{residual_mlp_hidden}"
+    else:
+        my_out_dir = out_dir
 
     try:
         shutil.rmtree(my_out_dir)
@@ -91,8 +103,11 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
             "MonkeyJ_20160702_Session2_S1",
         ][:num_sessions]
 
-        MAX_BATCH_SIZE = 62500 // 8
-        batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        if batch_size_per_session is None:
+            MAX_BATCH_SIZE = 62500 // 8
+            batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        else:
+            batch_size = batch_size_per_session * num_sessions
     else:
         raise ValueError("blah")
 
@@ -160,7 +175,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         cfg.tbfm.training.lambda_fro = 60.0
 
     cfg.training.epochs = 12001
-    cfg.latent_dim = 85
+    cfg.latent_dim = latent_dim if latent_dim is not None else 85
     cfg.tbfm.module.num_bases = num_bases
     cfg.ae.training.lambda_ae_recon = 0.03
     cfg.ae.use_two_stage = False
@@ -175,6 +190,8 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         cfg.meta.is_basis_residual = True
         cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
         cfg.meta.training.lambda_l2 = 1e-2
+        if residual_mlp_hidden is not None:
+            cfg.meta.residual_mlp_hidden = residual_mlp_hidden
     cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
@@ -274,23 +291,41 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
-    # Parse command line arguments
-    # Usage: python tma_standalone.py <num_bases> <num_sessions> <gpu> [coadapt] [basis_residual_rank] [train_size] [shuffle]
-    num_bases = int(sys.argv[1])
-    num_sessions = int(sys.argv[2])
-    gpu = sys.argv[3]
-    coadapt = sys.argv[4].lower() == 'true' if len(sys.argv) > 4 else False
-    basis_residual_rank = int(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5].isdigit() else None
-    train_size = int(sys.argv[6]) if len(sys.argv) > 6 else 1000
-    shuffle = sys.argv[7].lower() == 'true' if len(sys.argv) > 7 else False
+    # Parse command line arguments with support for both positional and named arguments
+    parser = argparse.ArgumentParser(description='Train multisession TBFM model')
+    parser.add_argument('num_bases', type=int, help='Number of bases')
+    parser.add_argument('num_sessions', type=int, help='Number of training sessions')
+    parser.add_argument('gpu', type=str, help='GPU ID to use')
+    parser.add_argument('coadapt', type=str, nargs='?', default='false', help='Use co-adaptation (true/false)')
+    parser.add_argument('basis_residual_rank', type=str, nargs='?', default=None, help='Basis residual rank')
+    parser.add_argument('train_size', type=int, nargs='?', default=1000, help='Training set size')
+    parser.add_argument('shuffle', type=str, nargs='?', default='false', help='Shuffle support set (true/false)')
+    
+    # New hyperparameter arguments
+    parser.add_argument('--latent-dim', type=int, default=None, help='Latent dimension for autoencoder')
+    parser.add_argument('--batch-size-per-session', type=int, default=None, help='Batch size per session')
+    parser.add_argument('--residual-mlp-hidden', type=int, default=None, help='Hidden dimension for residual MLP')
+    parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
+    
+    args = parser.parse_args()
+    
+    # Parse boolean arguments
+    coadapt = args.coadapt.lower() == 'true'
+    shuffle = args.shuffle.lower() == 'true'
+    basis_residual_rank = int(args.basis_residual_rank) if args.basis_residual_rank and args.basis_residual_rank.isdigit() else None
 
     main(
-        num_bases,
-        num_sessions,
-        gpu,
+        args.num_bases,
+        args.num_sessions,
+        args.gpu,
         coadapt=coadapt,
         basis_residual_rank_in=basis_residual_rank,
-        train_size=train_size,
+        train_size=args.train_size,
         shuffle=shuffle,
+        latent_dim=args.latent_dim,
+        batch_size_per_session=args.batch_size_per_session,
+        residual_mlp_hidden=args.residual_mlp_hidden,
+        out_dir=args.out_dir,
     )
