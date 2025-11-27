@@ -7,11 +7,15 @@ Evaluates TTA performance across multiple models, support sizes, and adaptation 
 
 import argparse
 import json
+import math
+import multiprocessing as mp
 import os
 import sys
+import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from queue import Empty
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
@@ -40,7 +44,19 @@ def parse_args():
         "--cuda-device",
         type=str,
         default="1",
-        help="CUDA device ID to use"
+        help="CUDA device ID to use (ignored if --use-multi-gpu is set)"
+    )
+    parser.add_argument(
+        "--use-multi-gpu",
+        action="store_true",
+        help="Use all available GPUs for parallel processing"
+    )
+    parser.add_argument(
+        "--gpu-ids",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Specific GPU IDs to use (e.g., --gpu-ids 0 1 2 3). If not specified, uses all available GPUs."
     )
     parser.add_argument(
         "--support-sizes",
@@ -129,6 +145,34 @@ def parse_args():
         default=7001,
         help="Number of epochs for fresh TBFM training"
     )
+    parser.add_argument(
+        "--progressive-unfreezing-threshold",
+        type=int,
+        default=2000,
+        help="Support size threshold for enabling progressive unfreezing"
+    )
+    parser.add_argument(
+        "--unfreeze-basis-weights",
+        action="store_true",
+        help="Enable supervised fine-tuning of basis weights at high support sizes"
+    )
+    parser.add_argument(
+        "--unfreeze-bases",
+        action="store_true",
+        help="Enable supervised fine-tuning of basis generator at high support sizes"
+    )
+    parser.add_argument(
+        "--basis-weight-lr",
+        type=float,
+        default=1e-5,
+        help="Learning rate for basis weights when unfrozen"
+    )
+    parser.add_argument(
+        "--bases-lr",
+        type=float,
+        default=1e-6,
+        help="Learning rate for basis generator when unfrozen"
+    )
 
     return parser.parse_args()
 
@@ -138,6 +182,145 @@ def setup_environment(cuda_device: str):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device
     print(f"Using CUDA device: {cuda_device}")
+
+
+def gpu_worker(
+    gpu_id: int,
+    job_queue: mp.Queue,
+    result_queue: mp.Queue,
+    cfg_dict: dict,
+    model_paths_dict: dict,
+    embeddings_cache_dict: dict,
+    data_train_dict: dict,
+    data_test_dict: dict,
+    tta_epochs: int,
+    tta_strategies: dict,
+):
+    """
+    Worker process for processing TTA jobs on a specific GPU.
+    
+    Args:
+        gpu_id: GPU device ID to use
+        job_queue: Queue of jobs to process (model_key, support_size, strategy_key)
+        result_queue: Queue to put results
+        cfg_dict: Configuration dictionary
+        model_paths_dict: Model paths dictionary
+        embeddings_cache_dict: Pre-loaded embeddings for each model
+        data_train_dict: Training data (serialized)
+        data_test_dict: Test data (serialized)
+        tta_epochs: Number of TTA epochs
+        tta_strategies: TTA strategy configurations
+    """
+    # Set up this process's GPU
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = "cuda:0"  # After setting CUDA_VISIBLE_DEVICES, use device 0
+    
+    # Reconstruct config from dict
+    cfg = OmegaConf.create(cfg_dict)
+    
+    print(f"[GPU {gpu_id}] Worker started")
+    
+    while True:
+        try:
+            # Get job from queue (timeout to check if we should exit)
+            job = job_queue.get(timeout=1)
+            
+            if job is None:  # Poison pill to signal worker to exit
+                print(f"[GPU {gpu_id}] Worker received exit signal")
+                break
+            
+            model_key, support_size, strategy_key = job
+            strategy_cfg = tta_strategies[strategy_key]
+            
+            print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}")
+            
+            try:
+                # Clone config for this evaluation
+                cfg_eval = clone_cfg_for_eval(cfg)
+                
+                # Reconstruct model path
+                model_path = Path(model_paths_dict[model_key])
+                model_file = model_path / "model_nf_1.torch"
+                if not model_file.exists():
+                    model_file = model_path / "model.torch"
+                
+                if not model_file.exists():
+                    raise FileNotFoundError(f"Model file not found for {model_key}")
+                
+                # Deserialize data (convert back from CPU tensors)
+                data_train = {}
+                for sid, tensors in data_train_dict.items():
+                    data_train[sid] = tuple(t.to(device) for t in tensors)
+                
+                data_test = []
+                for batch_dict in data_test_dict:
+                    data_test.append({sid: tuple(t.to(device) for t in tensors) for sid, tensors in batch_dict.items()})
+                
+                # Deserialize embeddings
+                embeddings = {sid: emb.to(device) for sid, emb in embeddings_cache_dict[model_key].items()}
+                
+                # Build model
+                ms_eval = multisession.build_from_cfg(
+                    cfg_eval,
+                    data_train,
+                    base_model_path=str(model_file),
+                    device=device,
+                    quiet=True,
+                )
+                
+                # Run TTA
+                _, strategy_results = multisession.test_time_adaptation(
+                    cfg_eval,
+                    ms_eval,
+                    embeddings,
+                    data_train,
+                    epochs=tta_epochs,
+                    data_test=data_test,
+                    ae_warm_start=True,
+                    adapt_ae=True,
+                    support_size=support_size,
+                    coadapt_embeddings=strategy_cfg["coadapt_embeddings"],
+                    quiet=True,
+                )
+                
+                final_r2 = strategy_results["final_test_r2"]
+                
+                # Clean up
+                del ms_eval
+                del strategy_results
+                torch.cuda.empty_cache()
+                
+                # Put result in queue
+                result_queue.put({
+                    "success": True,
+                    "model": model_key,
+                    "support_size": support_size,
+                    "strategy": strategy_key,
+                    "r2": final_r2,
+                    "gpu_id": gpu_id,
+                })
+                
+                print(f"[GPU {gpu_id}] Completed: Model={model_key}, Support={support_size}, Strategy={strategy_key}, R²={final_r2:.4f}")
+                
+            except Exception as e:
+                print(f"[GPU {gpu_id}] Error processing job: {e}")
+                result_queue.put({
+                    "success": False,
+                    "model": model_key,
+                    "support_size": support_size,
+                    "strategy": strategy_key,
+                    "error": str(e),
+                    "gpu_id": gpu_id,
+                })
+        
+        except Empty:
+            continue
+        except Exception as e:
+            print(f"[GPU {gpu_id}] Worker error: {e}")
+            break
+    
+    print(f"[GPU {gpu_id}] Worker finished")
 
 
 def load_configuration(config_dir: Path):
@@ -678,6 +861,241 @@ def train_fresh_tbfm_no_multisession(
     return final_test_r2
 
 
+def run_tta_sweep_multi_gpu(
+    model_paths: Dict[str, Path],
+    held_in_sessions_map: Dict,
+    support_sizes: List[int],
+    adapt_session_ids: List[str],
+    cfg,
+    data_train,
+    data_test,
+    tta_epochs: int,
+    gpu_ids: List[int],
+    output_dir: Path,
+    include_vanilla_tbfm: bool,
+    vanilla_tbfm_epochs: int,
+    include_fresh_tbfm: bool,
+    fresh_tbfm_epochs: int,
+    jobs: List,
+    tta_strategies: Dict,
+    embeddings_cache: Dict,
+    timestamp: str,
+    log_path: Path,
+) -> Dict:
+    """
+    Multi-GPU version of run_tta_sweep using multiprocessing.
+    
+    Distributes TTA jobs across multiple GPUs in parallel.
+    """
+    model_names = list(model_paths.keys())
+    
+    # Storage for results
+    tta_comparison = {
+        model_key: {strategy_key: [] for strategy_key in tta_strategies}
+        for model_key in model_names
+    }
+    vanilla_tbfm_results = {}
+    fresh_tbfm_results = {}
+    tta_runs = []
+    
+    # Separate TTA jobs from baseline jobs
+    tta_jobs = [j for j in jobs if len(j) == 3]
+    baseline_jobs = [j for j in jobs if len(j) == 2]
+    
+    # Process baselines on single GPU (typically fast and not worth parallelizing)
+    if baseline_jobs:
+        print(f"\\nProcessing {len(baseline_jobs)} baseline jobs on single GPU...")
+        device = f"cuda:{gpu_ids[0]}"
+        
+        for job in tqdm.tqdm(baseline_jobs, desc="Baseline jobs"):
+            model_key, support_size = job
+            
+            if model_key == "vanilla_tbfm":
+                final_r2 = train_vanilla_tbfm(
+                    cfg,
+                    data_train,
+                    data_test,
+                    support_size,
+                    vanilla_tbfm_epochs,
+                    device,
+                    quiet=True,
+                )
+                vanilla_tbfm_results[support_size] = final_r2
+                tta_runs.append({
+                    "model": "vanilla_tbfm",
+                    "support_size": support_size,
+                    "strategy": "vanilla_tbfm",
+                    "r2": final_r2,
+                })
+            elif model_key == "fresh_tbfm":
+                final_r2 = train_fresh_tbfm_no_multisession(
+                    cfg,
+                    data_train,
+                    data_test,
+                    support_size,
+                    fresh_tbfm_epochs,
+                    device,
+                    quiet=True,
+                )
+                fresh_tbfm_results[support_size] = final_r2
+                tta_runs.append({
+                    "model": "fresh_tbfm",
+                    "support_size": support_size,
+                    "strategy": "fresh_tbfm",
+                    "r2": final_r2,
+                })
+    
+    # Multi-GPU processing for TTA jobs
+    if tta_jobs:
+        print(f"\\nProcessing {len(tta_jobs)} TTA jobs across {len(gpu_ids)} GPUs...")
+        
+        # Prepare data for multiprocessing (move to CPU for serialization)
+        data_train_cpu = {sid: tuple(t.cpu() for t in tensors) for sid, tensors in data_train.items()}
+        data_test_cpu = [{sid: tuple(t.cpu() for t in tensors) for sid, tensors in batch.items()} for batch in data_test]
+        embeddings_cache_cpu = {
+            model_key: {sid: emb.cpu() for sid, emb in embeds.items()}
+            for model_key, embeds in embeddings_cache.items()
+        }
+        
+        # Convert config to dict for serialization
+        cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+        
+        # Convert model paths to strings
+        model_paths_dict = {k: str(v) for k, v in model_paths.items()}
+        
+        # Create job and result queues
+        job_queue = mp.Queue()
+        result_queue = mp.Queue()
+        
+        # Populate job queue
+        for job in tta_jobs:
+            job_queue.put(job)
+        
+        # Add poison pills (one per worker)
+        for _ in gpu_ids:
+            job_queue.put(None)
+        
+        # Start worker processes
+        workers = []
+        for gpu_id in gpu_ids:
+            p = mp.Process(
+                target=gpu_worker,
+                args=(
+                    gpu_id,
+                    job_queue,
+                    result_queue,
+                    cfg_dict,
+                    model_paths_dict,
+                    embeddings_cache_cpu,
+                    data_train_cpu,
+                    data_test_cpu,
+                    tta_epochs,
+                    tta_strategies,
+                ),
+            )
+            p.start()
+            workers.append(p)
+        
+        # Collect results with progress bar
+        completed = 0
+        progress = tqdm.tqdm(total=len(tta_jobs), desc="TTA jobs")
+        
+        with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
+            def log_line(message=""):
+                print(message, flush=True)
+                log_stream.write(message + "\\n")
+                log_stream.flush()
+            
+            log_line(f"TTA sweep started at {timestamp}")
+            log_line(f"Multi-GPU mode: Using GPUs {gpu_ids}")
+            log_line(f"Adapt session(s): {adapt_session_ids}")
+            log_line(f"Support sizes: {support_sizes}")
+            log_line(f"TTA epochs: {tta_epochs}")
+            log_line(f"Total TTA jobs: {len(tta_jobs)}")
+            log_line("")
+            
+            while completed < len(tta_jobs):
+                try:
+                    result = result_queue.get(timeout=1)
+                    
+                    if result["success"]:
+                        model_key = result["model"]
+                        support_size = result["support_size"]
+                        strategy_key = result["strategy"]
+                        final_r2 = result["r2"]
+                        gpu_id = result["gpu_id"]
+                        
+                        tta_comparison[model_key][strategy_key].append((support_size, final_r2))
+                        tta_runs.append({
+                            "model": model_key,
+                            "support_size": support_size,
+                            "strategy": strategy_key,
+                            "r2": final_r2,
+                        })
+                        
+                        strategy_label = tta_strategies[strategy_key]["label"]
+                        log_line(
+                            f"[GPU {gpu_id}] Complete | Strategy={strategy_label:<24} | "
+                            f"Support={support_size:>5} | Model={model_key:<20} | R²={final_r2:.4f}"
+                        )
+                    else:
+                        log_line(f"[GPU {result['gpu_id']}] FAILED: {result['model']}, {result['support_size']}, {result['strategy']}: {result['error']}")
+                    
+                    completed += 1
+                    progress.update(1)
+                    
+                except Empty:
+                    continue
+            
+            progress.close()
+            
+            # Wait for all workers to finish
+            for p in workers:
+                p.join()
+            
+            log_line("\\n" + "=" * 80)
+            log_line("TTA Sweep Complete - Summary")
+            log_line("=" * 80)
+            
+            # Print results
+            for entry in sorted(tta_runs, key=lambda x: (x.get("strategy", ""), x["support_size"], x["model"])):
+                if entry["strategy"] not in ["vanilla_tbfm", "fresh_tbfm"]:
+                    strategy_label = tta_strategies[entry["strategy"]]["label"]
+                    log_line(
+                        f"Strategy={strategy_label:<24} | Support={entry['support_size']:>5} | "
+                        f"Model={entry['model']:<20} | R²={entry['r2']:.4f}"
+                    )
+            
+            if vanilla_tbfm_results:
+                log_line("\\nVanilla TBFM Baseline:")
+                for entry in sorted([e for e in tta_runs if e.get("strategy") == "vanilla_tbfm"], key=lambda x: x["support_size"]):
+                    log_line(f"  Support={entry['support_size']:>5} | R²={entry['r2']:.4f}")
+            
+            if fresh_tbfm_results:
+                log_line("\\nFresh TBFM (no multisession) Baseline:")
+                for entry in sorted([e for e in tta_runs if e.get("strategy") == "fresh_tbfm"], key=lambda x: x["support_size"]):
+                    log_line(f"  Support={entry['support_size']:>5} | R²={entry['r2']:.4f}")
+    
+    return {
+        "metadata": {
+            "timestamp": timestamp,
+            "adapt_session_ids": adapt_session_ids,
+            "support_sizes": support_sizes,
+            "models": model_names,
+            "tta_epochs": tta_epochs,
+            "include_vanilla_tbfm": include_vanilla_tbfm,
+            "include_fresh_tbfm": include_fresh_tbfm,
+            "multi_gpu": True,
+            "gpu_ids": gpu_ids,
+        },
+        "strategies": tta_strategies,
+        "grid": tta_comparison,
+        "vanilla_tbfm_results": vanilla_tbfm_results,
+        "fresh_tbfm_results": fresh_tbfm_results,
+        "runs": tta_runs,
+    }
+
+
 def run_tta_sweep(
     model_paths: Dict[str, Path],
     held_in_sessions_map: Dict,
@@ -693,6 +1111,8 @@ def run_tta_sweep(
     vanilla_tbfm_epochs: int = 7001,
     include_fresh_tbfm: bool = False,
     fresh_tbfm_epochs: int = 7001,
+    use_multi_gpu: bool = False,
+    gpu_ids: List[int] = None,
 ) -> Dict:
     """
     Run comprehensive TTA sweep across models, support sizes, and strategies.
@@ -706,12 +1126,14 @@ def run_tta_sweep(
         data_train: Training data
         data_test: Test data
         tta_epochs: Number of epochs for TTA
-        device: CUDA device to use
+        device: CUDA device to use (ignored if use_multi_gpu is True)
         output_dir: Output directory for results
         include_vanilla_tbfm: If True, include vanilla TBFM baseline
         vanilla_tbfm_epochs: Number of epochs for vanilla TBFM training
         include_fresh_tbfm: If True, include fresh TBFM (no multisession) baseline
         fresh_tbfm_epochs: Number of epochs for fresh TBFM training
+        use_multi_gpu: If True, distribute jobs across multiple GPUs
+        gpu_ids: List of GPU IDs to use (if None, uses all available)
 
     Returns:
         Dictionary containing all results and metadata
@@ -773,8 +1195,40 @@ def run_tta_sweep(
     if baselines:
         print(f"Baselines: {', '.join(baselines)}")
     print(f"Total jobs: {len(jobs)}")
+    
+    if use_multi_gpu:
+        if gpu_ids is None:
+            gpu_ids = list(range(torch.cuda.device_count()))
+        print(f"Multi-GPU mode: Using GPUs {gpu_ids}")
+    else:
+        print(f"Single-GPU mode: Using device {device}")
+    
     print(f"Logging to: {log_path}")
     print(f"{'=' * 80}\n")
+    
+    # Multi-GPU execution path
+    if use_multi_gpu:
+        return run_tta_sweep_multi_gpu(
+            model_paths,
+            held_in_sessions_map,
+            support_sizes,
+            adapt_session_ids,
+            cfg,
+            data_train,
+            data_test,
+            tta_epochs,
+            gpu_ids,
+            output_dir,
+            include_vanilla_tbfm,
+            vanilla_tbfm_epochs,
+            include_fresh_tbfm,
+            fresh_tbfm_epochs,
+            jobs,
+            tta_strategies,
+            embeddings_cache,
+            timestamp,
+            log_path,
+        )
 
     with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
         def log_line(message=""):
@@ -1100,7 +1554,8 @@ def main():
     args = parse_args()
 
     # Setup
-    setup_environment(args.cuda_device)
+    if not args.use_multi_gpu:
+        setup_environment(args.cuda_device)
     device = "cuda"
 
     # Create output directory
@@ -1111,6 +1566,13 @@ def main():
     
     # Override inner_steps from command line
     cfg.meta.training.inner_steps = args.tta_inner_steps
+    
+    # Configure progressive unfreezing parameters
+    cfg.meta.training.progressive_unfreezing_threshold = args.progressive_unfreezing_threshold
+    cfg.meta.training.unfreeze_basis_weights = args.unfreeze_basis_weights
+    cfg.meta.training.unfreeze_bases = args.unfreeze_bases
+    cfg.meta.training.basis_weight_lr = args.basis_weight_lr
+    cfg.meta.training.bases_lr = args.bases_lr
     
     window_size = cfg.data.trial_len
 
@@ -1153,7 +1615,7 @@ def main():
     )
 
     # Process sessions in groups of 5 to manage memory
-    SESSION_GROUP_SIZE = 5
+    SESSION_GROUP_SIZE = 15
     session_groups = [
         adapt_session_ids[i:i + SESSION_GROUP_SIZE]
         for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
@@ -1192,6 +1654,8 @@ def main():
             vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
             include_fresh_tbfm=args.include_fresh_tbfm,
             fresh_tbfm_epochs=args.fresh_tbfm_epochs,
+            use_multi_gpu=args.use_multi_gpu,
+            gpu_ids=args.gpu_ids,
         )
 
         all_results.append(group_results)

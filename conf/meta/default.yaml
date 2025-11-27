@@ -46,6 +46,14 @@ meta:
     inner_steps: 20  # Number of inner loop steps for MAML
     support_size: 300
     lambda_l2: 1e-3
+    
+    # Progressive unfreezing for high support sizes (supervised fine-tuning)
+    progressive_unfreezing_threshold: 2000  # Support size threshold for enabling supervised fine-tuning
+    unfreeze_basis_weights: false  # Enable fine-tuning of basis weights at high support sizes
+    unfreeze_bases: false          # Enable fine-tuning of basis generator at high support sizes
+    basis_weight_lr: 1e-5          # Learning rate for basis weights when unfrozen
+    bases_lr: 1e-6                 # Learning rate for basis generator when unfrozen
+    
     optim:
       lr: 1e-2
       weight_decay: 1e-4

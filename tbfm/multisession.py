@@ -762,6 +762,49 @@ def test_time_adaptation(
                 weight_decay=cfg.meta.training.optim.weight_decay,
             )
 
+        # Progressive unfreezing: add TBFM optimizers at high support sizes
+        tbfm_optims = {}
+        progressive_unfreezing_threshold = cfg.meta.training.get('progressive_unfreezing_threshold', 2000)
+        unfreeze_basis_weights = cfg.meta.training.get('unfreeze_basis_weights', False)
+        unfreeze_bases = cfg.meta.training.get('unfreeze_bases', False)
+        basis_weight_lr = cfg.meta.training.get('basis_weight_lr', 1e-5)
+        bases_lr = cfg.meta.training.get('bases_lr', 1e-6)
+        
+        enable_progressive_unfreezing = support_size >= progressive_unfreezing_threshold
+        
+        if enable_progressive_unfreezing and (unfreeze_basis_weights or unfreeze_bases):
+            print(f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})")
+            
+            for session_id in data_for_adaptation.keys():
+                tbfm_instance = model.model.instances.get(session_id)
+                if tbfm_instance is not None:
+                    params_to_optimize = []
+                    
+                    if unfreeze_basis_weights:
+                        # Add basis weighting parameters (fast adaptation)
+                        params_to_optimize.append({
+                            'params': tbfm_instance.bases.weighting.parameters(),
+                            'lr': basis_weight_lr,
+                            'name': 'basis_weights'
+                        })
+                        print(f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})")
+                    
+                    if unfreeze_bases:
+                        # Add basis generator parameters (slow adaptation)
+                        params_to_optimize.append({
+                            'params': tbfm_instance.bases.parameters(),
+                            'lr': bases_lr,
+                            'name': 'bases'
+                        })
+                        print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
+                    
+                    if params_to_optimize:
+                        tbfm_optim = torch.optim.AdamW(
+                            params_to_optimize,
+                            weight_decay=cfg.tbfm.training.optim.weight_decay,
+                        )
+                        tbfm_optims[session_id] = tbfm_optim
+
         # Initialize variables for results
         ys = None
         yhat = None
@@ -785,6 +828,8 @@ def test_time_adaptation(
                     opt.zero_grad()
                 if embed_optim:
                     embed_optim.zero_grad()
+                for opt in tbfm_optims.values():
+                    opt.zero_grad()
 
                 # Forward pass with all sessions at once
                 yhat = model(
@@ -803,6 +848,20 @@ def test_time_adaptation(
                     losses[sid] = nn.MSELoss()(yhat[sid], y)
 
                 loss = sum(losses.values()) / len(data_for_adaptation)
+                
+                # Add TBFM regularization if progressive unfreezing is enabled
+                if tbfm_optims:
+                    for sid in data_for_adaptation.keys():
+                        tbfm_instance = model.model.instances.get(sid)
+                        if tbfm_instance is not None:
+                            # Add Frobenius norm regularization for basis weights
+                            if unfreeze_basis_weights:
+                                weighting_reg = tbfm_instance.get_weighting_reg()
+                                loss += cfg.tbfm.training.lambda_fro * weighting_reg
+                            # Add orthogonality regularization for bases
+                            if unfreeze_bases:
+                                basis_reg = tbfm_instance.get_basis_rms_reg()
+                                loss += cfg.tbfm.training.lambda_ortho * basis_reg
 
                 # Single backward pass
                 loss.backward()
@@ -812,9 +871,18 @@ def test_time_adaptation(
                     opt.step()
                 if embed_optim:
                     embed_optim.step()
+                for opt in tbfm_optims.values():
+                    opt.step()
 
                 if outer_step % 100 == 0 and not quiet:
-                    print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f}")
+                    active_components = ['AE', 'embeddings'] if embed_optim else ['AE']
+                    if tbfm_optims:
+                        if unfreeze_basis_weights:
+                            active_components.append('basis_weights')
+                        if unfreeze_bases:
+                            active_components.append('bases')
+                    components_str = '+'.join(active_components)
+                    print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
 
             else:
                 # Inner loop: optimize embeddings on data_for_adaptation
@@ -827,9 +895,11 @@ def test_time_adaptation(
                     quiet=True,
                 )
 
-                # Outer step: update AE on data_for_adaptation using adapted embeddings
+                # Outer step: update AE (and TBFM if unfrozen) on data_for_adaptation using adapted embeddings
                 # Process all sessions in one batched forward pass (like training)
                 for opt in ae_optims:
+                    opt.zero_grad()
+                for opt in tbfm_optims.values():
                     opt.zero_grad()
 
                 # Forward pass with all sessions at once
@@ -849,6 +919,20 @@ def test_time_adaptation(
                     losses[sid] = nn.MSELoss()(yhat[sid], y)
 
                 loss = sum(losses.values()) / len(data_for_adaptation)
+                
+                # Add TBFM regularization if progressive unfreezing is enabled
+                if tbfm_optims:
+                    for sid in data_for_adaptation.keys():
+                        tbfm_instance = model.model.instances.get(sid)
+                        if tbfm_instance is not None:
+                            # Add Frobenius norm regularization for basis weights
+                            if unfreeze_basis_weights:
+                                weighting_reg = tbfm_instance.get_weighting_reg()
+                                loss += cfg.tbfm.training.lambda_fro * weighting_reg
+                            # Add orthogonality regularization for bases
+                            if unfreeze_bases:
+                                basis_reg = tbfm_instance.get_basis_rms_reg()
+                                loss += cfg.tbfm.training.lambda_ortho * basis_reg
 
                 # Single backward pass
                 loss.backward()
@@ -856,9 +940,18 @@ def test_time_adaptation(
                 # Update AE parameters
                 for opt in ae_optims:
                     opt.step()
+                for opt in tbfm_optims.values():
+                    opt.step()
 
                 if outer_step % 100 == 0 and not quiet:
-                    print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
+                    active_components = ['AE']
+                    if tbfm_optims:
+                        if unfreeze_basis_weights:
+                            active_components.append('basis_weights')
+                        if unfreeze_bases:
+                            active_components.append('bases')
+                    components_str = '+'.join(active_components)
+                    print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
 
         # Store final predictions for results (recompute with all sessions at once)
         if coadapt_embeddings or not optimize_embeddings:
@@ -884,12 +977,24 @@ def test_time_adaptation(
             )
 
         if coadapt_embeddings:
+            components = ['AE', 'embeddings'] if embed_optim else ['AE']
+            if tbfm_optims:
+                if unfreeze_basis_weights:
+                    components.append('basis_weights')
+                if unfreeze_bases:
+                    components.append('bases')
             print(
-                f"TTA: Joint optimization complete. Final loss: {loss.item():.6f}"
+                f"TTA: Joint optimization complete [{'+'.join(components)}]. Final loss: {loss.item():.6f}"
             )
         else:
+            components = ['AE']
+            if tbfm_optims:
+                if unfreeze_basis_weights:
+                    components.append('basis_weights')
+                if unfreeze_bases:
+                    components.append('bases')
             print(
-                f"TTA: Meta-learning optimization complete."
+                f"TTA: Meta-learning optimization complete [{'+'.join(components)}]."
             )
     else:
         ys = None
