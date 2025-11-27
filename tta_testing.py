@@ -354,12 +354,13 @@ def load_configuration(config_dir: Path):
 def get_model_paths() -> Dict[str, Path]:
     """Return dictionary of available model paths."""
     return {
-        # "50_5_coadapt": Path("test/50_5_coadapt").resolve(),
-        # "50_5_inner": Path("test/50_5_inner").resolve(),
-        # "50_25_coadapt": Path("test/50_25_coadapt").resolve(),
-        # "50_25_inner": Path("test/50_25_inner").resolve(),
-        "100_25_rr32_coadapt": Path("test/100_25_rr32_coadapt").resolve(),
-        "100_25_rr16_inner": Path("test/100_25_rr16_inner_5k").resolve(),
+        # ts5000 models with different pretrain sizes (5, 12, 15, 20, 25)
+        "100_5_inner_ts5000": Path("test/100_5_rr16_inner_ts5000").resolve(),
+        "100_12_inner_ts5000": Path("test/100_12_rr16_inner_ts5000").resolve(),
+        "100_15_inner_ts5000": Path("test/100_15_rr16_inner_ts5000").resolve(),
+        "100_20_inner_ts5000": Path("test/100_20_rr16_inner_ts5000").resolve(),
+        "100_25_inner_ts5000": Path("test/100_25_rr16_inner_ts5000").resolve(),
+        "100_25_inner_ts5000_shuffle": Path("test/100_25_rr16_inner_ts5000_shuffle").resolve(),
     }
 
 

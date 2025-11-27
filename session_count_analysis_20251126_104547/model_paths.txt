@@ -2,3 +2,4 @@
 100_25_rr16_inner_ts5000_shuffle:test/100_25_rr16_inner_ts5000_shuffle
 100_5_rr16_inner_ts5000:test/100_5_rr16_inner_ts5000
 100_15_rr16_inner_ts5000:test/100_15_rr16_inner_ts5000
+100_12_rr16_inner_ts5000:test/100_12_rr16_inner_ts5000
