@@ -21,7 +21,7 @@ from tbfm import meta
 from tbfm import multisession
 from tbfm import utils
 
-DATA_DIR = "/var/data/opto-coproc/"
+DATA_DIR = os.getenv("TBFM_DATA_DIR", "/var/data/opto-coproc/")
 
 OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc folder.
 EMBEDDING_REST_SUBDIR = "embedding_rest"

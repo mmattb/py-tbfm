@@ -26,7 +26,7 @@ from tbfm import dataset, multisession, utils
 
 
 # Constants
-DATA_DIR = "/var/data/opto-coproc/"
+DATA_DIR = os.getenv("TBFM_DATA_DIR", "/var/data/opto-coproc/")
 EMBEDDING_REST_SUBDIR = "embedding_rest"
 
 
