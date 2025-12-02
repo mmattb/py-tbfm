@@ -47,3 +47,10 @@ Training uses a tripartite loss function:
   <img src="https://github.com/user-attachments/assets/ab6a5a7d-721c-43db-b443-5ab2935f4e6f" height="30"/>
 
 The LSTM model takes inspiration from dynamical systems and control methods which learn latent state representations for optimal control. Since it leverages an autoencoder architecture, it can be compared to methods such as deep Koopman for control, but without the key linearity constraint. We chose the LSTM model for comparison since it is a more expressive model than LSSMs, and has previously been demonstrated for control. While LSSMs were previously demonstrated for modeling neural stimulation, our ODE-LSTM model goes further by allowing for nonlinearities.
+
+## Orthonormality penalty
+We may optionally use an orthonormality penalty applied to the basis tensor. It is calculated as:
+
+  <img src="https://github.com/user-attachments/assets/7d6f6113-33b7-4d01-a1c5-61a3218cebd4" height="500"/>
+
+where B is the tensor of bases, and L_{ortho} is the calculated orthonormality penalty.
