@@ -20,6 +20,7 @@ from tbfm import dataset
 from tbfm import meta
 from tbfm import multisession
 from tbfm import utils
+import notifications
 
 DATA_DIR = os.getenv("TBFM_DATA_DIR", "/var/data/opto-coproc/")
 
@@ -219,6 +220,18 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 
     model_optims = multisession.get_optims(cfg, ms, embeddings_stim=embeddings_stim_init)
 
+    # Create progress notification
+    model_name = f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in or 0}"
+    job_id = None
+    try:
+        job_id = notifications.create_progress_notification(
+            job_id=f"train_{model_name}",
+            title=f"Training {model_name}",
+            initial_message=f"Starting {cfg.training.epochs} epochs with {num_sessions} sessions..."
+        )
+    except Exception as e:
+        print(f"Failed to create progress notification: {e}")
+    
     embeddings_stim, results = multisession.train_from_cfg(
         cfg,
         ms,
@@ -230,6 +243,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         test_interval=1000,
         epochs=cfg.training.epochs,
         random_sample_support=shuffle,
+        progress_job_id=job_id,
     )
 
     # Save hyperparameters for TTA evaluation
@@ -315,6 +329,32 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         plt.clf()
 
     graph_for_sid("MonkeyJ_20160426_Session2_S1", results, cidx=30)
+    
+    # Send completion notification
+    try:
+        final_train_r2 = results["train_r2s"][-1][1] if results.get("train_r2s") else None
+        final_test_r2 = results["test_r2s"][-1][1] if results.get("test_r2s") else None
+        
+        # Complete progress notification if it was created
+        if job_id:
+            notifications.complete_progress_notification(
+                job_id,
+                final_message=f"Training complete!\nTrain R²: {final_train_r2:.4f}\nTest R²: {final_test_r2:.4f}\nOutput: {my_out_dir}",
+                title="✓ Training Complete"
+            )
+        else:
+            # Fallback to regular notification
+            metrics = {
+                "train_r2": final_train_r2,
+                "test_r2": final_test_r2,
+            }
+            notifications.notify_training_complete(
+                model_name=f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in}",
+                metrics=metrics,
+                output_dir=my_out_dir
+            )
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
 
 
 if __name__ == "__main__":
@@ -346,18 +386,26 @@ if __name__ == "__main__":
     shuffle = args.shuffle.lower() == 'true'
     basis_residual_rank = int(args.basis_residual_rank) if args.basis_residual_rank and args.basis_residual_rank.isdigit() else None
 
-    main(
-        args.num_bases,
-        args.num_sessions,
-        args.gpu,
-        coadapt=coadapt,
-        basis_residual_rank_in=basis_residual_rank,
-        train_size=args.train_size,
-        shuffle=shuffle,
-        latent_dim=args.latent_dim,
-        batch_size_per_session=args.batch_size_per_session,
-        residual_mlp_hidden=args.residual_mlp_hidden,
-        out_dir=args.out_dir,
-        use_two_stage=args.two_stage,
-        embed_dim_stim=args.embed_dim_stim,
-    )
+    try:
+        main(
+            args.num_bases,
+            args.num_sessions,
+            args.gpu,
+            coadapt=coadapt,
+            basis_residual_rank_in=basis_residual_rank,
+            train_size=args.train_size,
+            shuffle=shuffle,
+            latent_dim=args.latent_dim,
+            batch_size_per_session=args.batch_size_per_session,
+            residual_mlp_hidden=args.residual_mlp_hidden,
+            out_dir=args.out_dir,
+            use_two_stage=args.two_stage,
+            embed_dim_stim=args.embed_dim_stim,
+        )
+    except Exception as e:
+        notifications.notify_error(
+            script_name="tma_standalone.py",
+            error=e,
+            context=f"Training {args.num_bases}_{args.num_sessions} on GPU {args.gpu}"
+        )
+        raise

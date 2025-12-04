@@ -27,6 +27,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from tbfm import dataset, multisession, utils
+import notifications
 
 
 # Constants
@@ -279,6 +280,17 @@ def gpu_worker(
             
             print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}")
             
+            # Create progress notification for this TTA run
+            job_id = None
+            try:
+                job_id = notifications.create_progress_notification(
+                    job_id=f"tta_{model_key}_{support_size}_{strategy_key}_gpu{gpu_id}",
+                    title=f"TTA: {model_key}",
+                    initial_message=f"Starting {strategy_key} with support size {support_size}...\nGPU: {gpu_id}"
+                )
+            except Exception as e:
+                print(f"[GPU {gpu_id}] Failed to create progress notification: {e}")
+            
             try:
                 # Clone config and apply model-specific hyperparameters
                 cfg_eval = clone_cfg_for_eval(cfg)
@@ -354,6 +366,7 @@ def gpu_worker(
                     support_size=support_size,
                     coadapt_embeddings=strategy_cfg["coadapt_embeddings"],
                     quiet=True,
+                    progress_job_id=job_id,  # Pass job_id for progress updates
                 )
                 
                 final_r2 = strategy_results["final_test_r2"]
@@ -399,6 +412,30 @@ def gpu_worker(
                 })
                 
                 print(f"[GPU {gpu_id}] Completed: Model={model_key}, Support={support_size}, Strategy={strategy_key}, R²={final_r2:.4f}")
+                
+                # Send notification for TTA completion
+                try:
+                    session_str = ",".join(adapt_session_ids[:3]) + ("..." if len(adapt_session_ids) > 3 else "")
+                    
+                    if job_id:
+                        # Complete progress notification
+                        notifications.complete_progress_notification(
+                            job_id,
+                            final_message=f"TTA complete!\nModel: {model_key}\nStrategy: {tta_strategies[strategy_key]['label']}\nSupport: {support_size}\nR²: {final_r2:.4f}\nSessions: {session_str}",
+                            title="✓ TTA Complete"
+                        )
+                    else:
+                        # Fallback to regular notification
+                        notifications.notify_tta_complete(
+                            model_name=model_key,
+                            session=session_str,
+                            support_size=support_size,
+                            strategy=tta_strategies[strategy_key]["label"],
+                            r2=final_r2,
+                            output_dir=str(output_dir) if output_dir else None
+                        )
+                except Exception as notif_error:
+                    print(f"[GPU {gpu_id}] Failed to send notification: {notif_error}")
                 
             except Exception as e:
                 print(f"[GPU {gpu_id}] Error processing job: {e}")
@@ -1796,6 +1833,20 @@ def plot_results(results: Dict, output_dir: Path, show: bool = False):
 def main():
     """Main entry point for TTA evaluation script."""
     args = parse_args()
+    
+    try:
+        _main_impl(args)
+    except Exception as e:
+        notifications.notify_error(
+            script_name="tta_testing.py",
+            error=e,
+            context=f"TTA evaluation"
+        )
+        raise
+
+
+def _main_impl(args):
+    """Implementation of main function (separated for error handling)."""
 
     # Setup
     if not args.use_multi_gpu:
@@ -1934,6 +1985,16 @@ def main():
     print("\n" + "=" * 80)
     print("TTA Evaluation Complete!")
     print("=" * 80)
+    
+    # Send completion notification
+    try:
+        notifications.notify_training_complete(
+            model_name="TTA Sweep",
+            metrics={},
+            output_dir=str(args.output_dir)
+        )
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
 
 
 if __name__ == "__main__":
