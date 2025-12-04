@@ -30,7 +30,7 @@ DEVICE = "cuda"  # cfg.device
 
 def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
          latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False,
-         embed_dim_stim=None, use_two_stage=False):
+         embed_dim_stim=None):
 
     if out_dir is None:
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")

@@ -1338,8 +1338,7 @@ def main():
         output_path=args.output,
         show=args.show,
         combine_duplicates=not args.no_combine_duplicates,
-    , 
-                 plot_batch_size=args.batch_size)
+        plot_batch_size=args.batch_size)
 
 
 if __name__ == "__main__":
