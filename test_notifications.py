@@ -4,7 +4,60 @@ Test notification system to verify setup is working correctly.
 """
 
 import sys
+import time
 import notifications
+
+def test_progress_updates():
+    """Test that progress updates replace the same notification."""
+    
+    if not notifications.is_enabled():
+        print("⚠️  Notifications are NOT enabled!")
+        return False
+    
+    print("\n" + "=" * 60)
+    print("Testing progress notification updates...")
+    print("You should see ONE notification that updates 4 times, not 4 separate notifications.\n")
+    
+    # Create initial progress notification
+    job_id = notifications.create_progress_notification(
+        job_id="test_job_123",
+        title="Test Progress",
+        initial_message="Starting test... (0/3)"
+    )
+    print("1. Sent initial notification")
+    time.sleep(3)
+    
+    # Update 1
+    notifications.update_progress_notification(
+        job_id=job_id,
+        message="Test in progress... (1/3)",
+        title="Test Progress"
+    )
+    print("2. Sent update 1")
+    time.sleep(3)
+    
+    # Update 2
+    notifications.update_progress_notification(
+        job_id=job_id,
+        message="Almost done... (2/3)",
+        title="Test Progress"
+    )
+    print("3. Sent update 2")
+    time.sleep(3)
+    
+    # Final completion
+    notifications.complete_progress_notification(
+        job_id=job_id,
+        final_message="Test complete! (3/3)",
+        title="✓ Test Complete"
+    )
+    print("4. Sent completion notification")
+    
+    print("\n✓ Progress update test complete!")
+    print("Check your phone - you should see ONE notification that was updated 4 times")
+    print("=" * 60)
+    return True
+
 
 def test_notifications():
     """Test all notification types."""
@@ -71,19 +124,19 @@ def test_notifications():
         return False
     
     print("=" * 60)
-    print("✓ All tests passed!")
-    print("\nYou should receive 3 notifications:")
+    print("✓ Basic notification tests passed!")
+    print("\nYou should have received 3 notifications:")
     print("  1. Training completion")
     print("  2. TTA completion")
     print("  3. Error notification")
-    print("\nIf you didn't receive them, check:")
-    print("  - Your spam/junk folder (for email)")
-    print("  - Environment variables are set correctly")
-    print("  - See NOTIFICATIONS_SETUP.md for troubleshooting")
     print("=" * 60)
     
     return True
 
 
 if __name__ == "__main__":
-    test_notifications()
+    success = test_notifications()
+    
+    if success:
+        # Test progress updates
+        test_progress_updates()

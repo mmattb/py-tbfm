@@ -64,7 +64,13 @@ class Notifier:
             print(f"[Notification] {subject}: {message}")
     
     def _send_pushover(self, title: str, message: str, priority: int = 0):
-        """Send notification via Pushover using HTTP API."""
+        """Send notification via Pushover using HTTP API.
+        
+        Args:
+            title: Notification title
+            message: Notification message
+            priority: Priority level (-2=silent, -1=quiet, 0=normal, 1=high, 2=emergency)
+        """
         try:
             import requests
         except ImportError:
@@ -88,7 +94,8 @@ class Notifier:
         response = requests.post(url, data=data)
         response.raise_for_status()
         
-        print(f"[Notification] Pushover notification sent")
+        priority_str = {-2: "silent", -1: "quiet", 0: "normal", 1: "high", 2: "emergency"}.get(priority, str(priority))
+        print(f"[Notification] Pushover notification sent (priority: {priority_str})")
 
 
 # Global notifier instance
@@ -157,10 +164,10 @@ def is_enabled():
 
 def create_progress_notification(job_id: str, title: str, initial_message: str):
     """
-    Create a notification that can be updated with progress.
+    Create a notification for progress tracking.
     
-    Pushover doesn't support updating existing notifications, so this just sends
-    the initial notification. Use update_progress_notification to send follow-ups.
+    Note: Pushover doesn't support updating existing notifications.
+    Updates will arrive as separate (but silent) notifications.
     
     Args:
         job_id: Unique identifier for this job (for tracking)
@@ -176,7 +183,8 @@ def create_progress_notification(job_id: str, title: str, initial_message: str):
     
     try:
         if _notifier.method == "pushover":
-            _notifier._send_pushover(title, initial_message)
+            # Send initial notification with normal priority (makes sound)
+            _notifier._send_pushover(title, initial_message, priority=0)
             return job_id
         else:
             # For other methods, just send a notification
@@ -190,9 +198,10 @@ def create_progress_notification(job_id: str, title: str, initial_message: str):
 
 def update_progress_notification(job_id: str, message: str, title: str = None):
     """
-    Update an existing progress notification.
+    Send a progress update notification.
     
-    Sends a new notification with the updated progress.
+    Note: This sends a new silent notification (no sound/vibration).
+    Pushover doesn't support updating existing notifications.
     
     Args:
         job_id: Job ID returned from create_progress_notification
@@ -205,10 +214,10 @@ def update_progress_notification(job_id: str, message: str, title: str = None):
     
     try:
         if _notifier.method == "pushover":
-            # Send new notification with updated info
+            # Send quiet update (priority -1 = quiet, no sound but does vibrate/show)
             notification_title = title or "Progress Update"
-            _notifier._send_pushover(notification_title, message, priority=-1)  # Low priority for updates
-            print(f"[Progress] Updated notification: {message[:50]}...")
+            _notifier._send_pushover(notification_title, message, priority=-1)
+            print(f"[Progress] Sent quiet update: {message[:50]}...")
         else:
             print(f"[Progress Update] {message}")
     except Exception as e:
@@ -219,6 +228,9 @@ def update_progress_notification(job_id: str, message: str, title: str = None):
 def complete_progress_notification(job_id: str, final_message: str, title: str = None):
     """
     Mark a progress notification as complete and clean up.
+    
+    Sends a final update with normal priority and then removes the tag
+    so future notifications don't replace this completion message.
     
     Args:
         job_id: Job ID returned from create_progress_notification
@@ -232,7 +244,8 @@ def complete_progress_notification(job_id: str, final_message: str, title: str =
     try:
         if _notifier.method == "pushover":
             final_title = title or "✓ Complete"
-            _notifier._send_pushover(final_title, final_message, priority=0)  # Normal priority for completion
+            # Send final notification with normal priority (makes sound)
+            _notifier._send_pushover(final_title, final_message, priority=0)
         else:
             print(f"[Progress Complete] {final_message}")
     except Exception as e:

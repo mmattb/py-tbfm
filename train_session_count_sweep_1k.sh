@@ -19,7 +19,7 @@ echo "" >> ${TIMING_LOG}
 SESSION_COUNTS=(1 5 10 15 20 25)
 LATENT_DIM=96
 NUM_BASES=100
-TRAIN_SIZE=5000
+TRAIN_SIZE=1000
 BATCH_SIZE=500
 
 # Track PIDs for each GPU
@@ -56,7 +56,7 @@ for i in "${!SESSION_COUNTS[@]}"; do
     echo "Starting training for num_sessions=${NS} on GPU ${GPU_ID}"
     echo "========================================="
     
-    OUT_DIR="${OUTPUT_BASE}/ns${NS}_maml"
+    OUT_DIR="${OUTPUT_BASE}/1kx${NS}_maml"
     
     python tma_standalone.py \
         ${NUM_BASES} \
@@ -73,7 +73,7 @@ for i in "${!SESSION_COUNTS[@]}"; do
     PID=$!
     GPU_PIDS[$GPU_ID]=$PID
     echo "Started training for num_sessions=${NS} on GPU ${GPU_ID} (PID: ${PID})"
-    echo "Train start (ns${NS}_maml): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
+    echo "Train start (1kx${NS}_maml): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
     echo ""
 done
 
@@ -114,9 +114,9 @@ echo "========================================="
 echo "Starting training for coadapt model (25 sessions) on GPU 0"
 echo "========================================="
 
-OUT_DIR_COADAPT="${OUTPUT_BASE}/ns25_coadapt"
+OUT_DIR_COADAPT="${OUTPUT_BASE}/1kx25_coadapt"
 COADAPT_TRAIN_START=$(date +%s)
-echo "Train start (ns25_coadapt): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
+echo "Train start (1kx25_coadapt): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
 
 python tma_standalone.py \
     ${NUM_BASES} \
@@ -136,12 +136,12 @@ COADAPT_TRAIN_TIME=$((COADAPT_TRAIN_END - COADAPT_TRAIN_START))
 
 if [ ${EXIT_CODE} -ne 0 ]; then
     echo "ERROR: Coadapt training failed"
-    echo "Train failed (ns25_coadapt): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
+    echo "Train failed (1kx25_coadapt): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
     exit 1
 fi
 
 echo "Coadapt training completed successfully"
-echo "Train complete (ns25_coadapt): $(date +%Y%m%d_%H%M%S), Duration: ${COADAPT_TRAIN_TIME}s" >> ${TIMING_LOG}
+echo "Train complete (1kx25_coadapt): $(date +%Y%m%d_%H%M%S), Duration: ${COADAPT_TRAIN_TIME}s" >> ${TIMING_LOG}
 echo ""
 
 # Force GPU memory cleanup
@@ -152,8 +152,8 @@ echo "All models trained. Starting TTA evaluation..."
 echo "========================================="
 
 # Run TTA sweep on 25 session models only
-MODEL_PATHS_ARG="ns25_coadapt:${OUTPUT_BASE}/ns25_coadapt"
-MODEL_PATHS_ARG="${MODEL_PATHS_ARG} ns25_maml:${OUTPUT_BASE}/ns25_maml"
+MODEL_PATHS_ARG="1kx25_coadapt:${OUTPUT_BASE}/1kx25_coadapt"
+MODEL_PATHS_ARG="${MODEL_PATHS_ARG} 1kx25_maml:${OUTPUT_BASE}/1kx25_maml"
 
 TTA_25_START=$(date +%s)
 echo "TTA start (25-session models sweep): $(date +%Y%m%d_%H%M%S)" >> ${TIMING_LOG}
@@ -168,7 +168,7 @@ python tta_testing.py \
     --output-dir ${OUTPUT_BASE}/tta_results \
     --unfreeze-bases \
     --progressive-unfreezing-threshold 0 \
-    --include-fresh-tbfm
+    --include-vanilla-tbfm
 
 
 EXIT_CODE=$?
@@ -190,7 +190,7 @@ python -c "import torch; torch.cuda.empty_cache(); import gc; gc.collect()"
 MODEL_PATHS_ARG=""
 for NS in "${SESSION_COUNTS[@]}"; do
     if [ ${NS} -ne 25 ]; then
-        MODEL_PATHS_ARG="${MODEL_PATHS_ARG} ns${NS}_maml:${OUTPUT_BASE}/ns${NS}_maml"
+        MODEL_PATHS_ARG="${MODEL_PATHS_ARG} 1kx${NS}_maml:${OUTPUT_BASE}/1kx${NS}_maml"
     fi
 done
 
