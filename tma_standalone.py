@@ -29,7 +29,8 @@ DEVICE = "cuda"  # cfg.device
 
 
 def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
-         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False):
+         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False,
+         embed_dim_stim=None, use_two_stage=False):
 
     if out_dir is None:
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
@@ -48,6 +49,8 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
             my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
         if residual_mlp_hidden is not None:
             my_out_dir += f"_mlp{residual_mlp_hidden}"
+        if embed_dim_stim is not None:
+            my_out_dir += f"_eds{embed_dim_stim}"
         if use_two_stage:
             my_out_dir += "_2stage"
     else:
@@ -194,6 +197,11 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         cfg.meta.training.lambda_l2 = 1e-2
         if residual_mlp_hidden is not None:
             cfg.meta.residual_mlp_hidden = residual_mlp_hidden
+    
+    # Set stim embedding dimension if provided
+    if embed_dim_stim is not None:
+        cfg.tbfm.module.embed_dim_stim = embed_dim_stim
+    
     cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
@@ -224,6 +232,24 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         random_sample_support=shuffle,
     )
 
+    # Save hyperparameters for TTA evaluation
+    hyperparameters = {
+        'num_bases': num_bases,
+        'num_sessions': num_sessions,
+        'latent_dim': cfg.latent_dim,
+        'basis_residual_rank': cfg.meta.basis_residual_rank if cfg.meta.is_basis_residual else None,
+        'residual_mlp_hidden': cfg.meta.residual_mlp_hidden if cfg.meta.is_basis_residual else None,
+        'embed_dim_stim': cfg.tbfm.module.embed_dim_stim,
+        'embed_dim_rest': cfg.tbfm.module.embed_dim_rest,
+        'is_basis_residual': cfg.meta.is_basis_residual,
+        'coadapt': coadapt,
+        'train_size': train_size,
+        'shuffle': shuffle,
+        'batch_size_per_session': batch_size_per_session,
+        'use_two_stage': use_two_stage,
+    }
+    torch.save(hyperparameters, os.path.join(my_out_dir, "hyperparameters.torch"))
+    
     torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
     torch.save(results, os.path.join(my_out_dir, "r.torch"))
     torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi.torch"))
@@ -309,6 +335,7 @@ if __name__ == "__main__":
     parser.add_argument('--latent-dim', type=int, default=None, help='Latent dimension for autoencoder')
     parser.add_argument('--batch-size-per-session', type=int, default=None, help='Batch size per session')
     parser.add_argument('--residual-mlp-hidden', type=int, default=None, help='Hidden dimension for residual MLP')
+    parser.add_argument('--embed-dim-stim', type=int, default=None, help='Stim embedding dimension')
     parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
     parser.add_argument('--two-stage', action='store_true', help='Use two-stage autoencoder')
     
@@ -332,4 +359,5 @@ if __name__ == "__main__":
         residual_mlp_hidden=args.residual_mlp_hidden,
         out_dir=args.out_dir,
         use_two_stage=args.two_stage,
+        embed_dim_stim=args.embed_dim_stim,
     )

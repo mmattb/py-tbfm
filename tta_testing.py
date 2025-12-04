@@ -278,11 +278,26 @@ def gpu_worker(
             print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}")
             
             try:
-                # Clone config for this evaluation
+                # Clone config and apply model-specific hyperparameters
                 cfg_eval = clone_cfg_for_eval(cfg)
                 
                 # Reconstruct model path
                 model_path = Path(model_paths_dict[model_key])
+                
+                # Load and apply model-specific hyperparameters
+                params = load_model_hyperparameters(model_path)
+                if params:
+                    if 'latent_dim' in params and params['latent_dim'] is not None:
+                        cfg_eval.latent_dim = params['latent_dim']
+                    if 'num_bases' in params and params['num_bases'] is not None:
+                        cfg_eval.tbfm.module.num_bases = params['num_bases']
+                    if 'basis_residual_rank' in params and params['basis_residual_rank'] is not None:
+                        cfg_eval.meta.basis_residual_rank = params['basis_residual_rank']
+                    if 'residual_mlp_hidden' in params and params['residual_mlp_hidden'] is not None:
+                        cfg_eval.meta.residual_mlp_hidden = params['residual_mlp_hidden']
+                    if 'embed_dim_stim' in params and params['embed_dim_stim'] is not None:
+                        cfg_eval.tbfm.module.embed_dim_stim = params['embed_dim_stim']
+                
                 model_file = model_path / "model_nf_1.torch"
                 if not model_file.exists():
                     model_file = model_path / "model.torch"
@@ -355,7 +370,71 @@ def gpu_worker(
     print(f"[GPU {gpu_id}] Worker finished")
 
 
-def load_configuration(config_dir: Path):
+def load_model_hyperparameters(model_path: Path) -> Dict:
+    """
+    Load hyperparameters from model directory.
+    
+    Args:
+        model_path: Path to model directory
+        
+    Returns:
+        Dictionary with model hyperparameters
+    """
+    hyperparam_file = model_path / "hyperparameters.torch"
+    
+    if hyperparam_file.exists():
+        params = torch.load(hyperparam_file, map_location='cpu')
+        print(f"Loaded hyperparameters from {hyperparam_file.name}")
+        return params
+    else:
+        # Fallback: try to parse from directory name for backwards compatibility
+        print(f"Warning: hyperparameters.torch not found in {model_path.name}, attempting to parse from name")
+        return parse_model_hyperparameters(model_path)
+
+
+def parse_model_hyperparameters(model_path: Path) -> Dict:
+    """
+    Parse hyperparameters from model directory name.
+    
+    Expected format: {num_bases}_{num_sessions}_rr{rr}_inner_ts{train_size}[_shuffle]_ld{latent_dim}_bs{batch_size}_mlp{mlp_hidden}_eds{embed_dim_stim}
+    
+    Returns:
+        Dictionary with extracted hyperparameters
+    """
+    import re
+    
+    model_name = model_path.name
+    params = {}
+    
+    # Extract residual rank
+    match = re.search(r'_rr(\d+)', model_name)
+    if match:
+        params['basis_residual_rank'] = int(match.group(1))
+    
+    # Extract latent dimension
+    match = re.search(r'_ld(\d+)', model_name)
+    if match:
+        params['latent_dim'] = int(match.group(1))
+    
+    # Extract MLP hidden dimension
+    match = re.search(r'_mlp(\d+)', model_name)
+    if match:
+        params['residual_mlp_hidden'] = int(match.group(1))
+    
+    # Extract stim embedding dimension
+    match = re.search(r'_eds(\d+)', model_name)
+    if match:
+        params['embed_dim_stim'] = int(match.group(1))
+    
+    # Extract num bases (at start of name)
+    match = re.match(r'^(\d+)_', model_name)
+    if match:
+        params['num_bases'] = int(match.group(1))
+    
+    return params
+
+
+def load_configuration(config_dir: Path, model_path: Path = None):
     """Load Hydra configuration and apply model-specific settings."""
     conf_dir = config_dir.resolve()
 
@@ -365,7 +444,7 @@ def load_configuration(config_dir: Path):
     with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
         cfg = compose(config_name="config")
 
-    # Apply model-specific configuration overrides
+    # Apply default model-specific configuration overrides
     cfg.training.epochs = 7001
     cfg.latent_dim = 85
     cfg.tbfm.module.num_bases = 100
@@ -377,8 +456,39 @@ def load_configuration(config_dir: Path):
     cfg.tbfm.training.lambda_fro = 75.0
     cfg.meta.is_basis_residual = True
     cfg.meta.basis_residual_rank = 16
+    cfg.meta.residual_mlp_hidden = 16
+    cfg.tbfm.module.embed_dim_stim = 15
     cfg.meta.training.lambda_l2 = 1e-2
     cfg.meta.training.coadapt = False
+    
+    # Parse and apply model-specific hyperparameters if model_path provided
+    if model_path is not None:
+        params = load_model_hyperparameters(model_path)
+        if params:
+            print(f"Applying model-specific hyperparameters from {model_path.name}:")
+            for key, value in params.items():
+                if value is not None:  # Only print non-None values
+                    print(f"  {key}: {value}")
+            
+            # Apply parsed parameters to config
+            if 'latent_dim' in params:
+                cfg.latent_dim = params['latent_dim']
+            if 'num_bases' in params:
+                cfg.tbfm.module.num_bases = params['num_bases']
+            if 'basis_residual_rank' in params:
+                cfg.meta.basis_residual_rank = params['basis_residual_rank']
+            if 'residual_mlp_hidden' in params:
+                cfg.meta.residual_mlp_hidden = params['residual_mlp_hidden']
+            if 'embed_dim_stim' in params:
+                cfg.tbfm.module.embed_dim_stim = params['embed_dim_stim']
+    
+    # Workaround: ae.py expects cfg.should_warm_start but config has it under cfg.ae.should_warm_start
+    # Copy it to the global level if it exists
+    OmegaConf.set_struct(cfg, False)
+    if hasattr(cfg, 'ae') and hasattr(cfg.ae, 'should_warm_start'):
+        cfg.should_warm_start = cfg.ae.should_warm_start
+    else:
+        cfg.should_warm_start = False
     
     # Workaround: ae.py expects cfg.should_warm_start but config has it under cfg.ae.should_warm_start
     # Copy it to the global level if it exists
@@ -387,6 +497,7 @@ def load_configuration(config_dir: Path):
         cfg.should_warm_start = cfg.ae.should_warm_start
     else:
         cfg.should_warm_start = True
+    OmegaConf.set_struct(cfg, True)
     OmegaConf.set_struct(cfg, True)
 
     return cfg
@@ -1386,8 +1497,23 @@ def run_tta_sweep(
                     "strategy": strategy_key,
                 })
 
-                # Clone config for this evaluation
+                # Clone config and apply model-specific hyperparameters
                 cfg_eval = clone_cfg_for_eval(cfg)
+                
+                # Parse and apply model-specific hyperparameters from path
+                model_path = model_paths[model_key]
+                params = load_model_hyperparameters(model_path)
+                if params:
+                    if 'latent_dim' in params and params['latent_dim'] is not None:
+                        cfg_eval.latent_dim = params['latent_dim']
+                    if 'num_bases' in params and params['num_bases'] is not None:
+                        cfg_eval.tbfm.module.num_bases = params['num_bases']
+                    if 'basis_residual_rank' in params and params['basis_residual_rank'] is not None:
+                        cfg_eval.meta.basis_residual_rank = params['basis_residual_rank']
+                    if 'residual_mlp_hidden' in params and params['residual_mlp_hidden'] is not None:
+                        cfg_eval.meta.residual_mlp_hidden = params['residual_mlp_hidden']
+                    if 'embed_dim_stim' in params and params['embed_dim_stim'] is not None:
+                        cfg_eval.tbfm.module.embed_dim_stim = params['embed_dim_stim']
 
                 # Find model file
                 model_file = model_paths[model_key] / "model_nf_1.torch"

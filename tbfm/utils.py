@@ -34,15 +34,17 @@ def zscore_inv(data, mean, std):
 
 def percentile_affine(x, p_low=0.1, p_high=0.9, floor=1e-3):
     # x: [B, T, C] few-shot stim samples
-    flat = x.flatten(end_dim=1)
-    q = torch.tensor([p_low, 0.5, p_high], device=x.device, dtype=x.dtype)
+    # Move to CPU for quantile computation to avoid GPU OOM
+    device = x.device
+    flat = x.flatten(end_dim=1).cpu()
+    q = torch.tensor([p_low, 0.5, p_high], dtype=x.dtype)
     qs = torch.quantile(flat, q, dim=0)  # [3, C]
     ql, qm, qh = qs[0], qs[1], qs[2]
     s = (qh - ql).clamp_min(floor * (qh - ql).median().clamp_min(1e-6))
     a = 2.0 / s
     b = -(qh + ql) / 2.0  # Average high and low; that's our new center
     # returns scale a and bias b such that x' = a*(x + b)
-    return a, b
+    return a.to(device), b.to(device)
 
 
 class SessionDispatcher:
