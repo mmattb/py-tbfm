@@ -148,7 +148,7 @@ def parse_args():
     parser.add_argument(
         "--progressive-unfreezing-threshold",
         type=int,
-        default=2000,
+        default=0,
         help="Support size threshold for enabling progressive unfreezing"
     )
     parser.add_argument(
@@ -195,6 +195,7 @@ def gpu_worker(
     batch_size_per_session: int,
     tta_epochs: int,
     tta_strategies: dict,
+    output_dir: Path = None,
 ):
     """
     Worker process for processing TTA jobs on a specific GPU.
@@ -210,6 +211,7 @@ def gpu_worker(
         batch_size_per_session: Batch size per session
         tta_epochs: Number of TTA epochs
         tta_strategies: TTA strategy configurations
+        output_dir: Directory to save adapted models
     """
     # Set up this process's GPU
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -286,17 +288,36 @@ def gpu_worker(
                 
                 # Load and apply model-specific hyperparameters
                 params = load_model_hyperparameters(model_path)
+                print(f"[GPU {gpu_id}] Parsed params for {model_key}: {params}")
+                
                 if params:
+                    # Need to disable struct mode to modify config
+                    OmegaConf.set_struct(cfg_eval, False)
+                    
                     if 'latent_dim' in params and params['latent_dim'] is not None:
                         cfg_eval.latent_dim = params['latent_dim']
+                        # Also update ae.module.latent_dim since interpolation may be resolved
+                        cfg_eval.ae.module.latent_dim = params['latent_dim']
+                        # Also update tbfm.module.in_dim which uses ${latent_dim}
+                        cfg_eval.tbfm.module.in_dim = params['latent_dim']
                     if 'num_bases' in params and params['num_bases'] is not None:
                         cfg_eval.tbfm.module.num_bases = params['num_bases']
                     if 'basis_residual_rank' in params and params['basis_residual_rank'] is not None:
                         cfg_eval.meta.basis_residual_rank = params['basis_residual_rank']
+                        # Also update tbfm.module.basis_residual_rank which uses ${meta.basis_residual_rank}
+                        cfg_eval.tbfm.module.basis_residual_rank = params['basis_residual_rank']
                     if 'residual_mlp_hidden' in params and params['residual_mlp_hidden'] is not None:
                         cfg_eval.meta.residual_mlp_hidden = params['residual_mlp_hidden']
+                        # Also update tbfm.module.residual_mlp_hidden which uses ${meta.residual_mlp_hidden}
+                        cfg_eval.tbfm.module.residual_mlp_hidden = params['residual_mlp_hidden']
                     if 'embed_dim_stim' in params and params['embed_dim_stim'] is not None:
                         cfg_eval.tbfm.module.embed_dim_stim = params['embed_dim_stim']
+                    
+                    OmegaConf.set_struct(cfg_eval, True)
+                
+                print(f"[GPU {gpu_id}] Config after applying params: latent_dim={cfg_eval.latent_dim}, "
+                      f"num_bases={cfg_eval.tbfm.module.num_bases}, rr={cfg_eval.meta.basis_residual_rank}, "
+                      f"mlp_hidden={cfg_eval.meta.residual_mlp_hidden}, embed_dim_stim={cfg_eval.tbfm.module.embed_dim_stim}")
                 
                 model_file = model_path / "model_nf_1.torch"
                 if not model_file.exists():
@@ -308,6 +329,10 @@ def gpu_worker(
                 # Get embeddings for this model
                 embeddings = embeddings_cache[model_key]
                 
+                # Verify config one more time right before building
+                print(f"[GPU {gpu_id}] VERIFY before build_from_cfg: cfg_eval.latent_dim = {cfg_eval.latent_dim}")
+                print(f"[GPU {gpu_id}] VERIFY type: {type(cfg_eval.latent_dim)}, value: {repr(cfg_eval.latent_dim)}")
+                
                 # Build model
                 ms_eval = multisession.build_from_cfg(
                     cfg_eval,
@@ -317,7 +342,7 @@ def gpu_worker(
                 )
                 
                 # Run TTA
-                _, strategy_results = multisession.test_time_adaptation(
+                adapted_embeddings, strategy_results = multisession.test_time_adaptation(
                     cfg_eval,
                     ms_eval,
                     embeddings,
@@ -333,10 +358,35 @@ def gpu_worker(
                 
                 final_r2 = strategy_results["final_test_r2"]
                 
+                # Save adapted model
+                if output_dir is not None:
+                    adapted_model_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
+                    adapted_model_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    # Save adapted model (TBFM only)
+                    multisession.save_model(ms_eval, adapted_model_dir / "model_adapted.torch", tbfm_only=True)
+                    
+                    # Save adapted embeddings
+                    torch.save(adapted_embeddings, adapted_model_dir / "embeddings_stim_adapted.torch")
+                    
+                    # Save metadata
+                    metadata = {
+                        "model_key": model_key,
+                        "support_size": support_size,
+                        "strategy_key": strategy_key,
+                        "final_r2": final_r2,
+                        "tta_epochs": tta_epochs,
+                        "adapt_session_ids": adapt_session_ids,
+                    }
+                    torch.save(metadata, adapted_model_dir / "metadata.torch")
+                
                 # Clean up
                 del ms_eval
                 del strategy_results
+                del adapted_embeddings
                 torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 
                 # Put result in queue
                 result_queue.put({
@@ -488,7 +538,16 @@ def load_configuration(config_dir: Path, model_path: Path = None):
     if hasattr(cfg, 'ae') and hasattr(cfg.ae, 'should_warm_start'):
         cfg.should_warm_start = cfg.ae.should_warm_start
     else:
+        cfg.should_warm_start = False
+    
+    # Workaround: ae.py expects cfg.should_warm_start but config has it under cfg.ae.should_warm_start
+    # Copy it to the global level if it exists
+    OmegaConf.set_struct(cfg, False)
+    if hasattr(cfg, 'ae') and hasattr(cfg.ae, 'should_warm_start'):
+        cfg.should_warm_start = cfg.ae.should_warm_start
+    else:
         cfg.should_warm_start = True
+    OmegaConf.set_struct(cfg, True)
     OmegaConf.set_struct(cfg, True)
 
     return cfg
@@ -692,10 +751,10 @@ def clone_cfg_for_eval(base_cfg, vanilla = False):
 def get_tta_strategies() -> Dict:
     """Return available TTA strategies."""
     return {
-        # "coadapt": {
-        #     "label": "Co-Adaptation",
-        #     "coadapt_embeddings": True
-        # },
+        "coadapt": {
+            "label": "Co-Adaptation",
+            "coadapt_embeddings": True
+        },
         "maml": {
             "label": "MAML (Meta-Learning)",
             "coadapt_embeddings": False
@@ -1135,6 +1194,7 @@ def run_tta_sweep_multi_gpu(
                     batch_size_per_session,
                     tta_epochs,
                     tta_strategies,
+                    output_dir,
                 ),
             )
             p.start()
@@ -1523,7 +1583,7 @@ def run_tta_sweep(
                 )
 
                 # Run TTA
-                _, strategy_results = multisession.test_time_adaptation(
+                adapted_embeddings, strategy_results = multisession.test_time_adaptation(
                     cfg_eval,
                     ms_eval,
                     embeddings_cache[model_key],
@@ -1547,6 +1607,27 @@ def run_tta_sweep(
                     "r2": final_r2,
                 })
 
+                # Save adapted model
+                adapted_model_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
+                adapted_model_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Save adapted model (TBFM only)
+                multisession.save_model(ms_eval, adapted_model_dir / "model_adapted.torch", tbfm_only=True)
+                
+                # Save adapted embeddings
+                torch.save(adapted_embeddings, adapted_model_dir / "embeddings_stim_adapted.torch")
+                
+                # Save metadata
+                metadata = {
+                    "model_key": model_key,
+                    "support_size": support_size,
+                    "strategy_key": strategy_key,
+                    "final_r2": final_r2,
+                    "tta_epochs": tta_epochs,
+                    "adapt_session_ids": adapt_session_ids,
+                }
+                torch.save(metadata, adapted_model_dir / "metadata.torch")
+
                 log_line(
                     f"Complete  | Strategy={strategy_cfg['label']:<24} | "
                     f"Support={support_size:>5} | Model={model_key:<20} | R²={final_r2:.4f}"
@@ -1555,7 +1636,10 @@ def run_tta_sweep(
                 # Release GPU memory immediately after each strategy
                 del ms_eval
                 del strategy_results
+                del adapted_embeddings
                 torch.cuda.empty_cache()
+                import gc
+                gc.collect()
                 torch.cuda.synchronize()  # Ensure GPU operations complete
 
         log_line("\n" + "=" * 80)
