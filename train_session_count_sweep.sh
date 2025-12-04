@@ -162,7 +162,7 @@ python tta_testing.py \
     --model-paths ${MODEL_PATHS_ARG} \
     --use-multi-gpu \
     --gpu-ids 0 1 \
-    --support-sizes 50 100 250 500 1000 2500 5000 \
+    --support-sizes 100 500 1000 2500 5000 \
     --max-adapt-sessions 15 \
     --tta-epochs 7001 \
     --output-dir ${OUTPUT_BASE}/tta_results \
