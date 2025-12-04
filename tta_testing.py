@@ -1775,7 +1775,7 @@ def main():
     )
 
     # Process sessions in groups of 5 to manage memory
-    SESSION_GROUP_SIZE = 5 if max(args.support_sizes) > 2500 else 15
+    SESSION_GROUP_SIZE = 5 if max(args.support_sizes) >= 2500 else 15
     session_groups = [
         adapt_session_ids[i:i + SESSION_GROUP_SIZE]
         for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
