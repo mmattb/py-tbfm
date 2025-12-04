@@ -119,9 +119,13 @@ def average_duplicate_runs(runs: List[Dict]) -> List[Dict]:
     return averaged_runs
 
 
-def parse_json_file(json_path: Path) -> Dict:
+def parse_json_file(json_path: Path, combine_duplicates: bool = True) -> Dict:
     """
     Parse a TTA sweep JSON file and extract results.
+
+    Args:
+        json_path: Path to the JSON file
+        combine_duplicates: If True, average duplicate runs with same (model, strategy, support_size)
 
     Returns:
         Dictionary with same structure as parse_log_file for consistency.
@@ -129,8 +133,10 @@ def parse_json_file(json_path: Path) -> Dict:
     with open(json_path, "r") as f:
         data = json.load(f)
 
-    # Average duplicate runs (same model, strategy, support_size)
-    runs = average_duplicate_runs(data.get("runs", []))
+    # Optionally average duplicate runs (same model, strategy, support_size)
+    runs = data.get("runs", [])
+    if combine_duplicates:
+        runs = average_duplicate_runs(runs)
 
     results = {
         "metadata": {
@@ -146,18 +152,19 @@ def parse_json_file(json_path: Path) -> Dict:
     return results
 
 
-def load_result_file(file_path: Path) -> Dict:
+def load_result_file(file_path: Path, combine_duplicates: bool = True) -> Dict:
     """
     Load results from either a log file or JSON file.
     
     Args:
         file_path: Path to log or JSON file
+        combine_duplicates: If True, average duplicate runs with same (model, strategy, support_size)
         
     Returns:
         Parsed results dictionary
     """
     if file_path.suffix == ".json":
-        return parse_json_file(file_path)
+        return parse_json_file(file_path, combine_duplicates=combine_duplicates)
     else:
         return parse_log_file(file_path)
 
@@ -197,16 +204,17 @@ def parse_model_name(model: str) -> dict:
     Expected format: {num_bases}_{num_pretrain_sessions}_{training_strategy}
     Example: "50_25_coadapt" -> bases=50, pretrain_sessions=25, training_strategy="coadapt"
 
-    Returns dict with: num_bases, pretrain_sessions, training_strategy
+    Returns dict with: num_bases, pretrain_sessions, training_strategy, is_shuffle
     """
     if model in ["vanilla_tbfm", "fresh_tbfm"]:
-        return {"num_bases": None, "pretrain_sessions": None, "training_strategy": model}
+        return {"num_bases": None, "pretrain_sessions": None, "training_strategy": model, "is_shuffle": False}
 
     parts = model.split("_")
     result = {
         "num_bases": int(parts[0]) if parts[0].isdigit() else None,
         "pretrain_sessions": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None,
-        "training_strategy": None
+        "training_strategy": None,
+        "is_shuffle": "shuffle" in model.lower()
     }
 
     # Find training strategy (last part that's a word)
@@ -342,6 +350,7 @@ def plot_results(
     file_paths: List[Path],
     output_path: Optional[Path] = None,
     show: bool = False,
+    combine_duplicates: bool = True,
 ):
     """
     Create comparison plots from log and/or JSON files.
@@ -356,12 +365,13 @@ def plot_results(
         file_paths: List of log/JSON file paths to plot
         output_path: Path to save plot. If None, uses timestamp-based name
         show: Whether to display plot interactively
+        combine_duplicates: If True, average duplicate runs with same (model, strategy, support_size)
     """
     # Parse all files
     all_results = []
     for file_path in file_paths:
         print(f"Parsing {file_path.name}...")
-        results = load_result_file(file_path)
+        results = load_result_file(file_path, combine_duplicates=combine_duplicates)
         all_results.append((file_path, results))
 
     if not all_results:
@@ -373,6 +383,23 @@ def plot_results(
     all_models = set()
     all_support_sizes = set()
     session_to_files = {}  # Map session tuple to list of file names
+
+    # When not combining duplicates, add file identifier to model name to make them unique
+    if not combine_duplicates:
+        enriched_results = []
+        for file_idx, (file_path, results) in enumerate(all_results):
+            # Use parent directory name as identifier
+            parent_dir_name = file_path.parent.name
+            enriched_runs = []
+            for run in results["runs"]:
+                enriched_run = run.copy()
+                # Add parent directory name to model name to make it unique
+                enriched_run["model"] = f"{run['model']}__{parent_dir_name}"
+                enriched_run["_original_model"] = run["model"]
+                enriched_run["_parent_dir"] = parent_dir_name
+                enriched_runs.append(enriched_run)
+            enriched_results.append((file_path, {**results, "runs": enriched_runs}))
+        all_results = enriched_results
 
     for file_path, results in all_results:
         aggregated = aggregate_runs_by_key(results["runs"])
@@ -437,7 +464,6 @@ def plot_results(
     for file_idx, (file_path, results) in enumerate(all_results):
         aggregated = aggregate_runs_by_key(results["runs"])
         timestamp = results["metadata"]["timestamp"]
-        # file_label = f"Run {file_idx + 1} ({timestamp})"
 
         # Plot each strategy+model combination
         for combo_idx, (strategy, model) in enumerate(strategy_model_combos):
@@ -449,20 +475,30 @@ def plot_results(
             support_vals = [dp[0] for dp in data_points]
             r2_vals = [dp[1] for dp in data_points]
 
+            # Extract original model name if available (for --no-combine-duplicates)
+            display_model = model
+            file_suffix = ""
+            if "__" in model:
+                # Extract original model name and parent directory name
+                parts = model.rsplit("__", 1)
+                if len(parts) == 2:
+                    display_model = parts[0]
+                    file_suffix = f" ({parts[1]})"
+            
             marker = markers[combo_idx % len(markers)]
             color = model_to_color[model]
             line_style = strategy_to_linestyle[strategy]
 
-            model_display = get_model_display_name(model)
+            model_display = get_model_display_name(display_model)
             strategy_display = get_display_name(strategy, "tta_strategy")
 
             # Special handling for baseline architectures on composite graph
-            if model == "vanilla_tbfm" and strategy.lower() in ["vanilla", "vanilla_tbfm"]:
+            if display_model == "vanilla_tbfm" and strategy.lower() in ["vanilla", "vanilla_tbfm"]:
                 strategy_display = "Vanilla Architecture"
-            elif model == "fresh_tbfm" and strategy.lower() in ["fresh", "fresh_tbfm"]:
+            elif display_model == "fresh_tbfm" and strategy.lower() in ["fresh", "fresh_tbfm"]:
                 strategy_display = "Multisession Architecture"
 
-            label = f"{model_display} - {strategy_display}"
+            label = f"{model_display} - {strategy_display}{file_suffix}"
 
             ax.plot(
                 support_vals,
@@ -476,6 +512,10 @@ def plot_results(
                 alpha=0.8,
             )
 
+    # Print number of lines plotted for debugging
+    num_lines = len(ax.get_lines())
+    print(f"Plotted {num_lines} line(s) on main graph")
+
     # Configure axes
     ax.set_xlabel("Support Set Size", fontsize=12)
     ax.set_ylabel("Test R²", fontsize=12)
@@ -483,7 +523,23 @@ def plot_results(
     if support_sizes:
         ax.set_xticks(support_sizes)
         ax.set_xticklabels([str(s) for s in support_sizes], rotation=45)
-    ax.set_ylim(bottom=-0.5)
+    
+    # Set y-axis limits to show all data properly
+    # Get current y limits to find max R² value
+    y_data = []
+    for line in ax.get_lines():
+        y_data.extend(line.get_ydata())
+    
+    if y_data:
+        max_r2 = max(y_data)
+        min_r2 = min(y_data)
+        # Add some padding
+        y_range = max_r2 - min_r2
+        padding = max(0.05, y_range * 0.1)  # At least 0.05 or 10% of range
+        ax.set_ylim(bottom=min(min_r2 - padding, -0.5), top=max_r2 + padding)
+    else:
+        ax.set_ylim(bottom=-0.5)
+    
     ax.grid(True, alpha=0.3)
     ax.set_title("TTA Performance Comparison", fontsize=14, fontweight="bold")
     
@@ -529,7 +585,7 @@ def plot_results(
         base_name = file_paths[0].stem
         output_path = file_paths[0].parent / f"{base_name}_combined_plot.png"
 
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.2)
     print(f"Main plot saved to: {output_path}")
 
     if show:
@@ -633,6 +689,10 @@ def plot_results(
         else:
             plt.close(fig_pretrain)
 
+    # 4. Pretrain size vs R² at specific support size
+    print("\nGenerating pretrain size vs R² comparison...")
+    generate_pretrain_size_plot(all_results, base_path, show=show)
+
     print("\nAll comparison plots generated!")
 
     # Generate summary statistics table
@@ -642,6 +702,126 @@ def plot_results(
     # Generate slide-ready visual table
     print("\nGenerating slide-ready table...")
     generate_slide_table(all_results, base_path)
+
+
+def generate_pretrain_size_plot(
+    all_results: List[Tuple[Path, Dict]], 
+    base_path: Path,
+    support_size: int = 1000,
+    show: bool = False
+):
+    """
+    Generate a plot of pretrain session count vs R² for a specific support size.
+    
+    Creates separate lines for each combination of training strategy and TTA strategy.
+    
+    Args:
+        all_results: List of (file_path, results) tuples
+        base_path: Base path for saving the plot
+        support_size: Support size to filter for (default: 1000)
+        show: Whether to display the plot
+    """
+    import pandas as pd
+    
+    # Collect all data with parsed model info
+    data = []
+    for file_path, results in all_results:
+        for run in results["runs"]:
+            model_info = parse_model_name(run["model"])
+            data.append({
+                "Model": run["model"],
+                "TTA Strategy": run["strategy"],
+                "Support Size": run["support_size"],
+                "R²": run["r2"],
+                "Training Strategy": model_info["training_strategy"],
+                "Pretrain Sessions": model_info["pretrain_sessions"],
+                "Is Shuffle": model_info["is_shuffle"],
+            })
+    
+    df = pd.DataFrame(data)
+    
+    # Filter for the specific support size
+    df_filtered = df[df["Support Size"] == support_size].copy()
+    
+    # Remove baseline models
+    df_filtered = df_filtered[~df_filtered["TTA Strategy"].isin(["vanilla_tbfm", "fresh_tbfm"])].copy()
+    
+    # Remove rows with missing pretrain sessions
+    df_filtered = df_filtered[df_filtered["Pretrain Sessions"].notna()].copy()
+    
+    if len(df_filtered) == 0:
+        print(f"Warning: No data found for support size {support_size}")
+        return
+    
+    # Group by training strategy, TTA strategy, pretrain sessions, AND shuffle status, then average R²
+    grouped = df_filtered.groupby(
+        ["Training Strategy", "TTA Strategy", "Pretrain Sessions", "Is Shuffle"]
+    )["R²"].mean().reset_index()
+    
+    # Create plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    markers = ['o', 's', '^', 'v', 'D', 'p', '*', 'h']
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    
+    # Plot each combination of training strategy and TTA strategy
+    combo_idx = 0
+    for (train_strat, tta_strat), group in grouped.groupby(["Training Strategy", "TTA Strategy"]):
+        if train_strat is None:
+            continue
+        
+        train_display = get_display_name(train_strat, "training_strategy")
+        tta_display = get_display_name(tta_strat, "tta_strategy")
+        
+        # Separate shuffle and non-shuffle
+        group_non_shuffle = group[group["Is Shuffle"] == False].sort_values("Pretrain Sessions")
+        group_shuffle = group[group["Is Shuffle"] == True].sort_values("Pretrain Sessions")
+        
+        marker = markers[combo_idx % len(markers)]
+        color = colors[combo_idx % len(colors)]
+        
+        # Plot non-shuffle models
+        if len(group_non_shuffle) > 0:
+            pretrain_sessions = group_non_shuffle["Pretrain Sessions"].values
+            r2_values = group_non_shuffle["R²"].values
+            label = f"{train_display} + {tta_display}"
+            ax.plot(pretrain_sessions, r2_values, marker=marker, linestyle='-',
+                    linewidth=2, markersize=10, label=label, color=color, alpha=0.8)
+        
+        # Plot shuffle models with lighter color and different marker
+        if len(group_shuffle) > 0:
+            pretrain_sessions = group_shuffle["Pretrain Sessions"].values
+            r2_values = group_shuffle["R²"].values
+            label = f"{train_display} + {tta_display} (shuffle)"
+            shuffle_marker = '*' if marker != '*' else 'P'
+            ax.plot(pretrain_sessions, r2_values, marker=shuffle_marker, linestyle='--',
+                    linewidth=2, markersize=12, label=label, color=color, alpha=0.5)
+        
+        combo_idx += 1
+    
+    ax.set_xlabel('Number of Pretraining Sessions', fontsize=12)
+    ax.set_ylabel('Test R²', fontsize=12)
+    ax.set_title(f'Pretraining Sessions vs R² (Support Size = {support_size})',
+                 fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9, loc='best')
+    
+    # Set x-axis to show only the actual pretrain session counts
+    pretrain_counts = sorted(df_filtered["Pretrain Sessions"].unique())
+    ax.set_xticks(pretrain_counts)
+    ax.set_xticklabels([str(int(c)) for c in pretrain_counts])
+    
+    plt.tight_layout()
+    
+    # Save plot
+    pretrain_size_path = Path(str(base_path) + f"_pretrain_size_vs_r2_support{support_size}.png")
+    fig.savefig(pretrain_size_path, dpi=200, bbox_inches='tight')
+    print(f"Pretrain size vs R² plot saved to: {pretrain_size_path}")
+    
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 
 def generate_slide_table(all_results: List[Tuple[Path, Dict]], base_path: Path):
@@ -1011,6 +1191,11 @@ def main():
         action="store_true",
         help="Display plot interactively",
     )
+    parser.add_argument(
+        "--no-combine-duplicates",
+        action="store_true",
+        help="Don't combine/average runs with same model, strategy, and support size",
+    )
 
     args = parser.parse_args()
 
@@ -1020,7 +1205,12 @@ def main():
             print(f"Error: File not found: {file_path}")
             return
 
-    plot_results(args.files, output_path=args.output, show=args.show)
+    plot_results(
+        args.files,
+        output_path=args.output,
+        show=args.show,
+        combine_duplicates=not args.no_combine_duplicates,
+    )
 
 
 if __name__ == "__main__":

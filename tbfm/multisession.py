@@ -650,6 +650,9 @@ def test_time_adaptation(
         results: Dict with test metrics
     """
 
+    if coadapt_embeddings:
+        Warning("TTA with co-adaptation of embeddings is likely to yield poor performance.")
+
     # Set model to eval mode; keep AE in train mode if adapting it
     model.eval(ae=not adapt_ae)
 
@@ -783,7 +786,7 @@ def test_time_adaptation(
                     if unfreeze_basis_weights:
                         # Add basis weighting parameters (fast adaptation)
                         params_to_optimize.append({
-                            'params': tbfm_instance.bases.weighting.parameters(),
+                            'params': tbfm_instance.basis_weighting.parameters(),
                             'lr': basis_weight_lr,
                             'name': 'basis_weights'
                         })
@@ -799,9 +802,12 @@ def test_time_adaptation(
                         print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
                     
                     if params_to_optimize:
+                        # Use weight_decay if available, otherwise default to 1e-4
+                        wd = cfg.tbfm.training.optim.get('weight_decay', 
+                                                          cfg.tbfm.training.optim.get('wd_head', 1e-4))
                         tbfm_optim = torch.optim.AdamW(
                             params_to_optimize,
-                            weight_decay=cfg.tbfm.training.optim.weight_decay,
+                            weight_decay=wd,
                         )
                         tbfm_optims[session_id] = tbfm_optim
 
