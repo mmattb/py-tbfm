@@ -650,6 +650,9 @@ def test_time_adaptation(
         results: Dict with test metrics
     """
 
+    if coadapt_embeddings:
+        raise ValueError("Coadaptation of embeddings sucks")
+
     # Set model to eval mode; keep AE in train mode if adapting it
     model.eval(ae=not adapt_ae)
 

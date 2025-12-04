@@ -190,6 +190,21 @@ def aggregate_runs_by_key(
     return aggregated
 
 
+def parse_batch_size(model: str) -> Optional[int]:
+    """
+    Extract batch size from model name if present.
+
+    Args:
+        model: Model name (e.g., "bs500", "bs625", "bs750")
+
+    Returns:
+        Batch size as integer, or None if not a batch size model
+    """
+    if model.startswith("bs") and model[2:].isdigit():
+        return int(model[2:])
+    return None
+
+
 def parse_model_name(model: str) -> dict:
     """
     Parse model name to extract components.
@@ -282,6 +297,57 @@ def get_model_display_name(model: str) -> str:
     return ", ".join(parts) if parts else model
 
 
+def aggregate_by_batch_size(
+    all_results: List[Tuple[Path, Dict]],
+    strategy: Optional[str] = None
+) -> Dict[int, List[Tuple[int, float]]]:
+    """
+    Aggregate results by batch size.
+
+    Args:
+        all_results: List of (file_path, results) tuples
+        strategy: Optional TTA strategy to filter by (e.g., "maml")
+
+    Returns:
+        Dict mapping batch_size to list of (support_size, r2) tuples
+    """
+    aggregated = {}
+
+    for file_path, results in all_results:
+        for run in results["runs"]:
+            model = run["model"]
+            run_strategy = run["strategy"]
+            support_size = run["support_size"]
+            r2 = run["r2"]
+
+            # Filter by strategy if specified
+            if strategy and run_strategy.lower() != strategy.lower():
+                continue
+
+            # Extract batch size from model name
+            batch_size = parse_batch_size(model)
+            if batch_size is None:
+                continue
+
+            if batch_size not in aggregated:
+                aggregated[batch_size] = {}
+
+            if support_size not in aggregated[batch_size]:
+                aggregated[batch_size][support_size] = []
+
+            aggregated[batch_size][support_size].append(r2)
+
+    # Average values for each (batch_size, support_size)
+    result = {}
+    for batch_size, support_dict in aggregated.items():
+        result[batch_size] = []
+        for support_size in sorted(support_dict.keys()):
+            avg_r2 = np.mean(support_dict[support_size])
+            result[batch_size].append((support_size, avg_r2))
+
+    return result
+
+
 def aggregate_by_dimension(
     all_results: List[Tuple[Path, Dict]],
     dimension: str
@@ -342,6 +408,7 @@ def plot_results(
     file_paths: List[Path],
     output_path: Optional[Path] = None,
     show: bool = False,
+    plot_batch_size: bool = False,
 ):
     """
     Create comparison plots from log and/or JSON files.
@@ -351,11 +418,13 @@ def plot_results(
     2. Training strategy comparison
     3. TTA strategy comparison
     4. Pretraining sessions comparison
+    5. Batch size comparison (if plot_batch_size=True)
 
     Args:
         file_paths: List of log/JSON file paths to plot
         output_path: Path to save plot. If None, uses timestamp-based name
         show: Whether to display plot interactively
+        plot_batch_size: Whether to generate batch size comparison plot
     """
     # Parse all files
     all_results = []
@@ -632,6 +701,60 @@ def plot_results(
             plt.show()
         else:
             plt.close(fig_pretrain)
+
+    # 4. Batch size comparison (if enabled)
+    if plot_batch_size:
+        print("\nGenerating batch size comparison...")
+        
+        # Get all unique strategies from batch size models
+        batch_strategies = set()
+        for file_path, results in all_results:
+            for run in results["runs"]:
+                if parse_batch_size(run["model"]) is not None:
+                    batch_strategies.add(run["strategy"])
+        
+        if batch_strategies:
+            # Create a subplot for each strategy
+            n_strategies = len(batch_strategies)
+            fig_batch, axes = plt.subplots(1, n_strategies, figsize=(7*n_strategies, 6), squeeze=False)
+            axes = axes.flatten()
+            
+            for idx, strategy in enumerate(sorted(batch_strategies)):
+                ax_batch = axes[idx]
+                batch_agg = aggregate_by_batch_size(all_results, strategy=strategy)
+                
+                if batch_agg:
+                    colors = plt.cm.viridis(np.linspace(0, 0.9, len(batch_agg)))
+                    for color_idx, (batch_size, data_points) in enumerate(sorted(batch_agg.items())):
+                        support_vals = [dp[0] for dp in data_points]
+                        r2_vals = [dp[1] for dp in data_points]
+                        ax_batch.plot(support_vals, r2_vals, marker='o', linewidth=2,
+                                    markersize=8, label=f"BS={batch_size}", 
+                                    color=colors[color_idx], alpha=0.8)
+                    
+                    ax_batch.set_xlabel("Support Set Size", fontsize=12)
+                    ax_batch.set_ylabel("Test R² (averaged)", fontsize=12)
+                    ax_batch.set_xscale("log")
+                    if support_sizes:
+                        ax_batch.set_xticks(support_sizes)
+                        ax_batch.set_xticklabels([str(s) for s in support_sizes], rotation=45)
+                    ax_batch.set_ylim(bottom=-0.5)
+                    ax_batch.grid(True, alpha=0.3)
+                    strategy_display = get_display_name(strategy, "tta_strategy")
+                    ax_batch.set_title(f"Batch Size Comparison\n({strategy_display})", 
+                                     fontsize=14, fontweight="bold")
+                    ax_batch.legend(title="Batch Size", fontsize=10)
+            
+            plt.tight_layout()
+            batch_path = Path(str(base_path) + "_batch_size.png")
+            fig_batch.savefig(batch_path, dpi=200, bbox_inches="tight")
+            print(f"Batch size plot saved to: {batch_path}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig_batch)
+        else:
+            print("No batch size data found (models must be named like 'bs500', 'bs625', etc.)")
 
     print("\nAll comparison plots generated!")
 
@@ -1011,6 +1134,11 @@ def main():
         action="store_true",
         help="Display plot interactively",
     )
+    parser.add_argument(
+        "--batch-size",
+        action="store_true",
+        help="Generate batch size comparison plot (models must be named like 'bs500', 'bs625', etc.)",
+    )
 
     args = parser.parse_args()
 
@@ -1020,7 +1148,8 @@ def main():
             print(f"Error: File not found: {file_path}")
             return
 
-    plot_results(args.files, output_path=args.output, show=args.show)
+    plot_results(args.files, output_path=args.output, show=args.show, 
+                 plot_batch_size=args.batch_size)
 
 
 if __name__ == "__main__":

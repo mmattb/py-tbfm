@@ -29,7 +29,7 @@ DEVICE = "cuda"  # cfg.device
 
 
 def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
-         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None):
+         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False):
 
     if out_dir is None:
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
@@ -48,6 +48,8 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
             my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
         if residual_mlp_hidden is not None:
             my_out_dir += f"_mlp{residual_mlp_hidden}"
+        if use_two_stage:
+            my_out_dir += "_2stage"
     else:
         my_out_dir = out_dir
 
@@ -308,6 +310,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size-per-session', type=int, default=None, help='Batch size per session')
     parser.add_argument('--residual-mlp-hidden', type=int, default=None, help='Hidden dimension for residual MLP')
     parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
+    parser.add_argument('--two-stage', action='store_true', help='Use two-stage autoencoder')
     
     args = parser.parse_args()
     
@@ -328,4 +331,5 @@ if __name__ == "__main__":
         batch_size_per_session=args.batch_size_per_session,
         residual_mlp_hidden=args.residual_mlp_hidden,
         out_dir=args.out_dir,
+        use_two_stage=args.two_stage,
     )

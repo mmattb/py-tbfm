@@ -190,9 +190,9 @@ def gpu_worker(
     result_queue: mp.Queue,
     cfg_dict: dict,
     model_paths_dict: dict,
-    embeddings_cache_dict: dict,
-    data_train_dict: dict,
-    data_test_dict: dict,
+    adapt_session_ids: list,
+    window_size: int,
+    batch_size_per_session: int,
     tta_epochs: int,
     tta_strategies: dict,
 ):
@@ -205,9 +205,9 @@ def gpu_worker(
         result_queue: Queue to put results
         cfg_dict: Configuration dictionary
         model_paths_dict: Model paths dictionary
-        embeddings_cache_dict: Pre-loaded embeddings for each model
-        data_train_dict: Training data (serialized)
-        data_test_dict: Test data (serialized)
+        adapt_session_ids: List of session IDs to load data for
+        window_size: Window size for data loading
+        batch_size_per_session: Batch size per session
         tta_epochs: Number of TTA epochs
         tta_strategies: TTA strategy configurations
     """
@@ -219,7 +219,49 @@ def gpu_worker(
     # Reconstruct config from dict
     cfg = OmegaConf.create(cfg_dict)
     
-    print(f"[GPU {gpu_id}] Worker started")
+    # Workaround: ae.py expects cfg.should_warm_start but config might have it under cfg.ae.should_warm_start
+    OmegaConf.set_struct(cfg, False)
+    if 'should_warm_start' not in cfg:
+        if 'ae' in cfg and 'should_warm_start' in cfg.ae:
+            cfg.should_warm_start = cfg.ae.should_warm_start
+        else:
+            cfg.should_warm_start = True
+    OmegaConf.set_struct(cfg, True)
+    
+    print(f"[GPU {gpu_id}] Worker started, loading data...")    # Load data in this worker process
+    batch_size = batch_size_per_session * len(adapt_session_ids)
+    d, _ = multisession.load_stim_batched(
+        batch_size=batch_size,
+        window_size=window_size,
+        session_subdir="torchraw",
+        data_dir=DATA_DIR,
+        held_in_session_ids=adapt_session_ids,
+        num_held_out_sessions=0,
+    )
+    data_train, data_test = d.train_test_split(5000, test_cut=2500)
+    
+    # Load embeddings for all models
+    embeddings_cache = {}
+    for model_key in model_paths_dict.keys():
+        # Load held-in sessions for this model
+        model_path = Path(model_paths_dict[model_key])
+        hisi_path = None
+        for candidate in ["hisi_nf_1.torch", "hisi.torch"]:
+            candidate_path = model_path / candidate
+            if candidate_path.exists():
+                hisi_path = candidate_path
+                break
+        
+        if hisi_path is None:
+            print(f"[GPU {gpu_id}] Warning: No hisi file found for {model_key}")
+            continue
+        
+        held_in_sessions = torch.load(hisi_path)
+        embeds = multisession.load_rest_embeddings(held_in_sessions, device=device)
+        embeds.update(multisession.load_rest_embeddings(adapt_session_ids, device=device))
+        embeddings_cache[model_key] = embeds
+    
+    print(f"[GPU {gpu_id}] Data loaded, ready to process jobs")
     
     while True:
         try:
@@ -248,17 +290,8 @@ def gpu_worker(
                 if not model_file.exists():
                     raise FileNotFoundError(f"Model file not found for {model_key}")
                 
-                # Deserialize data (convert back from CPU tensors)
-                data_train = {}
-                for sid, tensors in data_train_dict.items():
-                    data_train[sid] = tuple(t.to(device) for t in tensors)
-                
-                data_test = []
-                for batch_dict in data_test_dict:
-                    data_test.append({sid: tuple(t.to(device) for t in tensors) for sid, tensors in batch_dict.items()})
-                
-                # Deserialize embeddings
-                embeddings = {sid: emb.to(device) for sid, emb in embeddings_cache_dict[model_key].items()}
+                # Get embeddings for this model
+                embeddings = embeddings_cache[model_key]
                 
                 # Build model
                 ms_eval = multisession.build_from_cfg(
@@ -266,7 +299,6 @@ def gpu_worker(
                     data_train,
                     base_model_path=str(model_file),
                     device=device,
-                    quiet=True,
                 )
                 
                 # Run TTA
@@ -334,11 +366,11 @@ def load_configuration(config_dir: Path):
         cfg = compose(config_name="config")
 
     # Apply model-specific configuration overrides
-    cfg.training.epochs = 12001
+    cfg.training.epochs = 7001
     cfg.latent_dim = 85
     cfg.tbfm.module.num_bases = 100
     cfg.ae.training.lambda_ae_recon = 0.03
-    cfg.ae.use_two_stage = False
+    cfg.ae.use_two_stage = False  # ts5000 models use single-stage LinearChannelAE
     cfg.ae.two_stage.freeze_only_shared = False
     cfg.ae.two_stage.lambda_mu = 0.01
     cfg.ae.two_stage.lambda_cov = 0.01
@@ -346,7 +378,16 @@ def load_configuration(config_dir: Path):
     cfg.meta.is_basis_residual = True
     cfg.meta.basis_residual_rank = 16
     cfg.meta.training.lambda_l2 = 1e-2
-    cfg.meta.training.coadapt = True
+    cfg.meta.training.coadapt = False
+    
+    # Workaround: ae.py expects cfg.should_warm_start but config has it under cfg.ae.should_warm_start
+    # Copy it to the global level if it exists
+    OmegaConf.set_struct(cfg, False)
+    if hasattr(cfg, 'ae') and hasattr(cfg.ae, 'should_warm_start'):
+        cfg.should_warm_start = cfg.ae.should_warm_start
+    else:
+        cfg.should_warm_start = True
+    OmegaConf.set_struct(cfg, True)
 
     return cfg
 
@@ -355,11 +396,11 @@ def get_model_paths() -> Dict[str, Path]:
     """Return dictionary of available model paths."""
     return {
         # ts5000 models with different pretrain sizes (5, 12, 15, 20, 25)
-        "100_5_inner_ts5000": Path("test/100_5_rr16_inner_ts5000").resolve(),
-        "100_12_inner_ts5000": Path("test/100_12_rr16_inner_ts5000").resolve(),
-        "100_15_inner_ts5000": Path("test/100_15_rr16_inner_ts5000").resolve(),
-        "100_20_inner_ts5000": Path("test/100_20_rr16_inner_ts5000").resolve(),
-        "100_25_inner_ts5000": Path("test/100_25_rr16_inner_ts5000").resolve(),
+        # "100_5_inner_ts5000": Path("test/100_5_rr16_inner_ts5000").resolve(),
+        # "100_12_inner_ts5000": Path("test/100_12_rr16_inner_ts5000").resolve(),
+        # "100_15_inner_ts5000": Path("test/100_15_rr16_inner_ts5000").resolve(),
+        # "100_20_inner_ts5000": Path("test/100_20_rr16_inner_ts5000").resolve(),
+        # "100_25_inner_ts5000": Path("test/100_25_rr16_inner_ts5000").resolve(),
         "100_25_inner_ts5000_shuffle": Path("test/100_25_rr16_inner_ts5000_shuffle").resolve(),
     }
 
@@ -549,10 +590,10 @@ def clone_cfg_for_eval(base_cfg, vanilla = False):
 def get_tta_strategies() -> Dict:
     """Return available TTA strategies."""
     return {
-        "coadapt": {
-            "label": "Co-Adaptation",
-            "coadapt_embeddings": True
-        },
+        # "coadapt": {
+        #     "label": "Co-Adaptation",
+        #     "coadapt_embeddings": True
+        # },
         "maml": {
             "label": "MAML (Meta-Learning)",
             "coadapt_embeddings": False
@@ -871,6 +912,7 @@ def run_tta_sweep_multi_gpu(
     data_train,
     data_test,
     tta_epochs: int,
+    device: str,
     gpu_ids: List[int],
     output_dir: Path,
     include_vanilla_tbfm: bool,
@@ -948,15 +990,14 @@ def run_tta_sweep_multi_gpu(
     
     # Multi-GPU processing for TTA jobs
     if tta_jobs:
-        print(f"\\nProcessing {len(tta_jobs)} TTA jobs across {len(gpu_ids)} GPUs...")
+        print(f"\nProcessing {len(tta_jobs)} TTA jobs across {len(gpu_ids)} GPUs...")
         
-        # Prepare data for multiprocessing (move to CPU for serialization)
-        data_train_cpu = {sid: tuple(t.cpu() for t in tensors) for sid, tensors in data_train.items()}
-        data_test_cpu = [{sid: tuple(t.cpu() for t in tensors) for sid, tensors in batch.items()} for batch in data_test]
-        embeddings_cache_cpu = {
-            model_key: {sid: emb.cpu() for sid, emb in embeds.items()}
-            for model_key, embeds in embeddings_cache.items()
-        }
+        # Set multiprocessing start method to 'spawn' for CUDA compatibility
+        mp_context = mp.get_context('spawn')
+        
+        # Get configuration parameters for workers
+        window_size = cfg.data.trial_len
+        batch_size_per_session = 7500  # You may want to pass this as a parameter
         
         # Convert config to dict for serialization
         cfg_dict = OmegaConf.to_container(cfg, resolve=True)
@@ -964,9 +1005,9 @@ def run_tta_sweep_multi_gpu(
         # Convert model paths to strings
         model_paths_dict = {k: str(v) for k, v in model_paths.items()}
         
-        # Create job and result queues
-        job_queue = mp.Queue()
-        result_queue = mp.Queue()
+        # Create job and result queues using spawn context
+        job_queue = mp_context.Queue()
+        result_queue = mp_context.Queue()
         
         # Populate job queue
         for job in tta_jobs:
@@ -976,10 +1017,10 @@ def run_tta_sweep_multi_gpu(
         for _ in gpu_ids:
             job_queue.put(None)
         
-        # Start worker processes
+        # Start worker processes using spawn context
         workers = []
         for gpu_id in gpu_ids:
-            p = mp.Process(
+            p = mp_context.Process(
                 target=gpu_worker,
                 args=(
                     gpu_id,
@@ -987,9 +1028,9 @@ def run_tta_sweep_multi_gpu(
                     result_queue,
                     cfg_dict,
                     model_paths_dict,
-                    embeddings_cache_cpu,
-                    data_train_cpu,
-                    data_test_cpu,
+                    adapt_session_ids,
+                    window_size,
+                    batch_size_per_session,
                     tta_epochs,
                     tta_strategies,
                 ),
@@ -1218,6 +1259,7 @@ def run_tta_sweep(
             data_train,
             data_test,
             tta_epochs,
+            device,
             gpu_ids,
             output_dir,
             include_vanilla_tbfm,
@@ -1616,7 +1658,7 @@ def main():
     )
 
     # Process sessions in groups of 5 to manage memory
-    SESSION_GROUP_SIZE = 15
+    SESSION_GROUP_SIZE = 5 if max(args.support_sizes) > 2500 else 15
     session_groups = [
         adapt_session_ids[i:i + SESSION_GROUP_SIZE]
         for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
