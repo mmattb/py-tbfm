@@ -188,14 +188,17 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
 def split_support_query_sessions(
     data_train,
     support_size: int,
-    random_sample: bool = False
+    random_sample: bool = False,
+    train_set_size: int | None = None,
 ):
     support = {}
     query = {}
     for session_id, d in data_train.items():
         if random_sample:
             n_samples = len(d[0])
-            indices = torch.randperm(n_samples)
+            # Limit to train_set_size if specified
+            effective_size = min(train_set_size, n_samples) if train_set_size else n_samples
+            indices = torch.randperm(effective_size)
             support_indices = indices[:support_size]
             query_indices = indices[support_size:]
             support[session_id] = tuple(dd[support_indices] for dd in d)
@@ -227,6 +230,7 @@ def train_from_cfg(
     embed_steps_per_other_step: int = 5,  # How many other updates per embedding update
     model_save_path: str | None = None,
     random_sample_support: bool = False,  # Randomly sample support set instead of sequential
+    progress_job_id: str = None,  # Optional job ID for live progress notifications
 ):
     """
     One epoch over sessions with:
@@ -314,6 +318,7 @@ def train_from_cfg(
             _data_train,
             support_size=support_size,
             random_sample=random_sample_support,
+            train_set_size=cfg.training.train_set_size,
         )
 
         with torch.no_grad():
@@ -506,6 +511,17 @@ def train_from_cfg(
                 print(
                     "----", eidx, train_losses[-1][-1], loss, train_r2s[-1][-1], r2_test
                 )
+                
+                # Send progress update notification every test interval
+                if progress_job_id:
+                    try:
+                        import notifications
+                        notifications.update_progress_notification(
+                            progress_job_id,
+                            f"Epoch {eidx}/{epochs}\\nTrain Loss: {train_losses[-1][-1]:.4f} | Test Loss: {loss:.4f}\\nTrain R\u00b2: {train_r2s[-1][-1]:.4f} | Test R\u00b2: {r2_test:.4f}"
+                        )
+                    except Exception as e:
+                        pass  # Silently ignore notification errors
 
                 if r2_test < min_test_r2:
                     min_test_r2 = r2_test
@@ -528,6 +544,7 @@ def train_from_cfg(
             _data_train,
             support_size=support_size,
             random_sample=random_sample_support,
+            train_set_size=cfg.training.train_set_size,
         )
 
         model_optims.zero_grad(set_to_none=True)
@@ -627,6 +644,7 @@ def test_time_adaptation(
     support_size: int | None = None,
     quiet: bool = False,
     coadapt_embeddings: bool = False,
+    progress_job_id: str = None,  # Optional job ID for live progress notifications
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -673,7 +691,13 @@ def test_time_adaptation(
         )
 
     # Split into support/query if support_size is provided
-    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    # Note: In TTA, we don't limit train_set_size since we use all available adaptation data
+    data_for_adaptation, _ = split_support_query_sessions(
+        data_train, 
+        support_size=support_size,
+        random_sample=False,
+        train_set_size=None,
+    )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
     # AE warm start initialization using support data
@@ -889,6 +913,17 @@ def test_time_adaptation(
                             active_components.append('bases')
                     components_str = '+'.join(active_components)
                     print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
+                    
+                    # Send progress update notification
+                    if progress_job_id and outer_step % 500 == 0:  # Every 500 steps to avoid spam
+                        try:
+                            import notifications
+                            notifications.update_progress_notification(
+                                progress_job_id,
+                                f"TTA Progress: {outer_step}/{epochs}\\nLoss: {loss.item():.6f}\\nMode: {components_str}"
+                            )
+                        except Exception:
+                            pass  # Silently ignore notification errors
 
             else:
                 # Inner loop: optimize embeddings on data_for_adaptation
@@ -958,6 +993,17 @@ def test_time_adaptation(
                             active_components.append('bases')
                     components_str = '+'.join(active_components)
                     print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
+                    
+                    # Send progress update notification
+                    if progress_job_id and outer_step % 500 == 0:  # Every 500 steps to avoid spam
+                        try:
+                            import notifications
+                            notifications.update_progress_notification(
+                                progress_job_id,
+                                f"TTA Progress: {outer_step}/{epochs}\\nLoss: {loss.item():.6f}\\nMode: {components_str}"
+                            )
+                        except Exception:
+                            pass  # Silently ignore notification errors
 
         # Store final predictions for results (recompute with all sessions at once)
         if coadapt_embeddings or not optimize_embeddings:
