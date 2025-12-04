@@ -370,6 +370,7 @@ def gpu_worker(
                 )
                 
                 final_r2 = strategy_results["final_test_r2"]
+                per_session_r2s = strategy_results.get("final_test_r2s", {})
                 
                 # Save adapted model
                 if output_dir is not None:
@@ -408,6 +409,7 @@ def gpu_worker(
                     "support_size": support_size,
                     "strategy": strategy_key,
                     "r2": final_r2,
+                    "per_session_r2s": per_session_r2s,
                     "gpu_id": gpu_id,
                 })
                 
@@ -807,7 +809,7 @@ def train_vanilla_tbfm(
     epochs: int,
     device: str,
     quiet: bool = False
-) -> float:
+) -> Tuple[float, Dict[str, float]]:
     """
     Train a vanilla (single-session) TBFM model on the support set.
 
@@ -823,7 +825,7 @@ def train_vanilla_tbfm(
         quiet: If True, suppress progress messages
 
     Returns:
-        final_test_r2: R² score on test set
+        Tuple of (final_test_r2, per_session_r2s_dict)
     """
     from torcheval.metrics.functional import r2_score
     from tbfm import tbfm as tbfm_module
@@ -947,11 +949,14 @@ def train_vanilla_tbfm(
     
     # Average R² across all sessions
     final_test_r2 = sum(session_r2s) / len(session_r2s) if session_r2s else 0.0
+    
+    # Create per-session R² dict (using session IDs from data_support)
+    per_session_r2s = {session_id: r2 for session_id, r2 in zip(data_support.keys(), session_r2s)}
 
     if not quiet:
         print(f"Vanilla TBFM training complete. Average test R² across {len(session_r2s)} sessions: {final_test_r2:.4f}")
 
-    return final_test_r2
+    return final_test_r2, per_session_r2s
 
 
 def train_fresh_tbfm_no_multisession(
@@ -962,7 +967,7 @@ def train_fresh_tbfm_no_multisession(
     epochs: int,
     device: str,
     quiet: bool = False
-) -> float:
+) -> Tuple[float, Dict[str, float]]:
     """
     Train fresh TBFM models from scratch per session (no multisession features).
 
@@ -980,7 +985,7 @@ def train_fresh_tbfm_no_multisession(
         quiet: If True, suppress progress messages
 
     Returns:
-        final_test_r2: Average R² score across all sessions
+        Tuple of (final_test_r2, per_session_r2s_dict)
     """
     from torcheval.metrics.functional import r2_score
 
@@ -1094,11 +1099,14 @@ def train_fresh_tbfm_no_multisession(
     
     # Average R² across all sessions
     final_test_r2 = sum(session_r2s) / len(session_r2s) if session_r2s else 0.0
+    
+    # Create per-session R² dict (using session IDs from data_support)
+    per_session_r2s = {session_id: r2 for session_id, r2 in zip(data_support.keys(), session_r2s)}
 
     if not quiet:
         print(f"Fresh TBFM training complete. Average test R² across {len(session_r2s)} sessions: {final_test_r2:.4f}")
 
-    return final_test_r2
+    return final_test_r2, per_session_r2s
 
 
 def run_tta_sweep_multi_gpu(
@@ -1264,6 +1272,7 @@ def run_tta_sweep_multi_gpu(
                         support_size = result["support_size"]
                         strategy_key = result["strategy"]
                         final_r2 = result["r2"]
+                        per_session_r2s = result.get("per_session_r2s", {})
                         gpu_id = result["gpu_id"]
                         
                         tta_comparison[model_key][strategy_key].append((support_size, final_r2))
@@ -1272,6 +1281,7 @@ def run_tta_sweep_multi_gpu(
                             "support_size": support_size,
                             "strategy": strategy_key,
                             "r2": final_r2,
+                            "per_session_r2s": per_session_r2s,
                         })
                         
                         strategy_label = tta_strategies[strategy_key]["label"]
@@ -1637,11 +1647,13 @@ def run_tta_sweep(
                 # Store results
                 final_r2 = strategy_results["final_test_r2"]
                 tta_comparison[model_key][strategy_key].append((support_size, final_r2))
+                per_session_r2s = strategy_results.get("final_test_r2s", {})
                 tta_runs.append({
                     "model": model_key,
                     "support_size": support_size,
                     "strategy": strategy_key,
                     "r2": final_r2,
+                    "per_session_r2s": per_session_r2s,
                 })
 
                 # Save adapted model
@@ -1727,7 +1739,7 @@ def run_tta_sweep(
 
 
 def save_results(results: Dict, output_dir: Path):
-    """Save results to JSON file."""
+    """Save results to JSON file and per-session R² scores to CSV."""
     timestamp = results["metadata"]["timestamp"]
     json_path = output_dir / f"tta_support_{timestamp}.json"
 
@@ -1735,7 +1747,55 @@ def save_results(results: Dict, output_dir: Path):
         json.dump(results, f, indent=2)
 
     print(f"Results saved to: {json_path}")
+    
+    # Save per-session R² scores to CSV
+    csv_path = output_dir / f"tta_support_{timestamp}_per_session.csv"
+    save_per_session_csv(results, csv_path)
+    
     return json_path
+
+
+def save_per_session_csv(results: Dict, csv_path: Path):
+    """Save per-session R² scores to CSV file."""
+    rows = []
+    
+    for run in results["runs"]:
+        model = run["model"]
+        support_size = run["support_size"]
+        strategy = run["strategy"]
+        overall_r2 = run["r2"]
+        per_session_r2s = run.get("per_session_r2s", {})
+        
+        if per_session_r2s:
+            # Create a row for each session
+            for session_id, session_r2 in per_session_r2s.items():
+                rows.append({
+                    "model": model,
+                    "strategy": strategy,
+                    "support_size": support_size,
+                    "session_id": session_id,
+                    "session_r2": session_r2,
+                    "overall_r2": overall_r2,
+                })
+        else:
+            # No per-session data, just record the overall
+            rows.append({
+                "model": model,
+                "strategy": strategy,
+                "support_size": support_size,
+                "session_id": "(overall)",
+                "session_r2": overall_r2,
+                "overall_r2": overall_r2,
+            })
+    
+    if rows:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            fieldnames = ["model", "strategy", "support_size", "session_id", "session_r2", "overall_r2"]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        
+        print(f"Per-session R² scores saved to: {csv_path}")
 
 
 def plot_results(results: Dict, output_dir: Path, show: bool = False):
