@@ -12,6 +12,7 @@ from typing import Dict, Tuple, List
 from . import ae
 from . import dataset
 from . import meta
+from . import flow_ae  # Normalizing flow autoencoder support
 from . import normalizers
 from . import tbfm
 from . import utils
@@ -28,6 +29,15 @@ def build_from_cfg(
     quiet=False,
     device=None,
 ):
+    """
+    Build complete multisession TBFM model from config.
+
+    Autoencoder type is determined by cfg.ae.module._target_:
+    - tbfm.ae.LinearChannelAE: Linear tied-weight autoencoder (default)
+    - tbfm.flow_ae.FlowChannelAE: Normalizing flow autoencoder (invertible)
+
+    To use flow autoencoder, set: ae=flow in config or overrides.
+    """
     latent_dim = cfg.latent_dim
 
     with torch.no_grad():
@@ -37,6 +47,9 @@ def build_from_cfg(
         norms = normalizers.from_cfg(cfg, session_data, device=device)
 
         # Autoencoders ------
+        # Note: ae.from_cfg_and_data uses Hydra instantiate, which respects
+        # cfg.ae.module._target_ to determine which autoencoder class to create.
+        # This allows seamless switching between LinearChannelAE and FlowChannelAE.
         if not quiet:
             print("Building and warm starting AEs...")
         aes = ae.from_cfg_and_data(
@@ -87,7 +100,7 @@ def save_model(model, path, tbfm_only=True):
         torch.save(model_tbfm.state_dict(), path)
 
 
-def get_optims(cfg, model_ms: TBFMMultisession):
+def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     optims_norms = tuple()
     if cfg.normalizers.training.coadapt:
         raise NotImplementedError("No normalizer adaptation yet")
@@ -144,6 +157,18 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         if optim_meta is not None:
             meta_optims.append(optim_meta)
 
+    # Add embeddings optimizer if co-adapting
+    embed_optims = []
+    if embeddings_stim is not None:
+        embed_lr = cfg.meta.training.optim.lr
+        embed_wd = cfg.meta.training.optim.weight_decay
+        embed_optim = torch.optim.AdamW(
+            list(embeddings_stim.values()), 
+            lr=embed_lr, 
+            weight_decay=embed_wd
+        )
+        embed_optims.append(embed_optim)
+
     # Create named optimizer groups
     groups = {
         "norm": {"optimizers": optims_norms, "schedulers": []},
@@ -151,6 +176,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
         "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
         "meta": {"optimizers": meta_optims, "schedulers": []},
+        "embed": {"optimizers": embed_optims, "schedulers": []},
     }
 
     return utils.OptimCollection(groups)
@@ -162,12 +188,24 @@ def get_optims(cfg, model_ms: TBFMMultisession):
 def split_support_query_sessions(
     data_train,
     support_size: int,
+    random_sample: bool = False,
+    train_set_size: int | None = None,
 ):
     support = {}
     query = {}
     for session_id, d in data_train.items():
-        support[session_id] = tuple(dd[:support_size] for dd in d)
-        query[session_id] = tuple(dd[support_size:] for dd in d)
+        if random_sample:
+            n_samples = len(d[0])
+            # Limit to train_set_size if specified
+            effective_size = min(train_set_size, n_samples) if train_set_size else n_samples
+            indices = torch.randperm(effective_size)
+            support_indices = indices[:support_size]
+            query_indices = indices[support_size:]
+            support[session_id] = tuple(dd[support_indices] for dd in d)
+            query[session_id] = tuple(dd[query_indices] for dd in d)
+        else:
+            support[session_id] = tuple(dd[:support_size] for dd in d)
+            query[session_id] = tuple(dd[support_size:] for dd in d)
 
     return support, query
 
@@ -178,6 +216,7 @@ def train_from_cfg(
     data_train,  # yields per-session batches (stiminds, runways, y)
     model_optims,
     embeddings_rest,
+    embeddings_stim=None,  # Pre-initialized embeddings for co-adaptation
     data_test=None,
     epochs: int = 10000,
     test_interval: int | None = None,
@@ -188,20 +227,25 @@ def train_from_cfg(
     bw_steps_per_bg_step: (
         int | None
     ) = None,  # How many basis weight updates per basis update
+    embed_steps_per_other_step: int = 5,  # How many other updates per embedding update
     model_save_path: str | None = None,
+    random_sample_support: bool = False,  # Randomly sample support set instead of sequential
+    progress_job_id: str = None,  # Optional job ID for live progress notifications
 ):
     """
     One epoch over sessions with:
-      - inner loop on support to adapt stim_embed (per-episode latent)
+      - inner loop on support to adapt stim_embed (per-episode latent) OR co-adaptation
       - outer update on query for shared params
       - slow AE updates every step (small lr)
       - optional alternating updates: update basis weights more frequently than basis generator
+      - optional co-adaptation of embeddings instead of inner loop
 
     Alternating updates rationale:
       - Basis weights have large gradients and adapt quickly
       - Basis generator (Bases) changes more slowly
       - By updating basis weights N times per basis generator update, we let the
         weighting layer stabilize to the current bases before changing the bases
+      - When co-adapting embeddings, alternate between embeddings and other parameters
 
     Notes:
       • To add EMA for AE: keep a shadow copy of AE params and update with EMA after each optimizer.step().
@@ -209,6 +253,8 @@ def train_from_cfg(
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
     use_meta = cfg.tbfm.module.use_meta_learning
+    coadapt_embeddings = cfg.meta.training.coadapt if use_meta else False
+    embed_steps_per_other_step = embed_steps_per_other_step or cfg.meta.training.get('embed_steps_per_other_step', 5)
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
@@ -219,7 +265,23 @@ def train_from_cfg(
     lambda_cov = cfg.ae.two_stage.lambda_cov
     device = model.device
 
+    # Initialize embeddings_stim as trainable parameters if co-adapting
+    if embeddings_stim is None and use_meta and coadapt_embeddings:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
     embeddings_stim = None  # default
+    if use_meta:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
+
     iter_train = iter(data_train)
 
     train_losses = []
@@ -255,6 +317,8 @@ def train_from_cfg(
         support, query = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
+            train_set_size=cfg.training.train_set_size,
         )
 
         with torch.no_grad():
@@ -262,20 +326,37 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
-        if use_meta:
+        use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+        support_contexts = None
+
+        if use_meta and not coadapt_embeddings:
             model.eval()
-            embeddings_stim = meta.inner_update_stopgrad(
-                model,
-                support,
-                embeddings_rest,
-                cfg,
-            )
+            if use_hypernetwork:
+                # Hypernetwork mode: encode support set to contexts (single forward pass)
+                support_contexts = meta.hypernetwork_adapt(
+                    model,
+                    support,
+                    embeddings_rest,
+                    cfg,
+                )
+                embeddings_stim = None  # Not used in hypernetwork mode
+            else:
+                # MAML mode: optimize embeddings via gradient descent
+                embeddings_stim = meta.inner_update_stopgrad(
+                    model,
+                    support,
+                    embeddings_rest,
+                    cfg,
+                )
             model.train()
 
         model_optims.zero_grad(set_to_none=True)
 
         yhat_query = model(
-            query, embeddings_rest=embeddings_rest, embeddings_stim=embeddings_stim
+            query,
+            embeddings_rest=embeddings_rest,
+            embeddings_stim=embeddings_stim,
+            support_contexts=support_contexts,
         )
 
         losses = {}
@@ -284,11 +365,13 @@ def train_from_cfg(
             _loss = nn.MSELoss()(yhat_query[sid], y)
             losses[sid] = _loss
 
-            r2_train = r2_score(
-                yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1),
-                y.permute(0, 2, 1).flatten(end_dim=1),
-            )
-            r2_trains.append(r2_train.item())
+            yhat_flat = yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1)
+            y_flat = y.permute(0, 2, 1).flatten(end_dim=1)
+            if yhat_flat.shape[0] >= 2:
+                r2_train = r2_score(yhat_flat, y_flat)
+                r2_trains.append(r2_train.item())
+            else:
+                r2_trains.append(0.0)
 
         cur_loss = sum(losses.values()) / len(y_query)
         train_losses.append((eidx, cur_loss.item()))
@@ -377,12 +460,29 @@ def train_from_cfg(
             # Otherwise, only update basis weights
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
-            if update_basis_gen:
-                # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
-                model_optims.step(skip=skip_groups)
+            if coadapt_embeddings:
+                # When co-adapting embeddings, alternate between embeddings and other params
+                update_embeddings = (eidx % embed_steps_per_other_step) == 0 or eidx < 200
+                
+                if update_embeddings and update_basis_gen:
+                    # Update everything minus frozen groups
+                    model_optims.step(skip=skip_groups)
+                elif update_embeddings:
+                    # Update embeddings and basis weights, skip basis gen and meta
+                    model_optims.step(skip=["bg", "meta"] + skip_groups)
+                elif update_basis_gen:
+                    # Update basis gen and meta, skip embeddings
+                    model_optims.step(skip=["embed"] + skip_groups)
+                else:
+                    # Update basis weights only, skip basis gen, meta, and embeddings
+                    model_optims.step(skip=["bg", "meta", "embed"] + skip_groups)
             else:
-                # Update only basis weights (skip basis gen and meta) minus frozen groups
-                model_optims.step(skip=["bg", "meta"] + skip_groups)
+                if update_basis_gen:
+                    # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
+                    model_optims.step(skip=skip_groups)
+                else:
+                    # Update only basis weights (skip basis gen and meta) minus frozen groups
+                    model_optims.step(skip=["bg", "meta"] + skip_groups)
         else:
             model_optims.step(skip=skip_groups)
 
@@ -401,6 +501,7 @@ def train_from_cfg(
                     cfg,
                     device,
                     track_per_session_r2=False,
+                    support_contexts=support_contexts,
                 )
 
                 loss = test_results["loss"]
@@ -410,6 +511,17 @@ def train_from_cfg(
                 print(
                     "----", eidx, train_losses[-1][-1], loss, train_r2s[-1][-1], r2_test
                 )
+                
+                # Send progress update notification every test interval
+                if progress_job_id:
+                    try:
+                        import notifications
+                        notifications.update_progress_notification(
+                            progress_job_id,
+                            f"Epoch {eidx}/{epochs}\\nTrain Loss: {train_losses[-1][-1]:.4f} | Test Loss: {loss:.4f}\\nTrain R\u00b2: {train_r2s[-1][-1]:.4f} | Test R\u00b2: {r2_test:.4f}"
+                        )
+                    except Exception as e:
+                        pass  # Silently ignore notification errors
 
                 if r2_test < min_test_r2:
                     min_test_r2 = r2_test
@@ -421,6 +533,8 @@ def train_from_cfg(
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
     use_meta = cfg.tbfm.module.use_meta_learning
+    use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+
     if use_meta:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
@@ -429,16 +543,31 @@ def train_from_cfg(
         support, _ = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
+            train_set_size=cfg.training.train_set_size,
         )
 
         model_optims.zero_grad(set_to_none=True)
-        embeddings_stim = meta.inner_update_stopgrad(
-            model,
-            support,
-            embeddings_rest,
-            cfg,
-            inner_steps=(3 * cfg.meta.training.inner_steps),
-        )
+
+        if use_hypernetwork:
+            # Final hypernetwork encoding
+            support_contexts = meta.hypernetwork_adapt(
+                model,
+                support,
+                embeddings_rest,
+                cfg,
+            )
+            embeddings_stim = None
+        else:
+            # Final MAML adaptation
+            embeddings_stim = meta.inner_update_stopgrad(
+                model,
+                support,
+                embeddings_rest,
+                cfg,
+                inner_steps=(3 * cfg.meta.training.inner_steps),
+            )
+            support_contexts = None
 
     # Final test evaluation
     model_optims.zero_grad(set_to_none=True)
@@ -453,6 +582,7 @@ def train_from_cfg(
             cfg,
             device,
             track_per_session_r2=True,
+            support_contexts=support_contexts,
         )
 
         loss = final_test_results["loss"]
@@ -513,6 +643,8 @@ def test_time_adaptation(
     embeddings_stim=None,
     support_size: int | None = None,
     quiet: bool = False,
+    coadapt_embeddings: bool = False,
+    progress_job_id: str = None,  # Optional job ID for live progress notifications
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -528,11 +660,16 @@ def test_time_adaptation(
         adapt_ae: If True, optimize the autoencoder weights
         embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
         support_size: Override cfg.meta.training.support_size if provided.
+        quiet: If True, suppress progress messages
+        coadapt_embeddings: If True, optimize embeddings jointly with AE parameters
 
     Returns:
         embeddings_stim: Session embeddings (optimized or provided)
         results: Dict with test metrics
     """
+
+    if coadapt_embeddings:
+        Warning("TTA with co-adaptation of embeddings is likely to yield poor performance.")
 
     # Set model to eval mode; keep AE in train mode if adapting it
     model.eval(ae=not adapt_ae)
@@ -554,7 +691,13 @@ def test_time_adaptation(
         )
 
     # Split into support/query if support_size is provided
-    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    # Note: In TTA, we don't limit train_set_size since we use all available adaptation data
+    data_for_adaptation, _ = split_support_query_sessions(
+        data_train, 
+        support_size=support_size,
+        random_sample=False,
+        train_set_size=None,
+    )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
     # AE warm start initialization using support data
@@ -575,15 +718,38 @@ def test_time_adaptation(
                     )
                     print(f"  Warm started AE for {session_id}")
 
-    # Determine if we need to optimize embeddings
+    # Determine if we need to optimize embeddings or use hypernetwork
     optimize_embeddings = embeddings_stim is None
+    use_hypernetwork = cfg.meta.use_hypernetwork if hasattr(cfg.meta, 'use_hypernetwork') else False
+    support_contexts = None
 
-    if optimize_embeddings and not adapt_ae:
-        # Only optimizing embeddings (not AE)
-        print("TTA: Optimizing embeddings...")
-        embeddings_stim, _ = meta.inner_update_stopgrad(
-            model,
-            data_for_adaptation,
+    # Initialize embeddings as trainable parameters if co-adapting (MAML mode only)
+    if optimize_embeddings and coadapt_embeddings and not use_hypernetwork:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {}
+        for session_id in embeddings_rest.keys():
+            emb = torch.randn(embed_dim_stim, device=device) * 0.1
+            emb.requires_grad = True
+            embeddings_stim[session_id] = emb
+
+    if optimize_embeddings and not adapt_ae and not coadapt_embeddings:
+        # Only adapting meta-learning component (not AE)
+        if use_hypernetwork:
+            # Hypernetwork mode: encode support set to contexts
+            print("TTA: Encoding support set with hypernetwork...")
+            support_contexts = meta.hypernetwork_adapt(
+                model,
+                data_for_adaptation,
+                embeddings_rest,
+                cfg,
+            )
+            embeddings_stim = None  # Not used in hypernetwork mode
+        else:
+            # MAML mode: optimize embeddings via gradient descent
+            print("TTA: Optimizing embeddings...")
+            embeddings_stim, _ = meta.inner_update_stopgrad(
+                model,
+                data_for_adaptation,
             embeddings_rest,
             cfg,
             inner_steps=epochs,
@@ -591,12 +757,14 @@ def test_time_adaptation(
         )
 
     # AE optimization (alone or jointly with embeddings)
-    # AE optimization using meta-learning approach
     if adapt_ae:
-        print("TTA: Meta-learning style AE optimization...")
+        if coadapt_embeddings:
+            print("TTA: Joint optimization of AE and embeddings...")
+        else:
+            print("TTA: Meta-learning style AE optimization...")
 
-        # Outer loop: adapt AE parameters
-        # Inner loop: adapt embeddings
+        # Outer loop: adapt AE parameters (and embeddings if co-adapting)
+        # Inner loop: adapt embeddings (only if not co-adapting)
         # Both loops use data_for_adaptation (the tiny support set)
 
         # Set up AE optimizers
@@ -611,68 +779,275 @@ def test_time_adaptation(
                 )
                 ae_optims.append(ae_optim)
 
-        print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
-        print(
-            f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
-        )
+        # Set up embeddings optimizer if co-adapting
+        embed_optim = None
+        if coadapt_embeddings and optimize_embeddings:
+            embed_params = [emb for emb in embeddings_stim.values()]
+            embed_optim = torch.optim.AdamW(
+                embed_params,
+                lr=cfg.meta.training.optim.lr,
+                weight_decay=cfg.meta.training.optim.weight_decay,
+            )
+
+        # Progressive unfreezing: add TBFM optimizers at high support sizes
+        tbfm_optims = {}
+        progressive_unfreezing_threshold = cfg.meta.training.get('progressive_unfreezing_threshold', 2000)
+        unfreeze_basis_weights = cfg.meta.training.get('unfreeze_basis_weights', False)
+        unfreeze_bases = cfg.meta.training.get('unfreeze_bases', False)
+        basis_weight_lr = cfg.meta.training.get('basis_weight_lr', 1e-5)
+        bases_lr = cfg.meta.training.get('bases_lr', 1e-6)
+        
+        enable_progressive_unfreezing = support_size >= progressive_unfreezing_threshold
+        
+        if enable_progressive_unfreezing and (unfreeze_basis_weights or unfreeze_bases):
+            print(f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})")
+            
+            for session_id in data_for_adaptation.keys():
+                tbfm_instance = model.model.instances.get(session_id)
+                if tbfm_instance is not None:
+                    params_to_optimize = []
+                    
+                    if unfreeze_basis_weights:
+                        # Add basis weighting parameters (fast adaptation)
+                        params_to_optimize.append({
+                            'params': tbfm_instance.basis_weighting.parameters(),
+                            'lr': basis_weight_lr,
+                            'name': 'basis_weights'
+                        })
+                        print(f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})")
+                    
+                    if unfreeze_bases:
+                        # Add basis generator parameters (slow adaptation)
+                        params_to_optimize.append({
+                            'params': tbfm_instance.bases.parameters(),
+                            'lr': bases_lr,
+                            'name': 'bases'
+                        })
+                        print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
+                    
+                    if params_to_optimize:
+                        # Use weight_decay if available, otherwise default to 1e-4
+                        wd = cfg.tbfm.training.optim.get('weight_decay', 
+                                                          cfg.tbfm.training.optim.get('wd_head', 1e-4))
+                        tbfm_optim = torch.optim.AdamW(
+                            params_to_optimize,
+                            weight_decay=wd,
+                        )
+                        tbfm_optims[session_id] = tbfm_optim
+
+        # Initialize variables for results
+        ys = None
+        yhat = None
+
+        if coadapt_embeddings:
+            print(f"  Running {epochs} joint optimization steps")
+            print(
+                f"  Using data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
+            )
+        else:
+            print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
+            print(
+                f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
+            )
 
         for outer_step in range(epochs):
-            # Inner loop: optimize embeddings on data_for_adaptation
-            embeddings_stim_adapted = meta.inner_update_stopgrad(
+            if coadapt_embeddings:
+                # Joint optimization: update both AE and embeddings together
+                # Process all sessions in one batched forward pass (like training)
+                for opt in ae_optims:
+                    opt.zero_grad()
+                if embed_optim:
+                    embed_optim.zero_grad()
+                for opt in tbfm_optims.values():
+                    opt.zero_grad()
+
+                # Forward pass with all sessions at once
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim,
+                )
+
+                # Normalize y values for loss computation
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
+                y_normalized = model.norms(y_data)
+
+                # Compute combined loss across all sessions
+                losses = {}
+                for sid, y in y_normalized.items():
+                    losses[sid] = nn.MSELoss()(yhat[sid], y)
+
+                loss = sum(losses.values()) / len(data_for_adaptation)
+                
+                # Add TBFM regularization if progressive unfreezing is enabled
+                if tbfm_optims:
+                    for sid in data_for_adaptation.keys():
+                        tbfm_instance = model.model.instances.get(sid)
+                        if tbfm_instance is not None:
+                            # Add Frobenius norm regularization for basis weights
+                            if unfreeze_basis_weights:
+                                weighting_reg = tbfm_instance.get_weighting_reg()
+                                loss += cfg.tbfm.training.lambda_fro * weighting_reg
+                            # Add orthogonality regularization for bases
+                            if unfreeze_bases:
+                                basis_reg = tbfm_instance.get_basis_rms_reg()
+                                loss += cfg.tbfm.training.lambda_ortho * basis_reg
+
+                # Single backward pass
+                loss.backward()
+
+                # Update parameters
+                for opt in ae_optims:
+                    opt.step()
+                if embed_optim:
+                    embed_optim.step()
+                for opt in tbfm_optims.values():
+                    opt.step()
+
+                if outer_step % 100 == 0 and not quiet:
+                    active_components = ['AE', 'embeddings'] if embed_optim else ['AE']
+                    if tbfm_optims:
+                        if unfreeze_basis_weights:
+                            active_components.append('basis_weights')
+                        if unfreeze_bases:
+                            active_components.append('bases')
+                    components_str = '+'.join(active_components)
+                    print(f"  Joint step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
+                    
+                    # Send progress update notification
+                    if progress_job_id and outer_step % 500 == 0:  # Every 500 steps to avoid spam
+                        try:
+                            import notifications
+                            notifications.update_progress_notification(
+                                progress_job_id,
+                                f"TTA Progress: {outer_step}/{epochs}\\nLoss: {loss.item():.6f}\\nMode: {components_str}"
+                            )
+                        except Exception:
+                            pass  # Silently ignore notification errors
+
+            else:
+                # Inner loop: optimize embeddings on data_for_adaptation
+                embeddings_stim_adapted = meta.inner_update_stopgrad(
+                    model,
+                    data_for_adaptation,
+                    embeddings_rest,
+                    cfg,
+                    inner_steps=inner_steps,
+                    quiet=True,
+                )
+
+                # Outer step: update AE (and TBFM if unfrozen) on data_for_adaptation using adapted embeddings
+                # Process all sessions in one batched forward pass (like training)
+                for opt in ae_optims:
+                    opt.zero_grad()
+                for opt in tbfm_optims.values():
+                    opt.zero_grad()
+
+                # Forward pass with all sessions at once
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim_adapted,
+                )
+
+                # Normalize y values for loss computation
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
+                y_normalized = model.norms(y_data)
+
+                # Compute combined loss across all sessions
+                losses = {}
+                for sid, y in y_normalized.items():
+                    losses[sid] = nn.MSELoss()(yhat[sid], y)
+
+                loss = sum(losses.values()) / len(data_for_adaptation)
+                
+                # Add TBFM regularization if progressive unfreezing is enabled
+                if tbfm_optims:
+                    for sid in data_for_adaptation.keys():
+                        tbfm_instance = model.model.instances.get(sid)
+                        if tbfm_instance is not None:
+                            # Add Frobenius norm regularization for basis weights
+                            if unfreeze_basis_weights:
+                                weighting_reg = tbfm_instance.get_weighting_reg()
+                                loss += cfg.tbfm.training.lambda_fro * weighting_reg
+                            # Add orthogonality regularization for bases
+                            if unfreeze_bases:
+                                basis_reg = tbfm_instance.get_basis_rms_reg()
+                                loss += cfg.tbfm.training.lambda_ortho * basis_reg
+
+                # Single backward pass
+                loss.backward()
+
+                # Update AE parameters
+                for opt in ae_optims:
+                    opt.step()
+                for opt in tbfm_optims.values():
+                    opt.step()
+
+                if outer_step % 100 == 0 and not quiet:
+                    active_components = ['AE']
+                    if tbfm_optims:
+                        if unfreeze_basis_weights:
+                            active_components.append('basis_weights')
+                        if unfreeze_bases:
+                            active_components.append('bases')
+                    components_str = '+'.join(active_components)
+                    print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{components_str}]")
+                    
+                    # Send progress update notification
+                    if progress_job_id and outer_step % 500 == 0:  # Every 500 steps to avoid spam
+                        try:
+                            import notifications
+                            notifications.update_progress_notification(
+                                progress_job_id,
+                                f"TTA Progress: {outer_step}/{epochs}\\nLoss: {loss.item():.6f}\\nMode: {components_str}"
+                            )
+                        except Exception:
+                            pass  # Silently ignore notification errors
+
+        # Store final predictions for results (recompute with all sessions at once)
+        if coadapt_embeddings or not optimize_embeddings:
+            with torch.no_grad():
+                yhat = model(
+                    data_for_adaptation,
+                    embeddings_rest=embeddings_rest,
+                    embeddings_stim=embeddings_stim,
+                )
+
+                y_data = {sid: data[2] for sid, data in data_for_adaptation.items()}
+                ys = model.norms(y_data)
+
+        # After outer loop, do final inner optimization for embeddings to return (if not co-adapting)
+        if not coadapt_embeddings:
+            embeddings_stim, _ = meta.inner_update_stopgrad(
                 model,
                 data_for_adaptation,
                 embeddings_rest,
                 cfg,
                 inner_steps=inner_steps,
-                quiet=True,
+                quiet=False,
             )
 
-            # Outer step: update AE on data_for_adaptation using adapted embeddings
-            for opt in ae_optims:
-                opt.zero_grad()
-
-            # Forward on data_for_adaptation with adapted embeddings
-            yhat = model(
-                data_for_adaptation,
-                embeddings_rest=embeddings_rest,
-                embeddings_stim=embeddings_stim_adapted,
+        if coadapt_embeddings:
+            components = ['AE', 'embeddings'] if embed_optim else ['AE']
+            if tbfm_optims:
+                if unfreeze_basis_weights:
+                    components.append('basis_weights')
+                if unfreeze_bases:
+                    components.append('bases')
+            print(
+                f"TTA: Joint optimization complete [{'+'.join(components)}]. Final loss: {loss.item():.6f}"
             )
-
-            # Normalize y values for loss computation (similar to train_from_cfg line 260)
-            # Note: inner_update_stopgrad already normalizes internally, so we only normalize here
-            y_data = {sid: d[2] for sid, d in data_for_adaptation.items()}
-            y_normalized = model.norms(y_data)
-
-            # Compute loss on data_for_adaptation
-            loss = 0
-            ys = {}
-            for session_id in data_for_adaptation.keys():
-                y = y_normalized[session_id]
-                loss += nn.MSELoss()(yhat[session_id], y)
-                ys[session_id] = y.detach()
-            loss = loss / len(data_for_adaptation)
-
-            # Backward and update AE
-            loss.backward()
-            for opt in ae_optims:
-                opt.step()
-
-            if outer_step % 1000 == 0 and not quiet:
-                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
-
-        # After outer loop, do final inner optimization for embeddings to return
-        embeddings_stim, _ = meta.inner_update_stopgrad(
-            model,
-            data_for_adaptation,
-            embeddings_rest,
-            cfg,
-            inner_steps=inner_steps,
-            quiet=False,
-        )
-
-        print(
-            f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
-        )
+        else:
+            components = ['AE']
+            if tbfm_optims:
+                if unfreeze_basis_weights:
+                    components.append('basis_weights')
+                if unfreeze_bases:
+                    components.append('bases')
+            print(
+                f"TTA: Meta-learning optimization complete [{'+'.join(components)}]."
+            )
     else:
         ys = None
         yhat = None
@@ -688,6 +1063,7 @@ def test_time_adaptation(
                 cfg,
                 device,
                 track_per_session_r2=True,
+                support_contexts=support_contexts,
             )
 
             r2_test = test_results["r2"]
@@ -741,7 +1117,7 @@ def load_stim_batched(
     batch_size=1000,
     window_size=184,
     session_subdir="torchraw",
-    data_dir="/home/mmattb/Projects/opto-coproc/data",
+    data_dir="/var/data/opto-coproc/",
     held_in_session_ids=None,
     num_held_out_sessions=10,
     unpack_stiminds=True,
@@ -768,7 +1144,7 @@ def load_stim_batched(
 
 
 def load_rest_embeddings(
-    session_ids, in_dir="data", in_subdir="embedding_rest", device=None
+    session_ids, in_dir="/var/data/opto-coproc/", in_subdir="embedding_rest", device=None
 ):
     """
     See meta.cache_rest_embeds.

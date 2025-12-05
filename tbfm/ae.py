@@ -2,9 +2,46 @@ import inspect
 import hydra.utils
 import torch
 import torch.nn as nn
-from typing import Optional, Union
+from typing import Optional, Union, Dict
+import numpy as np
+import scipy.spatial.distance
 
 from .utils import SessionDispatcher, rotate_session_from_batch
+
+
+def build_spatial_structures(node_position: Dict[int, tuple], mask_indices: Optional[list] = None):
+    """
+    Build spatial structures from electrode positions.
+
+    Args:
+        node_position: dict mapping node_id -> (x, y) coordinates
+        mask_indices: optional list of indices to subset (for sessions with missing channels)
+
+    Returns:
+        distance_matrix: (C, C) pairwise Euclidean distances
+        adjacency_matrix: (C, C) weighted adjacency (based on Gaussian kernel of distances)
+        spatial_coords: (C, 2) coordinate array
+    """
+    # Sort by node_id to ensure consistent ordering
+    sorted_ids = sorted(node_position.keys())
+
+    # If mask provided, filter to those indices
+    if mask_indices is not None:
+        sorted_ids = [sid for sid in sorted_ids if sid in mask_indices]
+
+    # Extract coordinates
+    spatial_coords = np.array([node_position[nid] for nid in sorted_ids])  # (C, 2)
+
+    # Compute pairwise Euclidean distance matrix
+    distance_matrix = scipy.spatial.distance.cdist(spatial_coords, spatial_coords, metric='euclidean')
+
+    # Build weighted adjacency using Gaussian kernel
+    # sigma is set to median distance to capture local structure
+    sigma = np.median(distance_matrix[distance_matrix > 0])
+    adjacency_matrix = np.exp(-distance_matrix**2 / (2 * sigma**2))
+    np.fill_diagonal(adjacency_matrix, 0)  # No self-connections
+
+    return distance_matrix, adjacency_matrix, spatial_coords
 
 
 class LinearChannelAE(nn.Module):
@@ -28,6 +65,7 @@ class LinearChannelAE(nn.Module):
         use_bias: bool = False,
         use_lora: bool = False,
         device=None,
+        use_spatial: bool = False,
     ):
         super().__init__()
         self.in_dim = in_dim
@@ -35,6 +73,7 @@ class LinearChannelAE(nn.Module):
         self.use_bias = use_bias
         self.use_lora = use_lora
         self.device = device
+        self.use_spatial = use_spatial
 
         # Encoder weight (global). Kaiming uniform works fine here.
         self.w_enc = nn.Parameter(torch.empty(latent_dim, in_dim).to(device))
@@ -48,13 +87,19 @@ class LinearChannelAE(nn.Module):
         else:
             self.b_enc = None
 
-        # Rank-1 LoRA (global directions); per-session you’ll scale with a scalar alpha if you want
+        # Rank-1 LoRA (global directions); per-session you'll scale with a scalar alpha if you want
         if use_lora:
             self.a = nn.Parameter(torch.zeros(latent_dim).to(device))  # left direction
             self.b = nn.Parameter(torch.zeros(in_dim).to(device))  # right direction
             # init tiny so base dominates
             nn.init.normal_(self.a, std=1e-3)
             nn.init.normal_(self.b, std=1e-3)
+
+        # Spatial structures (registered buffers, not learnable parameters)
+        if use_spatial:
+            self.register_buffer('adjacency_matrix', None)
+            self.register_buffer('distance_matrix', None)
+            self.register_buffer('laplacian_matrix', None)
 
     def pca_warm_start(
         self,
@@ -108,6 +153,140 @@ class LinearChannelAE(nn.Module):
             m_dim = max(d1, d2)
             i = torch.eye(m_dim)
             self.w_enc[:] = i[:d1, :d2]
+
+    def register_spatial_structure(
+        self,
+        node_position: Dict[int, tuple],
+        mask_indices: Optional[list] = None
+    ):
+        """
+        Register spatial structure from electrode positions.
+
+        Args:
+            node_position: dict mapping node_id -> (x, y) coordinates
+            mask_indices: optional list of indices for present channels
+        """
+        if not self.use_spatial:
+            raise ValueError("use_spatial=False, cannot register spatial structure")
+
+        # Build spatial structures
+        dist_mat, adj_mat, coords = build_spatial_structures(node_position, mask_indices)
+
+        # Compute graph Laplacian: L = D - A
+        # where D is degree matrix (diagonal with row sums of A)
+        degree = np.sum(adj_mat, axis=1)
+        laplacian = np.diag(degree) - adj_mat
+
+        # Convert to torch tensors and register as buffers
+        self.adjacency_matrix = torch.from_numpy(adj_mat).float().to(self.device)
+        self.distance_matrix = torch.from_numpy(dist_mat).float().to(self.device)
+        self.laplacian_matrix = torch.from_numpy(laplacian).float().to(self.device)
+
+    def spatial_smoothness_penalty(
+        self,
+        x: torch.Tensor,
+        laplacian: Optional[torch.Tensor] = None,
+        reduction: str = 'mean'
+    ) -> torch.Tensor:
+        """
+        Compute spatial smoothness penalty using graph Laplacian.
+        Penalizes differences between spatially adjacent electrodes.
+
+        Args:
+            x: (..., C) tensor of channel activations
+            laplacian: (C, C) graph Laplacian matrix. If None, uses self.laplacian_matrix
+            reduction: 'mean', 'sum', or 'none'
+
+        Returns:
+            Smoothness penalty scalar or tensor
+
+        The penalty is: x^T L x = sum_ij L_ij * x_i * x_j
+        which penalizes large differences between connected nodes.
+        """
+        if laplacian is None:
+            if self.laplacian_matrix is None:
+                raise ValueError("No Laplacian registered. Call register_spatial_structure first.")
+            laplacian = self.laplacian_matrix
+
+        # x: (..., C), L: (C, C)
+        # x^T L x for each sample
+        # Optimized: avoid einsum, use matrix multiplication
+        # xLx = sum((x @ L) * x, dim=-1)
+        xL = torch.matmul(x, laplacian)  # (..., C)
+        xLx = (xL * x).sum(dim=-1)  # (...,)
+
+        if reduction == 'mean':
+            return xLx.mean()
+        elif reduction == 'sum':
+            return xLx.sum()
+        else:
+            return xLx
+
+    def spatial_decoder_penalty(
+        self,
+        mask: Union[torch.Tensor, list],
+        lora_alpha: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Penalize decoder weights to encourage spatial smoothness.
+        Each decoder column should be spatially smooth (nearby electrodes have similar decoder weights).
+
+        Returns:
+            Penalty encouraging spatial smoothness in decoder weights
+        """
+        if self.laplacian_matrix is None:
+            raise ValueError("No Laplacian registered. Call register_spatial_structure first.")
+
+        _, w_dec_s, _ = self.session_mats(mask, lora_alpha)  # (C_s, latent_dim)
+
+        # For each latent dimension, penalize spatial roughness of decoder weights
+        # w_dec_s^T L w_dec_s, where rows are latent dims
+        # Optimized: compute L @ w_dec_s first, then use element-wise operations
+        Lw = torch.matmul(self.laplacian_matrix, w_dec_s)  # (C_s, latent_dim)
+        penalty = (w_dec_s * Lw).sum()  # sum of element-wise products = trace(W^T L W)
+
+        return penalty / (self.latent_dim * w_dec_s.shape[0])  # normalize
+
+    @staticmethod
+    def _indices_from_mask(mask: torch.Tensor) -> torch.Tensor:
+        # mask: (in_dim,) bool → indices where True
+        if mask.dtype == torch.bool:
+            return torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        elif mask.dtype in (torch.int32, torch.int64):
+            return mask
+        else:
+            raise ValueError("mask must be bool or int index tensor")
+
+    def session_mats(
+        self,
+        mask: Union[torch.Tensor, list],
+        lora_alpha: Optional[torch.Tensor] = None,
+    ):
+        """
+        Build session-specific encoder/decoder matrices by selecting present channels.
+        Optionally add rank-1 LoRA: W_s = w_sel + alpha * a_sel_outer
+
+        Returns:
+            w_enc_s: (latent_dim, C_s)
+            w_dec_s: (C_s, latent_dim)  (tied transpose)
+        """
+        if isinstance(mask, list):
+            idx = torch.tensor(mask, device=self.w_enc.device, dtype=torch.long)
+        else:
+            idx = self._indices_from_mask(mask).to(self.w_enc.device)
+
+        w_sel = self.w_enc[:, idx]  # (latent_dim, C_s); selected dims only
+
+        if self.use_lora and lora_alpha is not None:
+            # LoRA rank-1 update on the selected columns
+            a = self.a.view(self.latent_dim, 1)  # (latent_dim, 1)
+            b_sel = self.b[idx].view(1, -1)  # (1, C_s)
+            w_sel = w_sel + lora_alpha * (a @ b_sel)
+
+        # Tied decoder
+        w_enc_s = w_sel
+        w_dec_s = w_sel.t().contiguous()  # (C_s, latent_dim)
+        return w_enc_s, w_dec_s, idx
 
     def encode(
         self,

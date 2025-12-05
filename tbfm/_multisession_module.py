@@ -15,9 +15,12 @@ class TBFMMultisession(nn.Module):
         self.model = model
         self.device = device
 
-    def forward(self, data, embeddings_rest=None, embeddings_stim=None):
+    def forward(self, data, embeddings_rest=None, embeddings_stim=None, support_contexts=None):
         """
         data: {session_id: (runway, covariates, y)}
+        embeddings_rest: {session_id: rest_embedding}
+        embeddings_stim: {session_id: stim_embedding} (for MAML)
+        support_contexts: {session_id: context_vector} (for hypernetwork)
         """
         # Unpack runways
         runways = {sid: d[0] for sid, d in data.items()}
@@ -31,6 +34,7 @@ class TBFMMultisession(nn.Module):
             covariates,
             embeddings_rest=embeddings_rest,
             embeddings_stim=embeddings_stim,
+            support_contexts=support_contexts,
         )
 
         forecast_decoded = self.ae.decode(latent_forecast)

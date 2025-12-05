@@ -20,19 +20,42 @@ from tbfm import dataset
 from tbfm import meta
 from tbfm import multisession
 from tbfm import utils
+import notifications
 
-DATA_DIR = "/home/mmattb/Projects/opto-coproc/data"
+DATA_DIR = os.getenv("TBFM_DATA_DIR", "/var/data/opto-coproc/")
 
 OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc folder.
 EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
 
-def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
+def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
+         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False,
+         embed_dim_stim=None):
 
-    my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
-    if basis_residual_rank_in is not None:
-        my_out_dir += f"_rr{basis_residual_rank_in}"
+    if out_dir is None:
+        my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
+        if basis_residual_rank_in is not None:
+            my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
+
+        # Add train_size and shuffle to folder name
+        my_out_dir += f"_ts{train_size}"
+        if shuffle:
+            my_out_dir += "_shuffle"
+        
+        # Add hyperparameter info to folder name
+        if latent_dim is not None:
+            my_out_dir += f"_ld{latent_dim}"
+        if batch_size_per_session is not None:
+            my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
+        if residual_mlp_hidden is not None:
+            my_out_dir += f"_mlp{residual_mlp_hidden}"
+        if embed_dim_stim is not None:
+            my_out_dir += f"_eds{embed_dim_stim}"
+        if use_two_stage:
+            my_out_dir += "_2stage"
+    else:
+        my_out_dir = out_dir
 
     try:
         shutil.rmtree(my_out_dir)
@@ -86,8 +109,11 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
             "MonkeyJ_20160702_Session2_S1",
         ][:num_sessions]
 
-        MAX_BATCH_SIZE = 62500 // 4
-        batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        if batch_size_per_session is None:
+            MAX_BATCH_SIZE = 62500 // 8
+            batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        else:
+            batch_size = batch_size_per_session * num_sessions
     else:
         raise ValueError("blah")
 
@@ -100,7 +126,7 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         batch_size=batch_size,
         num_held_out_sessions=NUM_HELD_OUT_SESSIONS,
     )
-    data_train, data_test = d.train_test_split(5000, test_cut=2500)
+    data_train, data_test = d.train_test_split(train_size, test_cut=2500)
 
     held_in_session_ids = data_train.session_ids
 
@@ -155,7 +181,7 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         cfg.tbfm.training.lambda_fro = 60.0
 
     cfg.training.epochs = 12001
-    cfg.latent_dim = 85
+    cfg.latent_dim = latent_dim if latent_dim is not None else 85
     cfg.tbfm.module.num_bases = num_bases
     cfg.ae.training.lambda_ae_recon = 0.03
     cfg.ae.use_two_stage = False
@@ -170,21 +196,74 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         cfg.meta.is_basis_residual = True
         cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
         cfg.meta.training.lambda_l2 = 1e-2
+        if residual_mlp_hidden is not None:
+            cfg.meta.residual_mlp_hidden = residual_mlp_hidden
+    
+    # Set stim embedding dimension if provided
+    if embed_dim_stim is not None:
+        cfg.tbfm.module.embed_dim_stim = embed_dim_stim
+    
+    cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
-    model_optims = multisession.get_optims(cfg, ms)
 
+    # Initialize trainable stim embeddings for co-adaptation if enabled
+    if cfg.meta.training.coadapt:
+        embed_dim_stim = ms.model.bases.embed_dim_stim
+        embeddings_stim_init = {}
+        for session_id in held_in_session_ids:
+            emb = torch.randn(embed_dim_stim, device=DEVICE) * 0.1
+            emb.requires_grad = True
+            embeddings_stim_init[session_id] = emb
+    else:
+        embeddings_stim_init = None
+
+    model_optims = multisession.get_optims(cfg, ms, embeddings_stim=embeddings_stim_init)
+
+    # Create progress notification
+    model_name = f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in or 0}"
+    job_id = None
+    try:
+        job_id = notifications.create_progress_notification(
+            job_id=f"train_{model_name}",
+            title=f"Training {model_name}",
+            initial_message=f"Starting {cfg.training.epochs} epochs with {num_sessions} sessions..."
+        )
+    except Exception as e:
+        print(f"Failed to create progress notification: {e}")
+    
     embeddings_stim, results = multisession.train_from_cfg(
         cfg,
         ms,
         data_train,
         model_optims,
         embeddings_rest,
+        embeddings_stim=embeddings_stim_init,
         data_test=data_test,
         test_interval=1000,
         epochs=cfg.training.epochs,
+        random_sample_support=shuffle,
+        progress_job_id=job_id,
     )
 
+    # Save hyperparameters for TTA evaluation
+    hyperparameters = {
+        'num_bases': num_bases,
+        'num_sessions': num_sessions,
+        'latent_dim': cfg.latent_dim,
+        'basis_residual_rank': cfg.meta.basis_residual_rank if cfg.meta.is_basis_residual else None,
+        'residual_mlp_hidden': cfg.meta.residual_mlp_hidden if cfg.meta.is_basis_residual else None,
+        'embed_dim_stim': cfg.tbfm.module.embed_dim_stim,
+        'embed_dim_rest': cfg.tbfm.module.embed_dim_rest,
+        'is_basis_residual': cfg.meta.is_basis_residual,
+        'coadapt': coadapt,
+        'train_size': train_size,
+        'shuffle': shuffle,
+        'batch_size_per_session': batch_size_per_session,
+        'use_two_stage': use_two_stage,
+    }
+    torch.save(hyperparameters, os.path.join(my_out_dir, "hyperparameters.torch"))
+    
     torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
     torch.save(results, os.path.join(my_out_dir, "r.torch"))
     torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi.torch"))
@@ -250,18 +329,83 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         plt.clf()
 
     graph_for_sid("MonkeyJ_20160426_Session2_S1", results, cidx=30)
+    
+    # Send completion notification
+    try:
+        final_train_r2 = results["train_r2s"][-1][1] if results.get("train_r2s") else None
+        final_test_r2 = results["test_r2s"][-1][1] if results.get("test_r2s") else None
+        
+        # Complete progress notification if it was created
+        if job_id:
+            notifications.complete_progress_notification(
+                job_id,
+                final_message=f"Training complete!\nTrain R²: {final_train_r2:.4f}\nTest R²: {final_test_r2:.4f}\nOutput: {my_out_dir}",
+                title="✓ Training Complete"
+            )
+        else:
+            # Fallback to regular notification
+            metrics = {
+                "train_r2": final_train_r2,
+                "test_r2": final_test_r2,
+            }
+            notifications.notify_training_complete(
+                model_name=f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in}",
+                metrics=metrics,
+                output_dir=my_out_dir
+            )
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
 
 
 if __name__ == "__main__":
     import sys
+    import argparse
 
-    basis_residual_rank = None
-    if len(sys.argv) > 4:
-        basis_residual_rank = int(sys.argv[4])
+    # Parse command line arguments with support for both positional and named arguments
+    parser = argparse.ArgumentParser(description='Train multisession TBFM model')
+    parser.add_argument('num_bases', type=int, help='Number of bases')
+    parser.add_argument('num_sessions', type=int, help='Number of training sessions')
+    parser.add_argument('gpu', type=str, help='GPU ID to use')
+    parser.add_argument('coadapt', type=str, nargs='?', default='false', help='Use co-adaptation (true/false)')
+    parser.add_argument('basis_residual_rank', type=str, nargs='?', default=None, help='Basis residual rank')
+    parser.add_argument('train_size', type=int, nargs='?', default=1000, help='Training set size')
+    parser.add_argument('shuffle', type=str, nargs='?', default='false', help='Shuffle support set (true/false)')
+    
+    # New hyperparameter arguments
+    parser.add_argument('--latent-dim', type=int, default=None, help='Latent dimension for autoencoder')
+    parser.add_argument('--batch-size-per-session', type=int, default=None, help='Batch size per session')
+    parser.add_argument('--residual-mlp-hidden', type=int, default=None, help='Hidden dimension for residual MLP')
+    parser.add_argument('--embed-dim-stim', type=int, default=None, help='Stim embedding dimension')
+    parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
+    parser.add_argument('--two-stage', action='store_true', help='Use two-stage autoencoder')
+    
+    args = parser.parse_args()
+    
+    # Parse boolean arguments
+    coadapt = args.coadapt.lower() == 'true'
+    shuffle = args.shuffle.lower() == 'true'
+    basis_residual_rank = int(args.basis_residual_rank) if args.basis_residual_rank and args.basis_residual_rank.isdigit() else None
 
-    main(
-        int(sys.argv[1]),
-        int(sys.argv[2]),
-        sys.argv[3],
-        basis_residual_rank_in=basis_residual_rank,
-    )
+    try:
+        main(
+            args.num_bases,
+            args.num_sessions,
+            args.gpu,
+            coadapt=coadapt,
+            basis_residual_rank_in=basis_residual_rank,
+            train_size=args.train_size,
+            shuffle=shuffle,
+            latent_dim=args.latent_dim,
+            batch_size_per_session=args.batch_size_per_session,
+            residual_mlp_hidden=args.residual_mlp_hidden,
+            out_dir=args.out_dir,
+            use_two_stage=args.two_stage,
+            embed_dim_stim=args.embed_dim_stim,
+        )
+    except Exception as e:
+        notifications.notify_error(
+            script_name="tma_standalone.py",
+            error=e,
+            context=f"Training {args.num_bases}_{args.num_sessions} on GPU {args.gpu}"
+        )
+        raise
