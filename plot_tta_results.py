@@ -477,6 +477,37 @@ def plot_results(
         print("No results found")
         return
 
+    # Combine duplicates globally across all files if requested
+    if combine_duplicates and len(all_results) > 1:
+        print(f"Combining duplicates across {len(all_results)} files...")
+        # Collect all runs from all files
+        all_runs = []
+        all_support_sizes_set = set()
+        all_adapt_sessions = []
+        for file_path, results in all_results:
+            all_runs.extend(results["runs"])
+            all_support_sizes_set.update(results["metadata"]["support_sizes"])
+            if results["metadata"]["adapt_sessions"]:
+                all_adapt_sessions.extend(results["metadata"]["adapt_sessions"])
+        
+        # Average duplicate runs
+        combined_runs = average_duplicate_runs(all_runs)
+        
+        # Create a single merged results entry
+        merged_results = {
+            "metadata": {
+                "support_sizes": sorted(all_support_sizes_set),
+                "adapt_sessions": sorted(set(all_adapt_sessions)),
+                "timestamp": "combined",
+                "source": "combined"
+            },
+            "runs": combined_runs
+        }
+        
+        # Replace all_results with single merged entry
+        all_results = [(file_paths[0], merged_results)]
+        print(f"Combined {len(all_runs)} runs into {len(combined_runs)} unique configurations")
+    
     # Collect all unique strategies, models, and support sizes
     all_strategies = set()
     all_models = set()
