@@ -81,6 +81,34 @@ def parse_log_file(log_path: Path) -> Dict:
             }
         )
 
+    # Parse vanilla TBFM baseline section
+    vanilla_section = re.search(r"Vanilla TBFM Baseline:(.*?)(?=\n\n|\nFresh TBFM|\Z)", content, re.DOTALL)
+    if vanilla_section:
+        vanilla_pattern = r"Support=\s*(\d+)\s+\|\s+R²=([+-]?\d+\.\d+)"
+        for match in re.finditer(vanilla_pattern, vanilla_section.group(1)):
+            support_size = int(match.group(1))
+            r2 = float(match.group(2))
+            results["runs"].append({
+                "strategy": "vanilla_tbfm",
+                "support_size": support_size,
+                "model": "vanilla_tbfm",
+                "r2": r2,
+            })
+
+    # Parse fresh TBFM baseline section
+    fresh_section = re.search(r"Fresh TBFM \(no multisession\) Baseline:(.*?)(?=\n\n|\Z)", content, re.DOTALL)
+    if fresh_section:
+        fresh_pattern = r"Support=\s*(\d+)\s+\|\s+R²=([+-]?\d+\.\d+)"
+        for match in re.finditer(fresh_pattern, fresh_section.group(1)):
+            support_size = int(match.group(1))
+            r2 = float(match.group(2))
+            results["runs"].append({
+                "strategy": "fresh_tbfm",
+                "support_size": support_size,
+                "model": "fresh_tbfm",
+                "r2": r2,
+            })
+
     return results
 
 
@@ -385,6 +413,8 @@ def aggregate_by_dimension(
             elif dimension == "training_strategy":
                 model_info = parse_model_name(model)
                 dim_value = model_info["training_strategy"]
+                if dim_value is None:
+                    continue
             elif dimension == "pretrain_sessions":
                 model_info = parse_model_name(model)
                 dim_value = model_info["pretrain_sessions"]
