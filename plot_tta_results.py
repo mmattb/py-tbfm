@@ -247,7 +247,7 @@ def parse_model_name(model: str) -> dict:
     Expected formats:
     - {num_bases}_{num_pretrain_sessions}_{training_strategy}: "50_25_coadapt"
     - ns{num_pretrain_sessions}_{training_strategy}: "ns25_coadapt", "ns5_maml"
-    - {n}kx{multiplier}_{training_strategy}: "1kx5_coadapt" -> 1000*5=5000 sessions
+    - {n}kx{sessions}_{training_strategy}: "1kx5_coadapt" -> 5 sessions (not 5000)
     - Baseline models: "vanilla_tbfm", "fresh_tbfm"
 
     Returns dict with: num_bases, pretrain_sessions, training_strategy, is_shuffle
@@ -263,11 +263,11 @@ def parse_model_name(model: str) -> dict:
         "is_shuffle": "shuffle" in model.lower()
     }
 
-    # Handle {n}kx{multiplier} format (e.g., "1kx5_coadapt" -> 5000 sessions)
+    # Handle {n}kx{sessions} format (e.g., "1kx5_coadapt" -> 5 sessions)
     if "kx" in parts[0]:
         kx_parts = parts[0].split("kx")
         if len(kx_parts) == 2 and kx_parts[0].isdigit() and kx_parts[1].isdigit():
-            result["pretrain_sessions"] = int(kx_parts[0]) * 1000 * int(kx_parts[1])
+            result["pretrain_sessions"] = int(kx_parts[1])
     # Handle ns{number} format (e.g., "ns25_coadapt", "ns5_maml")
     elif parts[0].startswith("ns") and parts[0][2:].isdigit():
         result["pretrain_sessions"] = int(parts[0][2:])
@@ -1204,6 +1204,9 @@ def generate_pretrain_size_plot(
                  fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.legend(fontsize=9, loc='best')
+    
+    # Set y-axis to start at 0
+    ax.set_ylim(bottom=0)
     
     # Set x-axis to show only the actual pretrain session counts
     pretrain_counts = sorted(df_filtered["Pretrain Sessions"].unique())
