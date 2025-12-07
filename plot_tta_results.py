@@ -244,8 +244,11 @@ def parse_model_name(model: str) -> dict:
     """
     Parse model name to extract components.
 
-    Expected format: {num_bases}_{num_pretrain_sessions}_{training_strategy}
-    Example: "50_25_coadapt" -> bases=50, pretrain_sessions=25, training_strategy="coadapt"
+    Expected formats:
+    - {num_bases}_{num_pretrain_sessions}_{training_strategy}: "50_25_coadapt"
+    - ns{num_pretrain_sessions}_{training_strategy}: "ns25_coadapt", "ns5_maml"
+    - {n}kx{multiplier}_{training_strategy}: "1kx5_coadapt" -> 1000*5=5000 sessions
+    - Baseline models: "vanilla_tbfm", "fresh_tbfm"
 
     Returns dict with: num_bases, pretrain_sessions, training_strategy, is_shuffle
     """
@@ -254,16 +257,32 @@ def parse_model_name(model: str) -> dict:
 
     parts = model.split("_")
     result = {
-        "num_bases": int(parts[0]) if parts[0].isdigit() else None,
-        "pretrain_sessions": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None,
+        "num_bases": None,
+        "pretrain_sessions": None,
         "training_strategy": None,
         "is_shuffle": "shuffle" in model.lower()
     }
 
-    # Find training strategy (last part that's a word)
-    if "coadapt" in model:
+    # Handle {n}kx{multiplier} format (e.g., "1kx5_coadapt" -> 5000 sessions)
+    if "kx" in parts[0]:
+        kx_parts = parts[0].split("kx")
+        if len(kx_parts) == 2 and kx_parts[0].isdigit() and kx_parts[1].isdigit():
+            result["pretrain_sessions"] = int(kx_parts[0]) * 1000 * int(kx_parts[1])
+    # Handle ns{number} format (e.g., "ns25_coadapt", "ns5_maml")
+    elif parts[0].startswith("ns") and parts[0][2:].isdigit():
+        result["pretrain_sessions"] = int(parts[0][2:])
+    # Handle traditional numeric format (e.g., "50_25_coadapt")
+    elif parts[0].isdigit():
+        result["num_bases"] = int(parts[0])
+        if len(parts) > 1 and parts[1].isdigit():
+            result["pretrain_sessions"] = int(parts[1])
+
+    # Find training strategy (look through all parts)
+    if "coadapt" in model.lower():
         result["training_strategy"] = "coadapt"
-    elif "inner" in model:
+    elif "maml" in model.lower():
+        result["training_strategy"] = "maml"
+    elif "inner" in model.lower():
         result["training_strategy"] = "inner"
 
     return result
@@ -283,6 +302,7 @@ def get_display_name(value: str, dimension: str) -> str:
     if dimension == "training_strategy":
         mapping = {
             "inner": "MAML Trained",
+            "maml": "MAML Trained",
             "coadapt": "Coadapt Trained",
             "vanilla_tbfm": "Vanilla TBFM",
             "fresh_tbfm": "Fresh TBFM"
@@ -448,6 +468,7 @@ def plot_results(
     show: bool = False,
     plot_batch_size: bool = False,
     combine_duplicates: bool = True,
+    pretrain_support_sizes: Optional[List[int]] = None,
 ):
     """
     Create comparison plots from log and/or JSON files.
@@ -458,6 +479,7 @@ def plot_results(
     3. TTA strategy comparison
     4. Pretraining sessions comparison
     5. Batch size comparison (if plot_batch_size=True)
+    6. Pretrain sessions vs R² (if pretrain_support_sizes specified)
 
     Args:
         file_paths: List of log/JSON file paths to plot
@@ -465,6 +487,7 @@ def plot_results(
         show: Whether to display plot interactively
         combine_duplicates: If True, average duplicate runs with same (model, strategy, support_size)
         plot_batch_size: Whether to generate batch size comparison plot
+        pretrain_support_sizes: If specified, generate pretrain sessions vs R² plots for these support sizes
     """
     # Parse all files
     all_results = []
@@ -819,9 +842,18 @@ def plot_results(
         else:
             plt.close(fig_pretrain)
 
-    # 4. Pretrain size vs R² at specific support size
-    print("\nGenerating pretrain size vs R² comparison...")
-    generate_pretrain_size_plot(all_results, base_path, show=show)
+    # 4. Pretrain size vs R² at specific support sizes (if requested)
+    if pretrain_support_sizes is not None:
+        print("\nGenerating pretrain size vs R² comparison...")
+        # Generate comprehensive multi-panel plot if multiple sizes requested
+        if len(pretrain_support_sizes) > 1:
+            generate_pretrain_size_multiplot(all_results, base_path, support_sizes=pretrain_support_sizes, show=show)
+        # Generate individual plots for each requested support size
+        for support_sz in pretrain_support_sizes:
+            if support_sz in support_sizes:
+                generate_pretrain_size_plot(all_results, base_path, support_size=support_sz, show=show)
+            else:
+                print(f"Warning: Requested support size {support_sz} not found in data")
 
     # 4. Batch size comparison (if enabled)
     if plot_batch_size:
@@ -888,6 +920,168 @@ def plot_results(
     generate_slide_table(all_results, base_path)
 
 
+def generate_pretrain_size_multiplot(
+    all_results: List[Tuple[Path, Dict]], 
+    base_path: Path,
+    support_sizes: Optional[List[int]] = None,
+    show: bool = False
+):
+    """
+    Generate a multi-panel plot of pretrain session count vs R² for multiple support sizes.
+    
+    Creates a grid showing different support sizes.
+    
+    Args:
+        all_results: List of (file_path, results) tuples
+        base_path: Base path for saving the plot
+        support_sizes: List of support sizes to plot. If None, uses [100, 500, 1000, 2500, 5000]
+        show: Whether to display the plot
+    """
+    import pandas as pd
+    
+    # Collect all data with parsed model info
+    data = []
+    for file_path, results in all_results:
+        for run in results["runs"]:
+            model_info = parse_model_name(run["model"])
+            data.append({
+                "Model": run["model"],
+                "TTA Strategy": run["strategy"],
+                "Support Size": run["support_size"],
+                "R²": run["r2"],
+                "Training Strategy": model_info["training_strategy"],
+                "Pretrain Sessions": model_info["pretrain_sessions"],
+                "Is Shuffle": model_info["is_shuffle"],
+            })
+    
+    df = pd.DataFrame(data)
+    
+    # Extract baseline models for all support sizes
+    df_baselines = df[df["TTA Strategy"].isin(["vanilla_tbfm", "fresh_tbfm"])].copy()
+    baseline_r2_by_support = {}
+    if len(df_baselines) > 0:
+        for support_sz in df_baselines["Support Size"].unique():
+            baseline_r2_by_support[support_sz] = {}
+            for strategy in ["vanilla_tbfm", "fresh_tbfm"]:
+                baseline_subset = df_baselines[
+                    (df_baselines["Support Size"] == support_sz) & 
+                    (df_baselines["TTA Strategy"] == strategy)
+                ]
+                if len(baseline_subset) > 0:
+                    baseline_r2_by_support[support_sz][strategy] = baseline_subset["R²"].mean()
+    
+    # Remove baseline models
+    df_filtered = df[~df["TTA Strategy"].isin(["vanilla_tbfm", "fresh_tbfm"])].copy()
+    
+    # Remove rows with missing pretrain sessions
+    df_filtered = df_filtered[df_filtered["Pretrain Sessions"].notna()].copy()
+    
+    if len(df_filtered) == 0:
+        print("Warning: No pretrained models with session data found")
+        return
+    
+    # Get available support sizes
+    available_sizes = sorted(df_filtered["Support Size"].unique())
+    if support_sizes is None:
+        key_sizes = [sz for sz in [100, 500, 1000, 2500, 5000] if sz in available_sizes]
+    else:
+        key_sizes = [sz for sz in support_sizes if sz in available_sizes]
+    
+    if len(key_sizes) == 0:
+        print("Warning: No requested support sizes found in data")
+        return
+    
+    # Create subplot grid
+    n_plots = len(key_sizes)
+    n_cols = min(2, n_plots)
+    n_rows = (n_plots + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(8*n_cols, 6*n_rows), squeeze=False)
+    axes = axes.flatten()
+    
+    markers = ['o', 's', '^', 'v', 'D', 'p', '*', 'h']
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    
+    for plot_idx, support_size in enumerate(key_sizes):
+        ax = axes[plot_idx]
+        
+        # Filter for this support size
+        df_support = df_filtered[df_filtered["Support Size"] == support_size].copy()
+        
+        # Group by training strategy, TTA strategy, pretrain sessions, AND shuffle status, then average R²
+        grouped = df_support.groupby(
+            ["Training Strategy", "TTA Strategy", "Pretrain Sessions", "Is Shuffle"]
+        )["R²"].mean().reset_index()
+        
+        # Plot each combination of training strategy and TTA strategy
+        combo_idx = 0
+        for (train_strat, tta_strat), group in grouped.groupby(["Training Strategy", "TTA Strategy"]):
+            if train_strat is None:
+                continue
+            
+            train_display = get_display_name(train_strat, "training_strategy")
+            tta_display = get_display_name(tta_strat, "tta_strategy")
+            
+            # Separate shuffle and non-shuffle
+            group_non_shuffle = group[group["Is Shuffle"] == False].sort_values("Pretrain Sessions")
+            
+            marker = markers[combo_idx % len(markers)]
+            color = colors[combo_idx % len(colors)]
+            
+            # Plot non-shuffle models
+            if len(group_non_shuffle) > 0:
+                pretrain_sessions = group_non_shuffle["Pretrain Sessions"].values
+                r2_values = group_non_shuffle["R²"].values
+                label = f"{train_display} + {tta_display}"
+                ax.plot(pretrain_sessions, r2_values, marker=marker, linestyle='-',
+                        linewidth=2, markersize=8, label=label, color=color, alpha=0.8)
+            
+            combo_idx += 1
+        
+        # Add baseline horizontal lines for this support size
+        if support_size in baseline_r2_by_support:
+            pretrain_counts = sorted(df_support["Pretrain Sessions"].unique())
+            if len(pretrain_counts) > 0:
+                for strategy, r2_val in baseline_r2_by_support[support_size].items():
+                    display_name = "Vanilla TBFM" if strategy == "vanilla_tbfm" else "Fresh TBFM"
+                    linestyle = ':' if strategy == "vanilla_tbfm" else '--'
+                    ax.axhline(y=r2_val, color='gray', linestyle=linestyle, linewidth=2, 
+                              label=display_name if plot_idx == 0 else None, alpha=0.7, zorder=1)
+        
+        ax.set_xlabel('Pretraining Sessions', fontsize=11)
+        ax.set_ylabel('Test R²', fontsize=11)
+        ax.set_title(f'Support Size = {support_size}', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        
+        # Set x-axis to show only the actual pretrain session counts
+        pretrain_counts = sorted(df_support["Pretrain Sessions"].unique())
+        if len(pretrain_counts) > 0:
+            ax.set_xticks(pretrain_counts)
+            ax.set_xticklabels([str(int(c)) for c in pretrain_counts], rotation=45)
+        
+        # Only show legend on first plot
+        if plot_idx == 0:
+            ax.legend(fontsize=8, loc='best')
+    
+    # Hide unused subplots
+    for idx in range(n_plots, len(axes)):
+        axes[idx].set_visible(False)
+    
+    fig.suptitle('Pretraining Sessions vs R² Across Support Sizes', 
+                 fontsize=16, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    
+    # Save plot
+    multiplot_path = Path(str(base_path) + "_pretrain_sessions_multiplot.png")
+    fig.savefig(multiplot_path, dpi=200, bbox_inches='tight')
+    print(f"Pretrain sessions multiplot saved to: {multiplot_path}")
+    
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+
 def generate_pretrain_size_plot(
     all_results: List[Tuple[Path, Dict]], 
     base_path: Path,
@@ -927,7 +1121,17 @@ def generate_pretrain_size_plot(
     # Filter for the specific support size
     df_filtered = df[df["Support Size"] == support_size].copy()
     
-    # Remove baseline models
+    # Extract baseline models for horizontal lines
+    df_baselines = df[df["Support Size"] == support_size].copy()
+    df_baselines = df_baselines[df_baselines["TTA Strategy"].isin(["vanilla_tbfm", "fresh_tbfm"])].copy()
+    baseline_r2 = {}
+    if len(df_baselines) > 0:
+        for strategy in ["vanilla_tbfm", "fresh_tbfm"]:
+            baseline_subset = df_baselines[df_baselines["TTA Strategy"] == strategy]
+            if len(baseline_subset) > 0:
+                baseline_r2[strategy] = baseline_subset["R²"].mean()
+    
+    # Remove baseline models from main plot
     df_filtered = df_filtered[~df_filtered["TTA Strategy"].isin(["vanilla_tbfm", "fresh_tbfm"])].copy()
     
     # Remove rows with missing pretrain sessions
@@ -982,6 +1186,17 @@ def generate_pretrain_size_plot(
                     linewidth=2, markersize=12, label=label, color=color, alpha=0.5)
         
         combo_idx += 1
+    
+    # Add baseline horizontal lines
+    if baseline_r2:
+        pretrain_counts = sorted(df_filtered["Pretrain Sessions"].unique())
+        if len(pretrain_counts) > 0:
+            x_min, x_max = min(pretrain_counts), max(pretrain_counts)
+            for strategy, r2_val in baseline_r2.items():
+                display_name = "Vanilla TBFM" if strategy == "vanilla_tbfm" else "Fresh TBFM"
+                linestyle = ':' if strategy == "vanilla_tbfm" else '--'
+                ax.axhline(y=r2_val, color='gray', linestyle=linestyle, linewidth=2, 
+                          label=display_name, alpha=0.7, zorder=1)
     
     ax.set_xlabel('Number of Pretraining Sessions', fontsize=12)
     ax.set_ylabel('Test R²', fontsize=12)
@@ -1385,6 +1600,13 @@ def main():
         action="store_true",
         help="Generate batch size comparison plot (models must be named like 'bs500', 'bs625', etc.)",
     )
+    parser.add_argument(
+        "--pretrain-sessions",
+        type=int,
+        nargs="+",
+        metavar="SIZE",
+        help="Generate pretrain sessions vs R² plot for specified support size(s) (e.g., --pretrain-sessions 1000 2500)",
+    )
 
     args = parser.parse_args()
 
@@ -1399,7 +1621,8 @@ def main():
         output_path=args.output,
         show=args.show,
         combine_duplicates=not args.no_combine_duplicates,
-        plot_batch_size=args.batch_size)
+        plot_batch_size=args.batch_size,
+        pretrain_support_sizes=args.pretrain_sessions)
 
 
 if __name__ == "__main__":
