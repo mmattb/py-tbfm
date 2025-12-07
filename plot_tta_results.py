@@ -666,7 +666,7 @@ def plot_results(
         # Add some padding
         y_range = max_r2 - min_r2
         padding = max(0.05, y_range * 0.1)  # At least 0.05 or 10% of range
-        ax.set_ylim(bottom=min(min_r2 - padding, -0.5), top=max_r2 + padding)
+        ax.set_ylim(bottom=0, top=max_r2 + padding)
     else:
         ax.set_ylim(bottom=-0.5)
     
