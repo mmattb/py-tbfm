@@ -75,9 +75,10 @@ def parse_args():
     )
     parser.add_argument(
         "--adapt-session",
+        nargs="+",
         type=str,
         default=None,
-        help="Specific session ID to use for TTA adaptation (e.g., 'MonkeyG_20150914_Session1_S1')"
+        help="Specific session ID(s) to use for TTA adaptation (e.g., 'MonkeyG_20150914_Session1_S1' or multiple sessions)"
     )
     parser.add_argument(
         "--tta-epochs",
@@ -602,7 +603,7 @@ def get_model_paths() -> Dict[str, Path]:
         # "100_15_inner_ts5000": Path("test/100_15_rr16_inner_ts5000").resolve(),
         # "100_20_inner_ts5000": Path("test/100_20_rr16_inner_ts5000").resolve(),
         # "100_25_inner_ts5000": Path("test/100_25_rr16_inner_ts5000").resolve(),
-        "100_25_inner_ts5000_shuffle": Path("test/100_25_rr16_inner_ts5000_shuffle").resolve(),
+        # "100_25_inner_ts5000_shuffle": Path("test/100_25_rr16_inner_ts5000_shuffle").resolve(),
     }
 
 
@@ -672,7 +673,7 @@ def find_shared_held_out_sessions(held_out_sessions_map: Dict) -> List[str]:
 def select_adapt_sessions(
     shared_held_out_sessions: List[str],
     max_sessions: int,
-    specific_session: str = None
+    specific_session: List[str] = None
 ) -> List[str]:
     """
     Select adaptation sessions from shared held-out sessions.
@@ -682,25 +683,28 @@ def select_adapt_sessions(
     Args:
         shared_held_out_sessions: List of available held-out sessions
         max_sessions: Maximum number of sessions to select
-        specific_session: If provided, use this specific session ID
+        specific_session: If provided, use these specific session IDs (can be a list)
     """
     if specific_session:
-        # Verify the specific session exists and has cached embeddings
-        if specific_session not in shared_held_out_sessions:
-            raise ValueError(
-                f"Specified session '{specific_session}' is not in shared held-out sessions.\n"
-                f"Available sessions: {shared_held_out_sessions}"
-            )
+        # Handle both single session and list of sessions
+        session_list = specific_session if isinstance(specific_session, list) else [specific_session]
         
-        path = os.path.join(DATA_DIR, specific_session, EMBEDDING_REST_SUBDIR, "er.torch")
-        if not os.path.exists(path):
-            raise ValueError(
-                f"Specified session '{specific_session}' does not have cached rest embeddings at {path}"
-            )
+        # Validate all specified sessions
+        for sid in session_list:
+            if sid not in shared_held_out_sessions:
+                raise ValueError(
+                    f"Specified session '{sid}' is not in shared held-out sessions.\n"
+                    f"Available sessions: {shared_held_out_sessions}"
+                )
+            
+            path = os.path.join(DATA_DIR, sid, EMBEDDING_REST_SUBDIR, "er.torch")
+            if not os.path.exists(path):
+                raise ValueError(
+                    f"Specified session '{sid}' does not have cached rest embeddings at {path}"
+                )
         
-        adapt_session_ids = [specific_session]
-        print(f"Using specified adaptation session: {specific_session}")
-        return adapt_session_ids
+        print(f"Using {len(session_list)} specified adaptation session(s): {session_list}")
+        return session_list
 
     # Original logic for auto-selection
     adapt_session_ids = []

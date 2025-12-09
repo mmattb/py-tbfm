@@ -911,6 +911,10 @@ def plot_results(
 
     print("\nAll comparison plots generated!")
 
+    # Generate per-session CSV
+    print("\nGenerating per-session results CSV...")
+    generate_per_session_csv(all_results, base_path)
+
     # Generate summary statistics table
     print("\nGenerating summary statistics table...")
     generate_summary_table(all_results, base_path)
@@ -1447,6 +1451,57 @@ def generate_slide_table(all_results: List[Tuple[Path, Dict]], base_path: Path):
     fig.savefig(table_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"Slide table saved to: {table_path}")
     plt.close(fig)
+
+
+def generate_per_session_csv(all_results: List[Tuple[Path, Dict]], base_path: Path):
+    """
+    Generate a CSV file with per-session R² results.
+
+    Args:
+        all_results: List of (file_path, results) tuples
+        base_path: Base path for saving the CSV
+    """
+    import pandas as pd
+
+    # Collect per-session data
+    data = []
+    for file_path, results in all_results:
+        for run in results["runs"]:
+            # Check if per_session_r2s exists in the run
+            if "per_session_r2s" in run and run["per_session_r2s"]:
+                for session_id, r2 in run["per_session_r2s"].items():
+                    data.append({
+                        "Model": run["model"],
+                        "Strategy": run["strategy"],
+                        "Support Size": run["support_size"],
+                        "Session ID": session_id,
+                        "R²": r2,
+                        "Overall R²": run["r2"]
+                    })
+
+    if not data:
+        print("No per-session results found in the data.")
+        return
+
+    df = pd.DataFrame(data)
+    
+    # Sort by model, strategy, support size, and session
+    df = df.sort_values(["Model", "Strategy", "Support Size", "Session ID"])
+
+    # Save to CSV
+    csv_path = Path(str(base_path) + "_per_session_results.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Per-session results CSV saved to: {csv_path}")
+    
+    # Print summary statistics
+    print(f"\nPer-session statistics:")
+    print(f"  Total per-session results: {len(df)}")
+    print(f"  Unique sessions: {df['Session ID'].nunique()}")
+    print(f"  Mean per-session R²: {df['R²'].mean():.4f}")
+    print(f"  Median per-session R²: {df['R²'].median():.4f}")
+    print(f"  Std Dev: {df['R²'].std():.4f}")
+    print(f"  Min R²: {df['R²'].min():.4f}")
+    print(f"  Max R²: {df['R²'].max():.4f}")
 
 
 def generate_summary_table(all_results: List[Tuple[Path, Dict]], base_path: Path):
