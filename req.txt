@@ -58,7 +58,6 @@ cattrs==25.3.0
 cbor==1.0.0
 certifi==2024.8.30
 cffi==1.14.2
-chardet==5.2.0
 charset-normalizer==2.0.4
 chex==0.1.86
 ci-info==0.3.0
@@ -86,7 +85,6 @@ dandischema==0.11.1
 dask==2023.11.0
 datashader==0.16.0
 debugpy==1.6.7
-decorator==4.4.2
 defusedxml==0.7.1
 Deprecated==1.2.18
 diff-match-patch==20200713
@@ -106,7 +104,6 @@ docutils==0.21.2
 edit-distance==1.0.6
 einops==0.8.0
 email_validator==2.2.0
-entrypoints==0.4
 et-xmlfile==1.1.0
 etelemetry==0.3.1
 etils==1.7.0
@@ -162,7 +159,6 @@ hydra-colorlog==1.2.0
 hydra-core==1.3.2
 hydra-submitit-launcher==1.2.0
 hyperframe==6.0.1
-hyperlink==21.0.0
 hypno==1.1.0
 hyppo==0.5.1
 idna==3.4
@@ -183,8 +179,7 @@ interleave==0.3.0
 intervaltree==3.1.0
 ipykernel==6.30.1
 ipympl==0.9.4
-ipython==8.37.0
-ipython-genutils==0.2.0
+ipython
 ipython_pygments_lexers==1.1.1
 ipywidgets==8.0.7
 isodate==0.7.2
@@ -198,7 +193,6 @@ jaraco.context==6.0.1
 jax==0.4.26
 jaxlib==0.4.26
 jedi==0.18.1
-jeepney==0.9.0
 jellyfish==1.0.1
 Jinja2==3.1.3
 jmespath==1.0.1
@@ -208,7 +202,6 @@ jsonpointer==2.1
 jsonschema==4.19.2
 jsonschema-specifications==2023.7.1
 jupyter==1.1.1
-jupyter-console==6.6.3
 jupyter-events==0.12.0
 jupyter-lsp==2.3.0
 jupyter_client==8.6.3
@@ -303,7 +296,6 @@ nwbinspector==0.6.3
 omegaconf==2.3.0
 opencv-python==4.10.0.84
 openpyxl==3.0.10
-opt_einsum==3.4.0
 optax==0.2.2
 orbax-checkpoint==0.5.9
 orjson==3.10.11
@@ -321,10 +313,8 @@ patchelf==0.17.2.1
 pathlib==1.0.1
 pathspec==0.10.3
 patsy==1.0.1
-pexpect==4.9.0
-pickleshare==0.7.5
 pillow==10.2.0
-pipreqs==0.4.13
+pipreqs
 pkce==1.0.3
 pkginfo==1.9.6
 platformdirs==3.10.0
@@ -341,11 +331,9 @@ propcache==0.4.1
 Protego==0.1.16
 protobuf==4.25.3
 psutil==5.9.0
-ptyprocess==0.7.0
 pure-eval==0.2.2
 py-cpuinfo==9.0.0
 pyarrow==16.1.0
-pyasn1==0.4.8
 pyasn1-modules==0.2.8
 pybullet==3.2.7
 pycodestyle==2.12.1
@@ -371,7 +359,6 @@ PyJWT==2.8.0
 pylint==3.3.9
 pylint-venv==3.0.3
 pyls-spyder==0.4.0
-PyNaCl==1.6.0
 pynwb==3.0.0
 pyodbc==5.1.0
 PyOpenGL==3.1.10
@@ -403,7 +390,6 @@ pyuca==1.2
 pyvers==0.1.0
 pyviz_comms==3.0.2
 PyWavelets==1.7.0
-pyxdg==0.28
 PyYAML==6.0.1
 pyzmq==25.1.2
 QDarkStyle==3.2.3
@@ -438,7 +424,6 @@ scipy==1.15.3
 Scrapy==2.11.1
 screeninfo==0.8.1
 seaborn==0.13.2
-SecretStorage==3.4.0
 semantic-version==2.10.0
 semver==3.0.2
 Send2Trash==1.8.3
@@ -476,7 +461,6 @@ sympy==1.14.0
 tables==3.10.1
 tabulate==0.9.0
 tbb==2022.2.0
-tbfm==0.0.1
 tblib==3.1.0
 tcmlib==1.4.0
 tenacity==9.1.2
@@ -540,7 +524,6 @@ watchdog==6.0.0
 watchfiles==1.1.1
 wcwidth==0.2.14
 webcolors==24.11.1
-webencodings==0.5.1
 websocket-client==1.9.0
 websockets==15.0.1
 Werkzeug==3.1.3

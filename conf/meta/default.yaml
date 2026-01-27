@@ -1,16 +1,59 @@
 # @package _global_
 # Meta-learning configuration
+#
+# HYPERNETWORK vs MAML COMPARISON
+# --------------------------------
+# This config supports two meta-learning strategies:
+#
+# 1. MAML (Model-Agnostic Meta-Learning) - DEFAULT
+#    - use_hypernetwork: false
+#    - Adapts via gradient descent on support set (~20-100 steps)
+#    - Learns good initialization for task embeddings
+#    - Slower but potentially more flexible
+#
+# 2. Hypernetwork Meta-Learning
+#    - use_hypernetwork: true
+#    - Adapts via single forward pass (no optimization!)
+#    - Generates model parameters from support set statistics
+#    - Much faster, deterministic, but less explored
+#
+# To enable hypernetwork mode:
+#   Set meta.use_hypernetwork=true in your config overrides
+#   OR: python script.py meta.use_hypernetwork=true
+#
+# Example: python tma_standalone.py 100 25 0 true 16 meta.use_hypernetwork=true
 
 meta:
+  # Meta-learning strategy selection
+  use_hypernetwork: false  # If true, use hypernetwork for fast adaptation; if false, use MAML
+
   # Residual-based meta-learning (MAML-style)
   is_basis_residual: false  # If true, use low-rank residual mode: bases += W*f(embed_stim)
   basis_residual_rank: 5     # Rank of residual subspace
   residual_mlp_hidden: 16    # Hidden dimension for residual MLP
-  
+
+  # Hypernetwork configuration
+  hypernetwork:
+    context_encoder_hidden: 64    # Hidden dim for support set encoder
+    context_dim: 32               # Dimension of encoded support context
+    param_generator_hidden: 128   # Hidden dim for parameter generator network
+    use_attention: false          # Use attention-based aggregation of support set
+    num_attention_heads: 4        # Number of attention heads if use_attention=true
+
   training:
-    inner_steps: 20
+    coadapt: false  # If true, co-adapt embeddings with other parameters instead of inner loop (MAML only)
+    embed_steps_per_other_step: 1  # How many embedding updates per other parameter updates
+    inner_steps: 20  # Number of inner loop steps for MAML
     support_size: 300
     lambda_l2: 1e-3
+    
+    # Progressive unfreezing for high support sizes (supervised fine-tuning)
+    progressive_unfreezing_threshold: 2000  # Support size threshold for enabling supervised fine-tuning
+    unfreeze_basis_weights: false  # Enable fine-tuning of basis weights at high support sizes
+    unfreeze_bases: false          # Enable fine-tuning of basis generator at high support sizes
+    basis_weight_lr: 1e-5          # Learning rate for basis weights when unfrozen
+    bases_lr: 1e-6                 # Learning rate for basis generator when unfrozen
+    
     optim:
       lr: 1e-2
       weight_decay: 1e-4

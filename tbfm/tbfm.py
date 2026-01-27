@@ -37,6 +37,12 @@ class TBFM(nn.Module):
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
         basis_gen_dropout: float = 0.0,
+        use_hypernetwork: bool = False,
+        hypernet_context_dim: int = 32,
+        hypernet_context_encoder_hidden: int = 64,
+        hypernet_param_generator_hidden: int = 128,
+        hypernet_use_attention: bool = False,
+        hypernet_num_attention_heads: int = 4,
         device=None,
     ):
         """
@@ -84,8 +90,21 @@ class TBFM(nn.Module):
             embed_dim_rest=embed_dim_rest,
             embed_dim_stim=embed_dim_stim,
             basis_gen_dropout=basis_gen_dropout,
+            use_hypernetwork=use_hypernetwork,
+            hypernet_context_dim=hypernet_context_dim,
+            hypernet_context_encoder_hidden=hypernet_context_encoder_hidden,
+            hypernet_param_generator_hidden=hypernet_param_generator_hidden,
+            hypernet_use_attention=hypernet_use_attention,
+            hypernet_num_attention_heads=hypernet_num_attention_heads,
             device=device,
         )
+
+        # Fix support encoder input dimension now that we know in_dim (output channels)
+        if use_hypernetwork and hasattr(self.bases, 'support_encoder') and self.bases.support_encoder is not None:
+            # Update support encoder input dimension: 6 statistics * in_dim channels
+            support_input_dim = 6 * in_dim
+            self.bases.support_encoder.encoder[0] = nn.Linear(support_input_dim, hypernet_context_encoder_hidden).to(device)
+            self.bases.support_encoder.input_dim = support_input_dim
 
     def reset_state(self):
         """
@@ -210,11 +229,15 @@ class TBFM(nn.Module):
         stiminds,
         embedding_rest: torch.Tensor | None = None,
         embedding_stim: torch.Tensor | None = None,
+        support_context: torch.Tensor | None = None,
     ):
         """
         Args:
             runway [tensor]: (batch_size, runway length, in_dim)
             stiminds [tensor]: (batch_size, trial_len, stimdim)
+            embedding_rest [tensor | None]: Rest embedding for meta-learning
+            embedding_stim [tensor | None]: Stim embedding for MAML
+            support_context [tensor | None]: Support context for hypernetwork
         Returns:
             y_hat [tensor]: (batch_size, trial_len, in_dim)
         """
@@ -226,7 +249,10 @@ class TBFM(nn.Module):
 
         # bases: (all batch, time, num_bases)
         bases = self.bases(
-            stiminds, embedding_rest=embedding_rest, embedding_stim=embedding_stim
+            stiminds,
+            embedding_rest=embedding_rest,
+            embedding_stim=embedding_stim,
+            support_context=support_context,
         )
         # Store for regularization (keep graph for outer loop backprop)
         self.prev_bases = bases
@@ -329,7 +355,7 @@ class SessionDispatcherTBFM(SessionDispatcher):
     def bases(self):
         return self.single.bases
 
-    def __call__(self, runways, covariates, embeddings_rest=None, embeddings_stim=None):
+    def __call__(self, runways, covariates, embeddings_rest=None, embeddings_stim=None, support_contexts=None):
         # module-style call override
         y_hats = {}
 
@@ -354,18 +380,28 @@ class SessionDispatcherTBFM(SessionDispatcher):
             else:
                 embedding_stim = None
 
+            if support_contexts:
+                support_context = support_contexts[sid]
+            elif sid in ck and "support_contexts" in ck[sid]:
+                support_context = ck[sid]["support_contexts"]
+            else:
+                support_context = None
+
             y_hat = instance(
                 runway,
                 _covariates,
                 embedding_rest=embedding_rest,
                 embedding_stim=embedding_stim,
+                support_context=support_context,
             )
             y_hats[sid] = y_hat
         return y_hats
 
-    def register_embeds_film(self, embeddings_rest, embeddings_stim):
+    def register_embeds_film(self, embeddings_rest, embeddings_stim, support_contexts=None):
         self.close_kwarg("__call__", "embeddings_rest", embeddings_rest)
         self.close_kwarg("__call__", "embeddings_stim", embeddings_stim)
+        if support_contexts:
+            self.close_kwarg("__call__", "support_contexts", support_contexts)
 
 
 def shared_from_cfg_and_base(cfg, session_ids, base_path, **kwargs):
