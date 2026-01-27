@@ -166,3 +166,6 @@ data/
 logs/
 test/
 training_log.txt
+archive/
+state_dependency_results*
+session_*

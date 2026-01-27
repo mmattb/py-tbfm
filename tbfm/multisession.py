@@ -87,17 +87,103 @@ def build_from_cfg(
     return TBFMMultisession(norms, aes, _tbfm, device=device)
 
 
-def save_model(model, path, tbfm_only=True):
-    # We save only the TBFM for now, since that is how we are doing TTA
-    if not tbfm_only:
-        raise NotImplementedError()
-    else:
+def save_model(model, path, tbfm_only=False, embeddings_stim=None, embeddings_rest=None):
+    """
+    Save model components to disk.
+
+    Args:
+        model: TBFMMultisession model
+        path: Path to save directory (will create if needed) or file path for tbfm_only mode
+        tbfm_only: If True, only save TBFM model (legacy behavior). If False, save all components.
+        embeddings_stim: Optional stimulus embeddings dict to save
+        embeddings_rest: Optional rest embeddings dict to save
+    """
+    if tbfm_only:
+        # Legacy behavior: save only TBFM to a single file
         instances = set(model.model.instances.values())
         if len(instances) != 1:
             raise NotImplementedError()
-
         model_tbfm = next(iter(instances))
         torch.save(model_tbfm.state_dict(), path)
+    else:
+        # Save all components to a directory
+        save_dir = path if isinstance(path, os.PathLike) else os.path.dirname(path) or path
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Save TBFM model(s)
+        tbfm_states = {sid: inst.state_dict() for sid, inst in model.model.instances.items()}
+        torch.save(tbfm_states, os.path.join(save_dir, "tbfm.torch"))
+
+        # Save AE model(s)
+        ae_states = {sid: inst.state_dict() for sid, inst in model.ae.instances.items()}
+        torch.save(ae_states, os.path.join(save_dir, "ae.torch"))
+
+        # Save normalizer(s)
+        norm_states = {sid: inst.state_dict() for sid, inst in model.norms.instances.items()}
+        torch.save(norm_states, os.path.join(save_dir, "norms.torch"))
+
+        # Save embeddings if provided
+        if embeddings_stim is not None:
+            torch.save(embeddings_stim, os.path.join(save_dir, "embeddings_stim.torch"))
+        if embeddings_rest is not None:
+            torch.save(embeddings_rest, os.path.join(save_dir, "embeddings_rest.torch"))
+
+        # Save session list for reference
+        session_ids = list(model.model.instances.keys())
+        torch.save(session_ids, os.path.join(save_dir, "session_ids.torch"))
+
+
+def load_model_components(path, model, device=None):
+    """
+    Load saved model components into an existing model.
+
+    Args:
+        path: Path to save directory containing model files
+        model: TBFMMultisession model to load weights into
+        device: Device to load tensors to
+
+    Returns:
+        Tuple of (embeddings_stim, embeddings_rest) if they were saved, else (None, None)
+    """
+    save_dir = path if isinstance(path, os.PathLike) else path
+
+    # Load TBFM model(s)
+    tbfm_path = os.path.join(save_dir, "tbfm.torch")
+    if os.path.exists(tbfm_path):
+        tbfm_states = torch.load(tbfm_path, map_location=device)
+        for sid, state in tbfm_states.items():
+            if sid in model.model.instances:
+                model.model.instances[sid].load_state_dict(state)
+
+    # Load AE model(s)
+    ae_path = os.path.join(save_dir, "ae.torch")
+    if os.path.exists(ae_path):
+        ae_states = torch.load(ae_path, map_location=device)
+        for sid, state in ae_states.items():
+            if sid in model.ae.instances:
+                model.ae.instances[sid].load_state_dict(state)
+
+    # Load normalizer(s)
+    norms_path = os.path.join(save_dir, "norms.torch")
+    if os.path.exists(norms_path):
+        norm_states = torch.load(norms_path, map_location=device)
+        for sid, state in norm_states.items():
+            if sid in model.norms.instances:
+                model.norms.instances[sid].load_state_dict(state)
+
+    # Load embeddings if available
+    embeddings_stim = None
+    embeddings_rest = None
+
+    stim_path = os.path.join(save_dir, "embeddings_stim.torch")
+    if os.path.exists(stim_path):
+        embeddings_stim = torch.load(stim_path, map_location=device)
+
+    rest_path = os.path.join(save_dir, "embeddings_rest.torch")
+    if os.path.exists(rest_path):
+        embeddings_rest = torch.load(rest_path, map_location=device)
+
+    return embeddings_stim, embeddings_rest
 
 
 def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
