@@ -1,3 +1,16 @@
+<script>
+MathJax = {
+  tex: {
+    inlineMath: [['$', '$']],
+    displayMath: [['$$', '$$']],
+    processEscapes: true
+  }
+};
+</script>
+<script type="text/javascript" id="MathJax-script" async
+  src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+</script>
+
 # Temporal Basis Function Model (TBFM), Supplementary Information
 This page contains a variety of supplemental information which supports TBFM's publications
 
@@ -54,3 +67,290 @@ We may optionally use an orthonormality penalty applied to the basis tensor. It 
   <img src="https://github.com/user-attachments/assets/7d6f6113-33b7-4d01-a1c5-61a3218cebd4" height="500"/>
 
 where B is the tensor of bases, and L_{ortho} is the calculated orthonormality penalty.
+
+## Multisession model compilation
+The following derives the compiled TBFM from a test-time adapted multi-session TBFM.
+The compiled form is implemented in `TBFMMultisessionCompiled`
+(`py-tbfm/tbfm/_multisession_module.py`).
+
+
+<table>
+<thead><tr><th>Symbol</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>$C$</td><td>Number of channels in the session</td></tr>
+<tr><td>$l$</td><td>AE latent dimension</td></tr>
+<tr><td>$r$</td><td>Runway length (time steps)</td></tr>
+<tr><td>$T$</td><td>Forecast horizon (time steps)</td></tr>
+<tr><td>$b$</td><td>Number of basis vectors</td></tr>
+<tr><td>$\mathbf{x} \in \mathbb{R}^{r \times C}$</td><td>Raw input runway, one trial</td></tr>
+<tr><td>$\mathbf{Z} \in \mathbb{R}^{r \times l}$</td><td>Latent runway (after normalisation + encoding)</td></tr>
+<tr><td>$B \in \mathbb{R}^{b \times T}$</td><td>Basis matrix (row = basis, col = time)</td></tr>
+<tr><td>$W(\mathbf{Z}) \in \mathbb{R}^{l \times b}$</td><td>Basis weight matrix (latent channels &times; bases)</td></tr>
+<tr><td>$W_{enc} \in \mathbb{R}^{l \times C}$</td><td>AE encoder weight</td></tr>
+<tr><td>$b_{enc} \in \mathbb{R}^{l}$</td><td>AE encoder bias</td></tr>
+<tr><td>$\boldsymbol{\alpha}, \boldsymbol{\beta} \in \mathbb{R}^C$</td><td>Per-channel normaliser scale and shift</td></tr>
+<tr><td>$\tilde{W}_{enc} \in \mathbb{R}^{l \times C}$</td><td>Normaliser-folded encoder weight (IQR/Z-score absorbed)</td></tr>
+<tr><td>$\tilde{b}_{enc} \in \mathbb{R}^{l}$</td><td>Normaliser-folded encoder bias</td></tr>
+<tr><td>$c^{rest}_s \in \mathbb{R}^{3}$</td><td>Per-session resting-state context (A-ACF percentiles)</td></tr>
+<tr><td>$c^{stim}_s \in \mathbb{R}^{15}$</td><td>Per-session stimulation context (optimised by TTA)</td></tr>
+<tr><td>$\hat{\mathbf{y}} \in \mathbb{R}^{T \times C}$</td><td>Forecast in channel space</td></tr>
+<tr><td>$Enc(\cdot)$, $Dec(\cdot)$</td><td>AE encoder and decoder</td></tr>
+<tr><td>$\phi(\cdot)$</td><td>Activation: $\phi(P) = \text{rowNorm}(\tanh(P))$</td></tr>
+</tbody>
+</table>
+
+---
+
+### Full Forward Pass
+
+For a fixed session $s$ after TTA, the full pipeline is:
+
+<div>
+$$
+\mathbf{x}
+\;\xrightarrow{\text{(1) normalise}}\;
+\mathbf{x}_\text{norm}
+\;\xrightarrow{\text{(2) } Enc}\;
+\mathbf{Z}
+\;\xrightarrow{\text{(3) basis-weight}}\;
+W(\mathbf{Z})
+\;\xrightarrow{\text{(4) contract with } B}\;
+\hat{\mathbf{Z}}
+\;\xrightarrow{\text{(5) } Dec}\;
+\hat{\mathbf{y}}
+$$
+</div>
+
+Steps (1)–(3) are affine in $\mathbf{x}$ and can be fused into a single
+precomputed matrix. Step (4) uses a fixed $B$ (determined by the frozen basis
+generator at $c^{rest}_s$, $c^{stim}_s$). Step (5) is a linear decode.
+The only genuine nonlinearity is $\phi$ inside step (3).
+
+---
+
+### Step 1 — Normalisation
+
+Both normaliser types (Z-score and quantile) are per-channel affine maps:
+
+<div>
+$$
+\mathbf{x}_{\text{norm},t} = \mathbf{x}_t \odot \boldsymbol{\alpha} + \boldsymbol{\beta},
+\qquad \boldsymbol{\alpha},\boldsymbol{\beta} \in \mathbb{R}^C
+$$
+</div>
+
+**Z-score:** $\;\alpha_c = 1/\sigma_c,\quad \beta_c = -\mu_c/\sigma_c$
+
+**Quantile:** $\;\alpha_c = 2/(q_{0.9,c} - q_{0.1,c}),\quad \beta_c = \alpha_c\cdot(-(q_{0.9,c}+q_{0.1,c})/2)$
+
+---
+
+### Step 2 — Linear Autoencoder Encoding
+
+The AE encoder (`LinearChannelAE`) is a per-session affine map:
+
+<div>
+$$
+\mathbf{z}_t = \mathbf{x}_{\text{norm},t}\, W_{enc}^\top + b_{enc}
+$$
+</div>
+
+#### Folding the normaliser into the encoder
+
+Substituting Step 1:
+
+<div>
+$$
+\mathbf{z}_t
+= (\mathbf{x}_t \odot \boldsymbol{\alpha} + \boldsymbol{\beta})\,W_{enc}^\top + b_{enc}
+= \mathbf{x}_t\,\tilde{W}_{enc}^\top + \tilde{b}_{enc}
+$$
+</div>
+
+where the **normalisation-folded encoder** (absorbing IQR or Z-score) is:
+
+<div>
+$$
+\boxed{
+\tilde{W}_{enc} = W_{enc} \odot \boldsymbol{\alpha}
+\qquad
+\tilde{b}_{enc} = \boldsymbol{\beta}\,W_{enc}^\top + b_{enc}
+}
+$$
+</div>
+
+($\boldsymbol{\alpha}$ is broadcast column-wise over $W_{enc}$, scaling column $c$ by $\alpha_c$.)
+
+The full latent runway is then $\mathbf{Z} = \mathbf{x}\,\tilde{W}_{enc}^\top + \mathbf{1}_r \tilde{b}_{enc}^\top \in \mathbb{R}^{r \times l}$, a single affine map of the raw runway.
+
+---
+
+### Step 3 — Basis Weight Estimation
+
+The `basis_weighting` layer is a linear map from the **flattened** latent runway
+to a weight matrix:
+
+<div>
+$$
+\text{vec}(W(\mathbf{Z})) = W_{bw}\,\text{vec}(\mathbf{Z}) + b_{bw},
+\qquad W_{bw} \in \mathbb{R}^{lb \times rl},\quad b_{bw} \in \mathbb{R}^{lb}
+$$
+</div>
+
+where $\text{vec}(\mathbf{Z}) \in \mathbb{R}^{rl}$ stacks all $r$ rows.
+
+#### Fusing Steps 1–3
+
+Substituting the latent encoding into the basis-weighting layer:
+
+<div>
+$$
+\text{vec}(\mathbf{Z}) = (I_r \otimes \tilde{W}_{enc})\,\text{vec}(\mathbf{x}) + \mathbf{1}_r \otimes \tilde{b}_{enc}
+$$
+</div>
+
+Hence,
+
+<div>
+$$
+\text{vec}(W(\mathbf{Z}))
+= \underbrace{W_{bw}(I_r \otimes \tilde{W}_{enc})}_{A_\text{pre}\;\in\;\mathbb{R}^{lb\times rC}}
+  \text{vec}(\mathbf{x})
+  \;+\;
+  \underbrace{W_{bw}(\mathbf{1}_r \otimes \tilde{b}_{enc}) + b_{bw}}_{v_\text{pre}\;\in\;\mathbb{R}^{lb}}
+$$
+</div>
+
+The Kronecker block structure is computed efficiently as:
+
+<div>
+$$
+A_\text{pre}[:,\, tC:(t+1)C] = W_{bw}[:,\, tl:(t+1)l]\;\tilde{W}_{enc},
+\quad t = 0,\ldots,r-1
+$$
+</div>
+
+#### Nonlinearity
+
+The raw weights are passed through $\phi$ (tanh + row-L2-normalise over the basis dimension):
+
+<div>
+$$
+\phi\!\left(\text{reshape}(A_\text{pre}\,\text{vec}(\mathbf{x}) + v_\text{pre},\;(l,b))\right)
+= \tilde{W}(\mathbf{x}) \in \mathbb{R}^{l \times b}
+$$
+</div>
+
+<div>
+$$
+\phi(P)_{i,*} = \frac{\tanh(P_{i,*})}{\|\tanh(P_{i,*})\|_2},
+\quad P \in \mathbb{R}^{l \times b}
+$$
+</div>
+
+---
+
+### Step 4 — Fixed Bases and $x_0$ Skip Connection
+
+After TTA, $c^{stim}_s$ is fixed. The basis generator (conditioned on $c^{rest}_s$
+and $c^{stim}_s$) produces a single constant matrix:
+
+<div>
+$$
+B \in \mathbb{R}^{b \times T}
+\quad \text{(fixed post-TTA)}
+$$
+</div>
+
+The latent forecast is a weighted sum of basis vectors plus the $x_0$ skip:
+
+<div>
+$$
+\hat{Z} = B^\top \tilde{W}(\mathbf{x})^\top + \mathbf{1}_T\,\mathbf{z}_{0}^\top
+\;\in\; \mathbb{R}^{T \times l}
+$$
+</div>
+
+where the $x_0$ skip encodes the last runway timestep through the
+same normalisation-folded encoder:
+
+<div>
+$$
+\mathbf{z}_0 = \mathbf{x}_{r}\,\tilde{W}_{enc}^\top + \tilde{b}_{enc} \;\in\; \mathbb{R}^l
+$$
+</div>
+
+(This is row $r$ of $\mathbf{Z}$, so no extra computation is required.)
+
+---
+
+### Step 5 — AE Decoding
+
+The `LinearChannelAE` uses tied weights: the decoder is the transpose of the encoder with no bias.
+
+<div>
+$$
+\hat{\mathbf{y}} = \hat{Z}\,W_{enc}
+$$
+</div>
+
+---
+
+### Compiled Form (Summary)
+
+<p>
+After TTA with session $s$, stimulus condition with descriptor $s_s$, and
+learnt contexts $c^{rest}_s$, $c^{stim}_s$, the full pipeline reduces to
+<strong>five stored constant tensors</strong>
+$\{A_\text{pre},\, v_\text{pre},\, B,\, \tilde{W}_{enc},\, \tilde{b}_{enc},\, W_{enc}\}$
+and a <strong>single hidden layer</strong> with activation $\phi$:
+</p>
+
+<div>
+$$
+\boxed{
+\hat{\mathbf{y}}
+=
+\Bigl(
+  B^\top\,\phi\!\bigl(A_\text{pre}\,\text{vec}(\mathbf{x}) + v_\text{pre}\bigr)^\top
+  +\,\mathbf{1}_T\mathbf{z}_0^\top
+\Bigr)\,W_{enc}
+}
+$$
+</div>
+
+<p>with $\mathbf{z}_0 = \mathbf{x}_r\,\tilde{W}_{enc}^\top + \tilde{b}_{enc}$, where the
+normalisation (IQR or Z-score) is absorbed into the folded encoder:</p>
+
+<div>
+$$
+\tilde{W}_{enc} = W_{enc} \odot \boldsymbol{\alpha},
+\qquad
+\tilde{b}_{enc} = \boldsymbol{\beta}\,W_{enc}^\top + b_{enc}
+$$
+</div>
+
+<p>The model is <strong>not affine</strong> (because $\phi$ contains $\tanh$), but it is a
+single-hidden-layer network. All of: the normaliser, AE encoder,
+<code>basis_weighting</code> layer, fixed bases, and AE decoder have been absorbed into
+constant matrices. At inference only two matrix multiplies plus the $\phi$
+activation are performed at runtime.</p>
+
+#### Dimension summary
+
+<table>
+<thead><tr><th>Tensor</th><th>Shape</th><th>Formed from</th></tr></thead>
+<tbody>
+<tr><td>$A_\text{pre}$</td><td>$lb \times rC$</td><td>$W_{bw}$, $\tilde{W}_{enc}$ (Kronecker product)</td></tr>
+<tr><td>$v_\text{pre}$</td><td>$lb$</td><td>$W_{bw}$, $\tilde{b}_{enc}$, $b_{bw}$</td></tr>
+<tr><td>$B$</td><td>$b \times T$</td><td>Frozen basis generator at $c^{rest}_s$, $c^{stim}_s$, $s_s$</td></tr>
+<tr><td>$\tilde{W}_{enc}$</td><td>$l \times C$</td><td>IQR/Z-score normaliser folded into $W_{enc}$</td></tr>
+<tr><td>$\tilde{b}_{enc}$</td><td>$l$</td><td>IQR/Z-score normaliser folded into $b_{enc}$</td></tr>
+<tr><td>$W_{enc}$</td><td>$l \times C$</td><td>AE encoder weight (= decoder weight, tied)</td></tr>
+</tbody>
+</table>
+
+---
+
+*See `TBFMMultisessionCompiled` and `TBFMMultisession.compile()` in
+`py-tbfm/tbfm/_multisession_module.py` for the implementation.*
