@@ -37,6 +37,7 @@ class TBFM(nn.Module):
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
         basis_gen_dropout: float = 0.0,
+        normalize_weights: bool = True,
         device=None,
     ):
         """
@@ -60,6 +61,7 @@ class TBFM(nn.Module):
         self.prev_bases = None
         self.prev_basis_weights = None
         self.use_meta_learning = use_meta_learning
+        self.normalize_weights = normalize_weights
 
         if zscore:
             self.normalizer = normalizers.ScalerZscore()
@@ -235,9 +237,9 @@ class TBFM(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
-        # XXX
-        basis_weights = torch.tanh(basis_weights)
-        basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
+        if self.normalize_weights:
+            basis_weights = torch.tanh(basis_weights)
+            basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 
         # Store for regularization (keep graph for outer loop backprop)
         self.prev_basis_weights = basis_weights
