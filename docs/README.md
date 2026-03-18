@@ -74,28 +74,30 @@ The compiled form is implemented in `TBFMMultisessionCompiled`
 (`py-tbfm/tbfm/_multisession_module.py`).
 
 
-| Symbol | Meaning |
-|---|---|
-| $C$ | Number of channels in the session |
-| $l$ | AE latent dimension |
-| $r$ | Runway length (time steps) |
-| $T$ | Forecast horizon (time steps) |
-| $b$ | Number of basis vectors |
-| $\mathbf{x} \in \mathbb{R}^{r \times C}$ | Raw input runway, one trial |
-| $\mathbf{Z} \in \mathbb{R}^{r \times l}$ | Latent runway (after normalisation + encoding) |
-| $B \in \mathbb{R}^{b \times T}$ | Basis matrix (row = basis, col = time) |
-| $R \in \mathbb{R}^{b \times T}$ | LoRA residual matrix; $R = O \cdot W^{\top}$ post-unflattening |
-| $W(\mathbf{Z}) \in \mathbb{R}^{l \times b}$ | Basis weight matrix (latent channels × bases) |
-| $W_{enc} \in \mathbb{R}^{l \times C}$ | AE encoder weight |
-| $b_{enc} \in \mathbb{R}^{l}$ | AE encoder bias |
-| $\boldsymbol{\alpha}, \boldsymbol{\beta} \in \mathbb{R}^C$ | Per-channel normaliser scale and shift |
-| $\tilde{W}_{enc} \in \mathbb{R}^{l \times C}$ | Normaliser-folded encoder weight (IQR/Z-score absorbed) |
-| $\tilde{b}_{enc} \in \mathbb{R}^{l}$ | Normaliser-folded encoder bias |
-| $c^{rest}_s \in \mathbb{R}^{3}$ | Per-session resting-state context (A-ACF percentiles) |
-| $c^{stim}_s \in \mathbb{R}^{15}$ | Per-session stimulation context (optimised by TTA) |
-| $\hat{\mathbf{y}} \in \mathbb{R}^{T \times C}$ | Forecast in channel space |
-| $Enc(\cdot)$, $Dec(\cdot)$ | AE encoder and decoder |
-| $\phi(\cdot)$ | Activation: $\phi(P) = \text{rowNorm}(\tanh(P))$ |
+<table>
+<thead><tr><th>Symbol</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td>$C$</td><td>Number of channels in the session</td></tr>
+<tr><td>$l$</td><td>AE latent dimension</td></tr>
+<tr><td>$r$</td><td>Runway length (time steps)</td></tr>
+<tr><td>$T$</td><td>Forecast horizon (time steps)</td></tr>
+<tr><td>$b$</td><td>Number of basis vectors</td></tr>
+<tr><td>$\mathbf{x} \in \mathbb{R}^{r \times C}$</td><td>Raw input runway, one trial</td></tr>
+<tr><td>$\mathbf{Z} \in \mathbb{R}^{r \times l}$</td><td>Latent runway (after normalisation + encoding)</td></tr>
+<tr><td>$B \in \mathbb{R}^{b \times T}$</td><td>Basis matrix (row = basis, col = time)</td></tr>
+<tr><td>$W(\mathbf{Z}) \in \mathbb{R}^{l \times b}$</td><td>Basis weight matrix (latent channels &times; bases)</td></tr>
+<tr><td>$W_{enc} \in \mathbb{R}^{l \times C}$</td><td>AE encoder weight</td></tr>
+<tr><td>$b_{enc} \in \mathbb{R}^{l}$</td><td>AE encoder bias</td></tr>
+<tr><td>$\boldsymbol{\alpha}, \boldsymbol{\beta} \in \mathbb{R}^C$</td><td>Per-channel normaliser scale and shift</td></tr>
+<tr><td>$\tilde{W}_{enc} \in \mathbb{R}^{l \times C}$</td><td>Normaliser-folded encoder weight (IQR/Z-score absorbed)</td></tr>
+<tr><td>$\tilde{b}_{enc} \in \mathbb{R}^{l}$</td><td>Normaliser-folded encoder bias</td></tr>
+<tr><td>$c^{rest}_s \in \mathbb{R}^{3}$</td><td>Per-session resting-state context (A-ACF percentiles)</td></tr>
+<tr><td>$c^{stim}_s \in \mathbb{R}^{15}$</td><td>Per-session stimulation context (optimised by TTA)</td></tr>
+<tr><td>$\hat{\mathbf{y}} \in \mathbb{R}^{T \times C}$</td><td>Forecast in channel space</td></tr>
+<tr><td>$Enc(\cdot)$, $Dec(\cdot)$</td><td>AE encoder and decoder</td></tr>
+<tr><td>$\phi(\cdot)$</td><td>Activation: $\phi(P) = \text{rowNorm}(\tanh(P))$</td></tr>
+</tbody>
+</table>
 
 ---
 
@@ -266,10 +268,13 @@ $$
 
 ### Compiled Form (Summary)
 
+<p>
 After TTA with session $s$, stimulus condition with descriptor $s_s$, and
 learnt contexts $c^{rest}_s$, $c^{stim}_s$, the full pipeline reduces to
-**five stored constant tensors** $\{A_\text{pre},\, v_\text{pre},\, B,\, \tilde{W}_{enc},\, \tilde{b}_{enc},\, W_{enc}\}$
-and a **single hidden layer** with activation $\phi$:
+<strong>five stored constant tensors</strong>
+$\{A_\text{pre},\, v_\text{pre},\, B,\, \tilde{W}_{enc},\, \tilde{b}_{enc},\, W_{enc}\}$
+and a <strong>single hidden layer</strong> with activation $\phi$:
+</p>
 
 $$
 \boxed{
@@ -282,8 +287,8 @@ $$
 }
 $$
 
-with $\mathbf{z}_0 = \mathbf{x}_r\,\tilde{W}_{enc}^\top + \tilde{b}_{enc}$, where the
-normalisation (IQR or Z-score) is absorbed into the folded encoder:
+<p>with $\mathbf{z}_0 = \mathbf{x}_r\,\tilde{W}_{enc}^\top + \tilde{b}_{enc}$, where the
+normalisation (IQR or Z-score) is absorbed into the folded encoder:</p>
 
 $$
 \tilde{W}_{enc} = W_{enc} \odot \boldsymbol{\alpha},
@@ -291,22 +296,25 @@ $$
 \tilde{b}_{enc} = \boldsymbol{\beta}\,W_{enc}^\top + b_{enc}
 $$
 
-The model is **not affine** (because $\phi$ contains $\tanh$), but it is a
+<p>The model is <strong>not affine</strong> (because $\phi$ contains $\tanh$), but it is a
 single-hidden-layer network. All of: the normaliser, AE encoder,
-`basis_weighting` layer, fixed bases, and AE decoder have been absorbed into
+<code>basis_weighting</code> layer, fixed bases, and AE decoder have been absorbed into
 constant matrices. At inference only two matrix multiplies plus the $\phi$
-activation are performed at runtime.
+activation are performed at runtime.</p>
 
 #### Dimension summary
 
-| Tensor | Shape | Formed from |
-|---|---|---|
-| $A_\text{pre}$ | $lb \times rC$ | $W_{bw}$, $\tilde{W}_{enc}$ (Kronecker product) |
-| $v_\text{pre}$ | $lb$ | $W_{bw}$, $\tilde{b}_{enc}$, $b_{bw}$ |
-| $B$ | $b \times T$ | Frozen basis generator at $c^{rest}_s$, $c^{stim}_s$, $s_s$ |
-| $\tilde{W}_{enc}$ | $l \times C$ | IQR/Z-score normaliser folded into $W_{enc}$ |
-| $\tilde{b}_{enc}$ | $l$ | IQR/Z-score normaliser folded into $b_{enc}$ |
-| $W_{enc}$ | $l \times C$ | AE encoder weight (= decoder weight, tied) |
+<table>
+<thead><tr><th>Tensor</th><th>Shape</th><th>Formed from</th></tr></thead>
+<tbody>
+<tr><td>$A_\text{pre}$</td><td>$lb \times rC$</td><td>$W_{bw}$, $\tilde{W}_{enc}$ (Kronecker product)</td></tr>
+<tr><td>$v_\text{pre}$</td><td>$lb$</td><td>$W_{bw}$, $\tilde{b}_{enc}$, $b_{bw}$</td></tr>
+<tr><td>$B$</td><td>$b \times T$</td><td>Frozen basis generator at $c^{rest}_s$, $c^{stim}_s$, $s_s$</td></tr>
+<tr><td>$\tilde{W}_{enc}$</td><td>$l \times C$</td><td>IQR/Z-score normaliser folded into $W_{enc}$</td></tr>
+<tr><td>$\tilde{b}_{enc}$</td><td>$l$</td><td>IQR/Z-score normaliser folded into $b_{enc}$</td></tr>
+<tr><td>$W_{enc}$</td><td>$l \times C$</td><td>AE encoder weight (= decoder weight, tied)</td></tr>
+</tbody>
+</table>
 
 ---
 
