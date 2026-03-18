@@ -20,7 +20,14 @@ We compare TBFMs to two existing model types. Details are as follows.
 ### Linear state space model (LSSM)
 While there are a wide variety of LSSMs, some simple versions were previously demonstrated for modeling neural stimulation. These are commonly learned using the Kalman Filter, though they can also be trained using other methods such as backpropagation. In discrete time these simple LSSMs are specified as:
 
-<img src="https://github.com/user-attachments/assets/debae1b5-2622-4410-9c3f-73365ddb5e55" height="60"/>
+<div>
+$$
+\begin{align}
+x_{k+1} &= Ax_k + Bu_k \\
+y_k &= Cx_k
+\end{align}
+$$
+</div>
 
 Here x is a latent state, u is the control input (e.g. stimulation parameters), and y is the prediction. Forward prediction can be performed by specifying an initial latent state x<sub>0</sub> and autoregressing forward in time.
 
@@ -47,26 +54,36 @@ the full 164ms multistep prediction.
 Training uses a tripartite loss function:
 
 * an autoencoder loss  
-  <img src="https://github.com/user-attachments/assets/65bf3d6e-973b-47ff-908f-64de815dcdbc" height="30"/>
+  <div>$$\mathcal{L}_{AE} = \text{MSELoss}(x,\, g^{-1}(g(x)))$$</div>
 
 
 * a dynamics prediction loss for all time steps in our window. Note however that we
     unroll predictions to make multi-step predictions, feeding our
     prediction back to the dynamics model at each step. The dynamics
     loss is a multi-step loss.  
-  <img src="https://github.com/user-attachments/assets/001e07fe-e80f-4095-98d1-3e846093f7e9" height="30"/>
+  <div>$$\mathcal{L}_{dyn} = \text{MSELoss}(z_t + \Delta z,\, z_{t+1})$$</div>
 
-* a nearest-neighbor loss, which attempts to force all LFP values to align near each other in latent space so the model can take advantage of similar dynamics across channels and space. The simplest way to do that is to force the latent states to be centered at 0; hence:  
-  <img src="https://github.com/user-attachments/assets/ab6a5a7d-721c-43db-b443-5ab2935f4e6f" height="30"/>
+* a nearest-neighbor loss, which attempts to force all LFP values to align near each other in latent space so the model can take advantage of similar dynamics across channels and space. The simplest way to do that is to force the latent states to be centered at 0; hence:
+  <div>$$\mathcal{L}_{nn} = \text{MSELoss}(\bar{z},\, 0)$$</div>
 
 The LSTM model takes inspiration from dynamical systems and control methods which learn latent state representations for optimal control. Since it leverages an autoencoder architecture, it can be compared to methods such as deep Koopman for control, but without the key linearity constraint. We chose the LSTM model for comparison since it is a more expressive model than LSSMs, and has previously been demonstrated for control. While LSSMs were previously demonstrated for modeling neural stimulation, our ODE-LSTM model goes further by allowing for nonlinearities.
 
 ## Orthonormality penalty
 We may optionally use an orthonormality penalty applied to the basis tensor. It is calculated as:
 
-  <img src="https://github.com/user-attachments/assets/7d6f6113-33b7-4d01-a1c5-61a3218cebd4" height="500"/>
+<div>
+$$
+\begin{align}
+&\text{Let } B \in \mathbb{R}^{T \times K} \text{ be the basis matrix (time } \times \text{ bases)} \\
+&\text{Gram matrix: } G = \tfrac{1}{T} B^\top B \in \mathbb{R}^{K \times K}, \quad G_{kj} = \tfrac{1}{T}\sum_{t=1}^{T} B_{tk}\,B_{tj} \\
+&\mathcal{L}_{\text{diag}} = \tfrac{1}{K} \sum_{k=1}^{K} (G_{kk} - 1)^2 \\
+&\mathcal{L}_{\text{off}} = \tfrac{1}{K(K-1)} \sum_{k \neq j} G_{kj}^2 \\
+&\mathcal{L}_{\text{ortho}} = \mathcal{L}_{\text{diag}} + \mathcal{L}_{\text{off}}
+\end{align}
+$$
+</div>
 
-where B is the tensor of bases, and L_{ortho} is the calculated orthonormality penalty.
+where $B$ is the basis matrix and $\mathcal{L}_{\text{ortho}}$ is the orthonormality penalty.
 
 ## Multisession model compilation
 The following derives the compiled TBFM from a test-time adapted multi-session TBFM.
@@ -181,7 +198,7 @@ $$
 
 ($\boldsymbol{\alpha}$ is broadcast column-wise over $W_{enc}$, scaling column $c$ by $\alpha_c$.)
 
-The full latent runway is then $\mathbf{Z} = \mathbf{x}\,\tilde{W}_{enc}^\top + \mathbf{1}_r \tilde{b}_{enc}^\top \in \mathbb{R}^{r \times l}$, a single affine map of the raw runway.
+<p>The full latent runway is then $\mathbf{Z} = \mathbf{x}\,\tilde{W}_{enc}^\top + \mathbf{1}_r \tilde{b}_{enc}^\top \in \mathbb{R}^{r \times l}$, a single affine map of the raw runway.</p>
 
 ---
 
