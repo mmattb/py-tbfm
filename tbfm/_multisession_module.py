@@ -1,3 +1,5 @@
+import torch
+import torch.nn.functional as F
 from torch import nn
 
 
@@ -86,3 +88,65 @@ class TBFMMultisession(nn.Module):
             # If mode=False, call eval
             self.eval(ae=ae)
         return self
+
+
+class TBFMMultisessionCompiled(nn.Module):
+    """TBFMMultisession with prerendered bases for a specific session.
+
+    Precomputes the bases matrix (output of the basis generator MLP + LoRA/residual)
+    once at construction time, mirroring the TBFMCompiled pattern for vanilla TBFM.
+    At inference, the basis generator and all LoRA/residual net forward passes are
+    skipped; only norm → AE encode → basis_weighting matmul → AE decode remain.
+
+    Args:
+        ms_model: a TBFMMultisession instance (eval mode)
+        session_id: the session for which to prerender bases
+        stiminds_ref: (1, stimdim) tensor — reference stimulus descriptor used to
+            prerender the bases (typically taken from the first trial)
+        emb_rest: rest embedding for session_id
+        emb_stim: stim embedding for session_id
+    """
+
+    def __init__(self, ms_model, session_id, stiminds_ref, emb_rest, emb_stim):
+        super().__init__()
+        self.device = ms_model.device
+        self.norms = ms_model.norms
+        self.ae = ms_model.ae
+        self.session_id = session_id
+
+        tbfm_instance = ms_model.model.instances[session_id]
+        self.basis_weighting = tbfm_instance.basis_weighting
+        self.in_dim = tbfm_instance.in_dim
+        self.num_bases = tbfm_instance.num_bases
+
+        # Prerender bases: (1, trial_len, num_bases)
+        with torch.no_grad():
+            bases = tbfm_instance.bases(
+                stiminds_ref,
+                embedding_rest=emb_rest,
+                embedding_stim=emb_stim,
+            )
+            self.register_buffer("prerendered_bases", bases.detach())
+
+    def forward(self, data, **ignored):
+        sid = self.session_id
+        runway_raw = data[sid][0]
+
+        runways_normalized = self.norms({sid: runway_raw})
+        runways_latent = self.ae.encode(runways_normalized)
+        runway_latent = runways_latent[sid]
+
+        x0 = runway_latent[:, -1:, :]
+        batch_size = runway_latent.shape[0]
+
+        basis_weights = self.basis_weighting(runway_latent.flatten(start_dim=1))
+        basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
+        basis_weights = torch.tanh(basis_weights)
+        basis_weights = F.normalize(basis_weights, p=2, dim=-1)
+
+        # Expand prerendered bases to batch size
+        bases = self.prerendered_bases.expand(batch_size, -1, -1)
+        latent_preds = (basis_weights @ bases.permute(0, 2, 1)).permute(0, 2, 1) + x0
+
+        forecast = self.ae.decode({sid: latent_preds})
+        return forecast

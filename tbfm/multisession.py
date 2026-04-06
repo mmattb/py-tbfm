@@ -921,6 +921,8 @@ def test_time_adaptation(
                         )
                         tbfm_optims[session_id] = tbfm_optim
 
+        lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+
         # Initialize variables for results
         ys = None
         yhat = None
@@ -964,7 +966,16 @@ def test_time_adaptation(
                     losses[sid] = nn.MSELoss()(yhat[sid], y)
 
                 loss = sum(losses.values()) / len(data_for_adaptation)
-                
+
+                # Add AE reconstruction loss (mirrors training)
+                if lambda_ae_recon > 0:
+                    runways_normalized, runways_recon = model.forward_reconstruct(data_for_adaptation)
+                    ae_recon_loss = sum(
+                        nn.functional.mse_loss(runways_recon[sid], runways_normalized[sid])
+                        for sid in data_for_adaptation
+                    ) / len(data_for_adaptation)
+                    loss = loss + lambda_ae_recon * ae_recon_loss
+
                 # Add TBFM regularization if progressive unfreezing is enabled
                 if tbfm_optims:
                     for sid in data_for_adaptation.keys():
@@ -1046,7 +1057,16 @@ def test_time_adaptation(
                     losses[sid] = nn.MSELoss()(yhat[sid], y)
 
                 loss = sum(losses.values()) / len(data_for_adaptation)
-                
+
+                # Add AE reconstruction loss (mirrors training)
+                if lambda_ae_recon > 0:
+                    runways_normalized, runways_recon = model.forward_reconstruct(data_for_adaptation)
+                    ae_recon_loss = sum(
+                        nn.functional.mse_loss(runways_recon[sid], runways_normalized[sid])
+                        for sid in data_for_adaptation
+                    ) / len(data_for_adaptation)
+                    loss = loss + lambda_ae_recon * ae_recon_loss
+
                 # Add TBFM regularization if progressive unfreezing is enabled
                 if tbfm_optims:
                     for sid in data_for_adaptation.keys():
