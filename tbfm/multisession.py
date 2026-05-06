@@ -151,9 +151,18 @@ def load_model_components(path, model, device=None):
     tbfm_path = os.path.join(save_dir, "tbfm.torch")
     if os.path.exists(tbfm_path):
         tbfm_states = torch.load(tbfm_path, map_location=device)
+        loaded_sids = set()
         for sid, state in tbfm_states.items():
             if sid in model.model.instances:
                 model.model.instances[sid].load_state_dict(state)
+                loaded_sids.add(sid)
+        # Held-out sessions at TTA time won't appear in tbfm_states (which contains
+        # training session IDs). Fall back to any saved state — valid when TBFM is shared.
+        if tbfm_states:
+            fallback_state = next(iter(tbfm_states.values()))
+            for sid in model.model.instances:
+                if sid not in loaded_sids:
+                    model.model.instances[sid].load_state_dict(fallback_state)
 
     # Load AE model(s)
     ae_path = os.path.join(save_dir, "ae.torch")
@@ -731,6 +740,8 @@ def test_time_adaptation(
     quiet: bool = False,
     coadapt_embeddings: bool = False,
     progress_job_id: str = None,  # Optional job ID for live progress notifications
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -778,10 +789,12 @@ def test_time_adaptation(
 
     # Split into support/query if support_size is provided
     # Note: In TTA, we don't limit train_set_size since we use all available adaptation data
+    if random_sample_support and support_seed is not None:
+        torch.manual_seed(support_seed)
     data_for_adaptation, _ = split_support_query_sessions(
-        data_train, 
+        data_train,
         support_size=support_size,
-        random_sample=False,
+        random_sample=random_sample_support,
         train_set_size=None,
     )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
@@ -833,14 +846,16 @@ def test_time_adaptation(
         else:
             # MAML mode: optimize embeddings via gradient descent
             print("TTA: Optimizing embeddings...")
-            embeddings_stim, _ = meta.inner_update_stopgrad(
+            embeddings_stim = meta.inner_update_stopgrad(
                 model,
                 data_for_adaptation,
-            embeddings_rest,
-            cfg,
-            inner_steps=epochs,
-            quiet=quiet,
-        )
+                embeddings_rest,
+                cfg,
+                inner_steps=epochs,
+                quiet=True,
+            )
+            if isinstance(embeddings_stim, tuple):
+                embeddings_stim = embeddings_stim[0]
 
     # AE optimization (alone or jointly with embeddings)
     if adapt_ae:
@@ -1192,10 +1207,29 @@ def test_time_adaptation(
         y_hat_test = None
         test_batch = None
 
+    # Evaluate on support (train) data after adaptation
+    with torch.no_grad():
+        train_results = utils.evaluate_test_batches(
+            model,
+            [data_for_adaptation],
+            embeddings_rest,
+            embeddings_stim,
+            model.norms,
+            cfg,
+            device,
+            track_per_session_r2=True,
+            support_contexts=support_contexts,
+        )
+    r2_train = train_results["r2"]
+    final_train_r2s = train_results["per_session_r2"]
+    print(f"TTA: Train results - R2: {r2_train:.4f}")
+
     results = {}
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    results["final_train_r2"] = r2_train
+    results["final_train_r2s"] = final_train_r2s
     results["y"] = ys
     results["y_hat"] = yhat
     results["y_test"] = test_batch

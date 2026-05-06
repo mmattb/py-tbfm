@@ -43,6 +43,8 @@ class TBFM(nn.Module):
         hypernet_param_generator_hidden: int = 128,
         hypernet_use_attention: bool = False,
         hypernet_num_attention_heads: int = 4,
+        use_tanh_basis_weights: bool = True,
+        use_basis_weight_row_norm: bool = True,
         device=None,
     ):
         """
@@ -66,6 +68,8 @@ class TBFM(nn.Module):
         self.prev_bases = None
         self.prev_basis_weights = None
         self.use_meta_learning = use_meta_learning
+        self.use_tanh_basis_weights = use_tanh_basis_weights
+        self.use_basis_weight_row_norm = use_basis_weight_row_norm
 
         if zscore:
             self.normalizer = normalizers.ScalerZscore()
@@ -261,9 +265,10 @@ class TBFM(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
-        # XXX
-        basis_weights = torch.tanh(basis_weights)
-        basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
+        if self.use_tanh_basis_weights:
+            basis_weights = torch.tanh(basis_weights)
+        if self.use_basis_weight_row_norm:
+            basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 
         # Store for regularization (keep graph for outer loop backprop)
         self.prev_basis_weights = basis_weights

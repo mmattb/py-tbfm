@@ -28,10 +28,56 @@ OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc fold
 EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
+# All 40 valid sessions with complete preprocessing
+ALL_VALID_SESSIONS = [
+    "MonkeyG_20150914_Session1_S1",
+    "MonkeyG_20150914_Session3_S1",
+    "MonkeyG_20150915_Session2_S1",
+    "MonkeyG_20150915_Session3_S1",
+    "MonkeyG_20150915_Session4_S1",
+    "MonkeyG_20150915_Session5_S1",
+    "MonkeyG_20150916_Session4_S1",
+    "MonkeyG_20150917_Session1_M1",
+    "MonkeyG_20150917_Session1_S1",
+    "MonkeyG_20150917_Session2_M1",
+    "MonkeyG_20150917_Session2_S1",
+    "MonkeyG_20150917_Session3_M1",
+    "MonkeyG_20150917_Session3_S1",
+    "MonkeyG_20150918_Session1_M1",
+    "MonkeyG_20150918_Session1_S1",
+    "MonkeyG_20150921_Session3_S1",
+    "MonkeyG_20150921_Session5_S1",
+    "MonkeyG_20150922_Session1_S1",
+    "MonkeyG_20150922_Session2_S1",
+    "MonkeyG_20150922_Session3_S1",
+    "MonkeyG_20150925_Session1_S1",
+    "MonkeyG_20150925_Session2_S1",
+    "MonkeyJ_20160426_Session1_S1",
+    "MonkeyJ_20160426_Session2_S1",
+    "MonkeyJ_20160426_Session3_S1",
+    "MonkeyJ_20160428_Session2_S1",
+    "MonkeyJ_20160428_Session3_S1",
+    "MonkeyJ_20160429_Session1_S1",
+    "MonkeyJ_20160429_Session3_S1",
+    "MonkeyJ_20160502_Session1_S1",
+    "MonkeyJ_20160624_Session3_S1",
+    "MonkeyJ_20160624_Session4_S1",
+    "MonkeyJ_20160625_Session4_S1",
+    "MonkeyJ_20160625_Session5_S1",
+    "MonkeyJ_20160627_Session1_S1",
+    "MonkeyJ_20160627_Session2_S1",
+    "MonkeyJ_20160630_Session1_S1",
+    "MonkeyJ_20160630_Session3_S1",
+    "MonkeyJ_20160702_Session2_S1",
+    "MonkeyJ_20160702_Session4_S1",
+]
 
-def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False, 
+
+def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False,
          latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False,
-         embed_dim_stim=None):
+         embed_dim_stim=None, random_seed=None, held_in_sessions=None,
+         normalizer=None, lambda_ae_recon=None, lambda_fro=None, lambda_ortho=None, lambda_l2=None,
+         no_rest_embeddings=False, no_tanh_basis_weights=False):
 
     if out_dir is None:
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
@@ -80,34 +126,49 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
 
     if num_sessions == 40:
         held_in_session_ids = None
+    elif held_in_sessions is not None:
+        # Explicit session list provided — use as-is
+        held_in_session_ids = held_in_sessions
+        if batch_size_per_session is None:
+            MAX_BATCH_SIZE = 62500 // 8
+            batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        else:
+            batch_size = batch_size_per_session * num_sessions
     elif num_sessions < 40:
-        held_in_session_ids = [
-            "MonkeyJ_20160426_Session2_S1",
-            "MonkeyG_20150914_Session1_S1",
-            "MonkeyG_20150915_Session3_S1",
-            "MonkeyG_20150915_Session5_S1",
-            "MonkeyG_20150916_Session4_S1",
-            "MonkeyG_20150917_Session1_M1",
-            "MonkeyG_20150917_Session1_S1",
-            "MonkeyG_20150917_Session2_M1",
-            "MonkeyG_20150917_Session2_S1",
-            "MonkeyG_20150921_Session3_S1",
-            "MonkeyG_20150921_Session5_S1",
-            "MonkeyG_20150922_Session1_S1",
-            "MonkeyG_20150922_Session2_S1",
-            "MonkeyG_20150925_Session1_S1",
-            "MonkeyG_20150925_Session2_S1",
-            "MonkeyJ_20160426_Session3_S1",
-            "MonkeyJ_20160428_Session3_S1",
-            "MonkeyJ_20160429_Session1_S1",
-            "MonkeyJ_20160502_Session1_S1",
-            "MonkeyJ_20160624_Session3_S1",
-            "MonkeyJ_20160625_Session4_S1",
-            "MonkeyJ_20160625_Session5_S1",
-            "MonkeyJ_20160627_Session1_S1",
-            "MonkeyJ_20160630_Session3_S1",
-            "MonkeyJ_20160702_Session2_S1",
-        ][:num_sessions]
+        # Select sessions based on random seed or use default order
+        if random_seed is not None:
+            # Use random seed to select sessions from all valid sessions
+            rng = random.Random(random_seed)
+            held_in_session_ids = rng.sample(ALL_VALID_SESSIONS, num_sessions)
+        else:
+            # Use the default first N sessions (original behavior)
+            held_in_session_ids = [
+                "MonkeyJ_20160426_Session2_S1",
+                "MonkeyG_20150914_Session1_S1",
+                "MonkeyG_20150915_Session3_S1",
+                "MonkeyG_20150915_Session5_S1",
+                "MonkeyG_20150916_Session4_S1",
+                "MonkeyG_20150917_Session1_M1",
+                "MonkeyG_20150917_Session1_S1",
+                "MonkeyG_20150917_Session2_M1",
+                "MonkeyG_20150917_Session2_S1",
+                "MonkeyG_20150921_Session3_S1",
+                "MonkeyG_20150921_Session5_S1",
+                "MonkeyG_20150922_Session1_S1",
+                "MonkeyG_20150922_Session2_S1",
+                "MonkeyG_20150925_Session1_S1",
+                "MonkeyG_20150925_Session2_S1",
+                "MonkeyJ_20160426_Session3_S1",
+                "MonkeyJ_20160428_Session3_S1",
+                "MonkeyJ_20160429_Session1_S1",
+                "MonkeyJ_20160502_Session1_S1",
+                "MonkeyJ_20160624_Session3_S1",
+                "MonkeyJ_20160625_Session4_S1",
+                "MonkeyJ_20160625_Session5_S1",
+                "MonkeyJ_20160627_Session1_S1",
+                "MonkeyJ_20160630_Session3_S1",
+                "MonkeyJ_20160702_Session2_S1",
+            ][:num_sessions]
 
         if batch_size_per_session is None:
             MAX_BATCH_SIZE = 62500 // 8
@@ -134,6 +195,8 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
     embeddings_rest = multisession.load_rest_embeddings(
         held_in_session_ids, device=DEVICE
     )
+    if no_rest_embeddings:
+        embeddings_rest = {sid: torch.zeros_like(v) for sid, v in embeddings_rest.items()}
 
     # Batch sizes will be:
     print("Batch shapes:")
@@ -195,7 +258,7 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
     else:
         cfg.meta.is_basis_residual = True
         cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
-        cfg.meta.training.lambda_l2 = 1e-2
+        cfg.meta.training.lambda_l2 = lambda_l2 if lambda_l2 is not None else 1e-2
         if residual_mlp_hidden is not None:
             cfg.meta.residual_mlp_hidden = residual_mlp_hidden
     
@@ -204,6 +267,20 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         cfg.tbfm.module.embed_dim_stim = embed_dim_stim
     
     cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
+
+    # Ablation overrides (applied after all hardcoded defaults above)
+    if normalizer == "zscore":
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerZscore"
+    elif normalizer == "quant":
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerQuant"
+    if lambda_ae_recon is not None:
+        cfg.ae.training.lambda_ae_recon = lambda_ae_recon
+    if lambda_fro is not None:
+        cfg.tbfm.training.lambda_fro = lambda_fro
+    if lambda_ortho is not None:
+        cfg.tbfm.training.lambda_ortho = lambda_ortho
+    if no_tanh_basis_weights:
+        cfg.tbfm.module.use_tanh_basis_weights = False
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
 
@@ -328,7 +405,9 @@ def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=Non
         plt.savefig(os.path.join(my_out_dir, "statedeptest.png"))
         plt.clf()
 
-    graph_for_sid("MonkeyJ_20160426_Session2_S1", results, cidx=30)
+    # Only graph specific session if it was included in training
+    if "MonkeyJ_20160426_Session2_S1" in results.get("y_hat", {}):
+        graph_for_sid("MonkeyJ_20160426_Session2_S1", results, cidx=30)
     
     # Send completion notification
     try:
@@ -378,13 +457,33 @@ if __name__ == "__main__":
     parser.add_argument('--embed-dim-stim', type=int, default=None, help='Stim embedding dimension')
     parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
     parser.add_argument('--two-stage', action='store_true', help='Use two-stage autoencoder')
-    
+    parser.add_argument('--random-seed', type=int, default=None, help='Random seed for session selection')
+    parser.add_argument('--held-in-sessions', type=str, default=None,
+                        help='Comma-separated list of session IDs to use as held-in sessions (overrides random-seed)')
+
+    # Ablation flags
+    parser.add_argument('--normalizer', type=str, default=None, choices=['quant', 'zscore'],
+                        help='Normalizer type (default: quant = IQR/percentile-based)')
+    parser.add_argument('--lambda-ae-recon', type=float, default=None,
+                        help='Override AE reconstruction loss weight (default: 0.03)')
+    parser.add_argument('--lambda-fro', type=float, default=None,
+                        help='Override Frobenius regularization weight on basis weights (default: 75.0)')
+    parser.add_argument('--lambda-ortho', type=float, default=None,
+                        help='Override orthonormality penalty on bases (default: 0.0)')
+    parser.add_argument('--lambda-l2', type=float, default=None,
+                        help='Override L2 regularization on stimulus embeddings (default: 1e-2)')
+    parser.add_argument('--no-rest-embeddings', action='store_true',
+                        help='Zero out rest embeddings (ablate c_rest)')
+    parser.add_argument('--no-tanh-basis-weights', action='store_true',
+                        help='Remove tanh activation from basis weight network')
+
     args = parser.parse_args()
     
     # Parse boolean arguments
     coadapt = args.coadapt.lower() == 'true'
     shuffle = args.shuffle.lower() == 'true'
     basis_residual_rank = int(args.basis_residual_rank) if args.basis_residual_rank and args.basis_residual_rank.isdigit() else None
+    held_in_sessions = args.held_in_sessions.split(',') if args.held_in_sessions else None
 
     try:
         main(
@@ -401,6 +500,15 @@ if __name__ == "__main__":
             out_dir=args.out_dir,
             use_two_stage=args.two_stage,
             embed_dim_stim=args.embed_dim_stim,
+            random_seed=args.random_seed,
+            held_in_sessions=held_in_sessions,
+            normalizer=args.normalizer,
+            lambda_ae_recon=args.lambda_ae_recon,
+            lambda_fro=args.lambda_fro,
+            lambda_ortho=args.lambda_ortho,
+            lambda_l2=args.lambda_l2,
+            no_rest_embeddings=args.no_rest_embeddings,
+            no_tanh_basis_weights=args.no_tanh_basis_weights,
         )
     except Exception as e:
         notifications.notify_error(

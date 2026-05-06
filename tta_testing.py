@@ -176,6 +176,58 @@ def parse_args():
         default=1e-6,
         help="Learning rate for basis generator when unfrozen"
     )
+    parser.add_argument(
+        "--coadapt-tta",
+        action="store_true",
+        help="Use co-adaptation (joint embedding + AE update) instead of MAML for TTA"
+    )
+    parser.add_argument(
+        "--no-adapt-ae",
+        action="store_true",
+        help="Use PCA warm-start for AE but skip gradient updates (ablate AE fine-tuning at TTA time)"
+    )
+    parser.add_argument(
+        "--random-support",
+        action="store_true",
+        help="Randomly sample support set instead of taking the first N trials"
+    )
+    parser.add_argument(
+        "--support-seed",
+        type=int,
+        default=None,
+        help="Random seed for support set sampling (used with --random-support)"
+    )
+
+    # Ablation cfg overrides — passed through to TTA so the model is run with the
+    # same cfg it was trained under (otherwise TTA reverts to defaults and confounds the ablation).
+    parser.add_argument(
+        "--normalizer", type=str, default=None, choices=["quant", "zscore"],
+        help="Override normalizer type at TTA time (default: cfg default = ScalerQuant)"
+    )
+    parser.add_argument(
+        "--lambda-ae-recon", type=float, default=None,
+        help="Override cfg.ae.training.lambda_ae_recon at TTA time"
+    )
+    parser.add_argument(
+        "--lambda-fro", type=float, default=None,
+        help="Override cfg.tbfm.training.lambda_fro at TTA time"
+    )
+    parser.add_argument(
+        "--lambda-l2", type=float, default=None,
+        help="Override cfg.meta.training.lambda_l2 at TTA time"
+    )
+    parser.add_argument(
+        "--lambda-ortho", type=float, default=None,
+        help="Override cfg.tbfm.training.lambda_ortho at TTA time"
+    )
+    parser.add_argument(
+        "--no-tanh-basis-weights", action="store_true",
+        help="Set cfg.tbfm.module.use_tanh_basis_weights=False at TTA time"
+    )
+    parser.add_argument(
+        "--zero-rest-embeddings", action="store_true",
+        help="Zero all rest embeddings before TTA (mirrors --no-rest-embeddings at training)"
+    )
 
     return parser.parse_args()
 
@@ -185,6 +237,70 @@ def setup_environment(cuda_device: str):
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     os.environ["CUDA_VISIBLE_DEVICES"] = cuda_device
     print(f"Using CUDA device: {cuda_device}")
+
+
+def filter_session_loader(loader, session_ids: List[str]):
+    """
+    Create a filtered copy of a SessionLoader with only the specified sessions.
+    
+    Args:
+        loader: SessionLoader to filter
+        session_ids: List of session IDs to keep
+        
+    Returns:
+        Filtered SessionLoader with only the specified sessions
+    """
+    import copy
+    filtered = copy.copy(loader)
+    filtered._access_paths = {sid: loader._access_paths[sid] for sid in session_ids if sid in loader._access_paths}
+    filtered._torchmeta = {sid: loader._torchmeta[sid] for sid in session_ids if sid in loader._torchmeta}
+    filtered._iters = {}
+    filtered._reset_iters = set()
+    return filtered
+
+
+def apply_ablation_overrides(cfg, overrides: dict, log_prefix: str = ""):
+    """
+    Apply ablation cfg overrides at TTA time so the model is run with the same cfg
+    it was trained under. Prints every override applied for verification.
+    `overrides` keys: normalizer, lambda_ae_recon, lambda_fro, lambda_l2, lambda_ortho,
+                      no_tanh_basis_weights (bool).
+    """
+    if not overrides:
+        print(f"{log_prefix}[ABLATION] No overrides — using default cfg")
+        return cfg
+    OmegaConf.set_struct(cfg, False)
+    print(f"{log_prefix}[ABLATION] Applying overrides: {overrides}")
+    if overrides.get("normalizer") == "zscore":
+        prev = cfg.normalizers.module._target_
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerZscore"
+        print(f"{log_prefix}[ABLATION]   normalizer._target_: {prev} -> {cfg.normalizers.module._target_}")
+    elif overrides.get("normalizer") == "quant":
+        prev = cfg.normalizers.module._target_
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerQuant"
+        print(f"{log_prefix}[ABLATION]   normalizer._target_: {prev} -> {cfg.normalizers.module._target_}")
+    if overrides.get("lambda_ae_recon") is not None:
+        prev = cfg.ae.training.lambda_ae_recon
+        cfg.ae.training.lambda_ae_recon = float(overrides["lambda_ae_recon"])
+        print(f"{log_prefix}[ABLATION]   lambda_ae_recon: {prev} -> {cfg.ae.training.lambda_ae_recon}")
+    if overrides.get("lambda_fro") is not None:
+        prev = cfg.tbfm.training.lambda_fro
+        cfg.tbfm.training.lambda_fro = float(overrides["lambda_fro"])
+        print(f"{log_prefix}[ABLATION]   lambda_fro: {prev} -> {cfg.tbfm.training.lambda_fro}")
+    if overrides.get("lambda_l2") is not None:
+        prev = cfg.meta.training.lambda_l2
+        cfg.meta.training.lambda_l2 = float(overrides["lambda_l2"])
+        print(f"{log_prefix}[ABLATION]   lambda_l2: {prev} -> {cfg.meta.training.lambda_l2}")
+    if overrides.get("lambda_ortho") is not None:
+        prev = cfg.tbfm.training.get("lambda_ortho", 0.0)
+        cfg.tbfm.training.lambda_ortho = float(overrides["lambda_ortho"])
+        print(f"{log_prefix}[ABLATION]   lambda_ortho: {prev} -> {cfg.tbfm.training.lambda_ortho}")
+    if overrides.get("no_tanh_basis_weights"):
+        prev = cfg.tbfm.module.get("use_tanh_basis_weights", True)
+        cfg.tbfm.module.use_tanh_basis_weights = False
+        print(f"{log_prefix}[ABLATION]   use_tanh_basis_weights: {prev} -> False")
+    OmegaConf.set_struct(cfg, True)
+    return cfg
 
 
 def gpu_worker(
@@ -199,6 +315,11 @@ def gpu_worker(
     tta_epochs: int,
     tta_strategies: dict,
     output_dir: Path = None,
+    adapt_ae: bool = True,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
+    ablation_overrides: dict | None = None,
+    zero_rest_embeddings: bool = False,
 ):
     """
     Worker process for processing TTA jobs on a specific GPU.
@@ -276,11 +397,20 @@ def gpu_worker(
             if job is None:  # Poison pill to signal worker to exit
                 print(f"[GPU {gpu_id}] Worker received exit signal")
                 break
-            
-            model_key, support_size, strategy_key = job
+
+            # Handle both per-session jobs (4-tuple) and batch jobs (3-tuple)
+            if len(job) == 4:
+                # Per-session job (progressive unfreezing)
+                model_key, support_size, strategy_key, session_id = job
+                current_session_ids = [session_id]
+                print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}, Session={session_id}")
+            else:
+                # Batch job (all sessions together)
+                model_key, support_size, strategy_key = job
+                current_session_ids = adapt_session_ids
+                print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}, Sessions={len(current_session_ids)}")
+
             strategy_cfg = tta_strategies[strategy_key]
-            
-            print(f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}")
             
             # Create progress notification for this TTA run
             job_id = None
@@ -332,69 +462,200 @@ def gpu_worker(
                 print(f"[GPU {gpu_id}] Config after applying params: latent_dim={cfg_eval.latent_dim}, "
                       f"num_bases={cfg_eval.tbfm.module.num_bases}, rr={cfg_eval.meta.basis_residual_rank}, "
                       f"mlp_hidden={cfg_eval.meta.residual_mlp_hidden}, embed_dim_stim={cfg_eval.tbfm.module.embed_dim_stim}")
-                
-                model_file = model_path / "model_nf_1.torch"
-                if not model_file.exists():
-                    model_file = model_path / "model.torch"
-                
-                if not model_file.exists():
-                    raise FileNotFoundError(f"Model file not found for {model_key}")
-                
+
+                # Apply ablation overrides (must run AFTER params load, BEFORE model build)
+                cfg_eval = apply_ablation_overrides(
+                    cfg_eval, ablation_overrides, log_prefix=f"[GPU {gpu_id}] "
+                )
+                # Verify post-override
+                print(f"[GPU {gpu_id}] [VERIFY] post-override cfg: "
+                      f"normalizer={cfg_eval.normalizers.module._target_}, "
+                      f"use_tanh={cfg_eval.tbfm.module.get('use_tanh_basis_weights', True)}, "
+                      f"lambda_ae_recon={cfg_eval.ae.training.lambda_ae_recon}, "
+                      f"lambda_fro={cfg_eval.tbfm.training.lambda_fro}, "
+                      f"lambda_l2={cfg_eval.meta.training.lambda_l2}, "
+                      f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}")
+
+                is_coadapt = params.get('coadapt', False)
+                is_split_format = (model_path / "tbfm.torch").exists()
+
+                if not is_coadapt and not is_split_format:
+                    model_file = model_path / "model_nf_1.torch"
+                    if not model_file.exists():
+                        model_file = model_path / "model.torch"
+
+                    if not model_file.exists():
+                        raise FileNotFoundError(f"Model file not found for {model_key}")
+
                 # Get embeddings for this model
                 embeddings = embeddings_cache[model_key]
-                
+
+                # For per-session jobs, filter data to only the specified session(s)
+                if len(current_session_ids) < len(adapt_session_ids):
+                    # Filter both train and test data to only include current session(s)
+                    data_train_filtered = filter_session_loader(data_train, current_session_ids)
+                    data_test_filtered = filter_session_loader(data_test, current_session_ids)
+                    # Also filter embeddings to only the specified session(s)
+                    embeddings = {sid: embeddings[sid] for sid in current_session_ids if sid in embeddings}
+                else:
+                    # Use all data as-is
+                    data_train_filtered = data_train
+                    data_test_filtered = data_test
+
+                # Zero rest embeddings if no_rest ablation
+                if zero_rest_embeddings:
+                    embeddings = {sid: torch.zeros_like(v) for sid, v in embeddings.items()}
+                    nonzero = sum(int(v.abs().sum() > 0) for v in embeddings.values())
+                    print(f"[GPU {gpu_id}] [ABLATION] Zeroed rest embeddings for {len(embeddings)} sessions "
+                          f"(verify: {nonzero} have nonzero values, expect 0)")
+
                 # Verify config one more time right before building
                 print(f"[GPU {gpu_id}] VERIFY before build_from_cfg: cfg_eval.latent_dim = {cfg_eval.latent_dim}")
                 print(f"[GPU {gpu_id}] VERIFY type: {type(cfg_eval.latent_dim)}, value: {repr(cfg_eval.latent_dim)}")
-                
+
                 # Build model
-                ms_eval = multisession.build_from_cfg(
-                    cfg_eval,
-                    data_train,
-                    base_model_path=str(model_file),
-                    device=device,
-                )
+                if is_coadapt or is_split_format:
+                    # Split format saves per-component weights (tbfm.torch, ae.torch, norms.torch).
+                    # Build without a base model path, then load all components.
+                    label = "Coadapt" if is_coadapt else "Split-format"
+                    print(f"[GPU {gpu_id}] {label} model detected — loading per-session weights from {model_path.name}")
+                    ms_eval = multisession.build_from_cfg(
+                        cfg_eval,
+                        data_train_filtered,
+                        base_model_path=None,
+                        device=device,
+                    )
+                    multisession.load_model_components(model_path, ms_eval, device=device)
+                else:
+                    ms_eval = multisession.build_from_cfg(
+                        cfg_eval,
+                        data_train_filtered,
+                        base_model_path=str(model_file),
+                        device=device,
+                    )
                 
                 # Run TTA
                 adapted_embeddings, strategy_results = multisession.test_time_adaptation(
                     cfg_eval,
                     ms_eval,
                     embeddings,
-                    data_train,
+                    data_train_filtered,
                     epochs=tta_epochs,
-                    data_test=data_test,
+                    data_test=data_test_filtered,
                     ae_warm_start=True,
-                    adapt_ae=True,
+                    adapt_ae=adapt_ae,
                     support_size=support_size,
                     coadapt_embeddings=strategy_cfg["coadapt_embeddings"],
                     quiet=True,
-                    progress_job_id=job_id,  # Pass job_id for progress updates
+                    progress_job_id=job_id,
+                    random_sample_support=random_sample_support,
+                    support_seed=support_seed,
                 )
                 
                 final_r2 = strategy_results["final_test_r2"]
                 per_session_r2s = strategy_results.get("final_test_r2s", {})
-                
+                final_train_r2 = strategy_results.get("final_train_r2")
+                per_session_train_r2s = strategy_results.get("final_train_r2s", {})
+
                 # Save adapted model
                 if output_dir is not None:
-                    adapted_model_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
-                    adapted_model_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    # Save adapted model (TBFM only)
-                    multisession.save_model(ms_eval, adapted_model_dir / "model_adapted.torch", tbfm_only=True)
-                    
-                    # Save adapted embeddings
-                    torch.save(adapted_embeddings, adapted_model_dir / "embeddings_stim_adapted.torch")
-                    
-                    # Save metadata
-                    metadata = {
-                        "model_key": model_key,
-                        "support_size": support_size,
-                        "strategy_key": strategy_key,
-                        "final_r2": final_r2,
-                        "tta_epochs": tta_epochs,
-                        "adapt_session_ids": adapt_session_ids,
-                    }
-                    torch.save(metadata, adapted_model_dir / "metadata.torch")
+                    # Determine save location based on whether progressive unfreezing is active
+                    progressive_unfreezing_active = (
+                        hasattr(cfg_eval.meta.training, 'progressive_unfreezing_threshold') and
+                        cfg_eval.meta.training.progressive_unfreezing_threshold <= support_size and
+                        (cfg_eval.meta.training.get('unfreeze_basis_weights', False) or
+                         cfg_eval.meta.training.get('unfreeze_bases', False))
+                    )
+
+                    base_adapted_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
+
+                    if progressive_unfreezing_active:
+                        # Save each session to its own subfolder
+                        if len(current_session_ids) == 1:
+                            session_id = current_session_ids[0]
+                            adapted_model_dir = base_adapted_dir / session_id
+                        else:
+                            session_names = "_".join([s.split('_')[-1] for s in current_session_ids[:3]])
+                            if len(current_session_ids) > 3:
+                                session_names += f"_plus{len(current_session_ids)-3}"
+                            adapted_model_dir = base_adapted_dir / session_names
+
+                        adapted_model_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Save adapted model with all components (TBFM, AE, normalizers, embeddings)
+                        multisession.save_model(ms_eval, adapted_model_dir, tbfm_only=False, embeddings_stim=adapted_embeddings)
+
+                        metadata = {
+                            "model_key": model_key,
+                            "support_size": support_size,
+                            "strategy_key": strategy_key,
+                            "final_r2": final_r2,
+                            "tta_epochs": tta_epochs,
+                            "adapt_session_ids": current_session_ids,
+                            "per_session_r2s": per_session_r2s,
+                            "progressive_unfreezing": True,
+                        }
+                        torch.save(metadata, adapted_model_dir / "metadata.torch")
+
+                    else:
+                        # Progressive unfreezing disabled: merge session embeddings
+                        adapted_model_dir = base_adapted_dir
+                        adapted_model_dir.mkdir(parents=True, exist_ok=True)
+
+                        # Check for embeddings in new format first, then fall back to old format
+                        previous_embeddings_path = adapted_model_dir / "embeddings_stim.torch"
+                        if not previous_embeddings_path.exists():
+                            previous_embeddings_path = adapted_model_dir / "embeddings_stim_adapted.torch"
+                        previous_metadata_path = adapted_model_dir / "metadata.torch"
+
+                        # Load and merge with previous embeddings if they exist
+                        if previous_embeddings_path.exists():
+                            try:
+                                previous_embeddings = torch.load(previous_embeddings_path, map_location=device)
+                                previous_embeddings.update(adapted_embeddings)
+                                adapted_embeddings = previous_embeddings
+                                print(f"[GPU {gpu_id}] Merged {len(current_session_ids)} new session(s) with {len(previous_embeddings) - len(current_session_ids)} previous session(s)")
+                            except Exception as e:
+                                print(f"[GPU {gpu_id}] Warning: Could not load previous embeddings: {e}")
+
+                        # Load and merge metadata
+                        accumulated_sessions = list(current_session_ids)
+                        accumulated_r2s = dict(per_session_r2s)
+
+                        if previous_metadata_path.exists():
+                            try:
+                                previous_metadata = torch.load(previous_metadata_path, map_location='cpu')
+                                prev_sessions = previous_metadata.get("adapt_session_ids", [])
+                                prev_r2s = previous_metadata.get("per_session_r2s", {})
+
+                                # Merge session lists (keep unique, preserve order)
+                                seen = set(prev_sessions)
+                                accumulated_sessions = list(prev_sessions)
+                                for sid in current_session_ids:
+                                    if sid not in seen:
+                                        accumulated_sessions.append(sid)
+                                        seen.add(sid)
+
+                                # Merge R² scores
+                                accumulated_r2s = {**prev_r2s, **per_session_r2s}
+                            except Exception as e:
+                                print(f"[GPU {gpu_id}] Warning: Could not load previous metadata: {e}")
+
+                        # Save accumulated results with all components (TBFM, AE, normalizers, embeddings)
+                        multisession.save_model(ms_eval, adapted_model_dir, tbfm_only=False, embeddings_stim=adapted_embeddings)
+
+                        metadata = {
+                            "model_key": model_key,
+                            "support_size": support_size,
+                            "strategy_key": strategy_key,
+                            "final_r2": final_r2,
+                            "tta_epochs": tta_epochs,
+                            "adapt_session_ids": accumulated_sessions,
+                            "per_session_r2s": accumulated_r2s,
+                            "progressive_unfreezing": False,
+                            "num_sessions_accumulated": len(accumulated_sessions),
+                        }
+                        torch.save(metadata, adapted_model_dir / "metadata.torch")
                 
                 # Clean up
                 del ms_eval
@@ -412,6 +673,8 @@ def gpu_worker(
                     "strategy": strategy_key,
                     "r2": final_r2,
                     "per_session_r2s": per_session_r2s,
+                    "train_r2": final_train_r2,
+                    "per_session_train_r2s": per_session_train_r2s,
                     "gpu_id": gpu_id,
                 })
                 
@@ -792,13 +1055,16 @@ def clone_cfg_for_eval(base_cfg, vanilla = False):
         cfg_base(cfg, cfg.latent_dim)
     return cfg
 
-def get_tta_strategies() -> Dict:
+def get_tta_strategies(use_coadapt: bool = False) -> Dict:
     """Return available TTA strategies."""
+    if use_coadapt:
+        return {
+            "coadapt": {
+                "label": "Co-Adaptation",
+                "coadapt_embeddings": True
+            },
+        }
     return {
-        "coadapt": {
-            "label": "Co-Adaptation",
-            "coadapt_embeddings": True
-        },
         "maml": {
             "label": "MAML (Meta-Learning)",
             "coadapt_embeddings": False
@@ -1135,10 +1401,16 @@ def run_tta_sweep_multi_gpu(
     embeddings_cache: Dict,
     timestamp: str,
     log_path: Path,
+    progressive_unfreezing_enabled: bool = False,
+    adapt_ae: bool = True,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
+    ablation_overrides: dict | None = None,
+    zero_rest_embeddings: bool = False,
 ) -> Dict:
     """
     Multi-GPU version of run_tta_sweep using multiprocessing.
-    
+
     Distributes TTA jobs across multiple GPUs in parallel.
     """
     model_names = list(model_paths.keys())
@@ -1151,14 +1423,29 @@ def run_tta_sweep_multi_gpu(
     vanilla_tbfm_results = {}
     fresh_tbfm_results = {}
     tta_runs = []
-    
-    # Separate TTA jobs from baseline jobs
-    tta_jobs = [j for j in jobs if len(j) == 3]
-    baseline_jobs = [j for j in jobs if len(j) == 2]
-    
+
+    # With progressive unfreezing, create per-session jobs for better parallelization
+    if progressive_unfreezing_enabled:
+        print(f"Creating per-session jobs for progressive unfreezing ({len(adapt_session_ids)} sessions)")
+        # Expand jobs to include session IDs
+        tta_jobs_expanded = []
+        for job in jobs:
+            if len(job) == 3:  # TTA job
+                model_key, support_size, strategy_key = job
+                # Create one job per session
+                for session_id in adapt_session_ids:
+                    tta_jobs_expanded.append((model_key, support_size, strategy_key, session_id))
+        tta_jobs = tta_jobs_expanded
+        baseline_jobs = [j for j in jobs if len(j) == 2]
+        print(f"Expanded to {len(tta_jobs)} per-session TTA jobs")
+    else:
+        # Separate TTA jobs from baseline jobs
+        tta_jobs = [j for j in jobs if len(j) == 3]
+        baseline_jobs = [j for j in jobs if len(j) == 2]
+
     # Process baselines on single GPU (typically fast and not worth parallelizing)
     if baseline_jobs:
-        print(f"\\nProcessing {len(baseline_jobs)} baseline jobs on single GPU...")
+        print(f"\nProcessing {len(baseline_jobs)} baseline jobs on single GPU...")
         device = f"cuda:{gpu_ids[0]}"
         
         for job in tqdm.tqdm(baseline_jobs, desc="Baseline jobs"):
@@ -1245,6 +1532,11 @@ def run_tta_sweep_multi_gpu(
                     tta_epochs,
                     tta_strategies,
                     output_dir,
+                    adapt_ae,
+                    random_sample_support,
+                    support_seed,
+                    ablation_overrides,
+                    zero_rest_embeddings,
                 ),
             )
             p.start()
@@ -1257,7 +1549,7 @@ def run_tta_sweep_multi_gpu(
         with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
             def log_line(message=""):
                 print(message, flush=True)
-                log_stream.write(message + "\\n")
+                log_stream.write(message + "\n")
                 log_stream.flush()
             
             log_line(f"TTA sweep started at {timestamp}")
@@ -1278,8 +1570,10 @@ def run_tta_sweep_multi_gpu(
                         strategy_key = result["strategy"]
                         final_r2 = result["r2"]
                         per_session_r2s = result.get("per_session_r2s", {})
+                        final_train_r2 = result.get("train_r2")
+                        per_session_train_r2s = result.get("per_session_train_r2s", {})
                         gpu_id = result["gpu_id"]
-                        
+
                         tta_comparison[model_key][strategy_key].append((support_size, final_r2))
                         tta_runs.append({
                             "model": model_key,
@@ -1287,6 +1581,8 @@ def run_tta_sweep_multi_gpu(
                             "strategy": strategy_key,
                             "r2": final_r2,
                             "per_session_r2s": per_session_r2s,
+                            "train_r2": final_train_r2,
+                            "per_session_train_r2s": per_session_train_r2s,
                         })
                         
                         strategy_label = tta_strategies[strategy_key]["label"]
@@ -1308,8 +1604,8 @@ def run_tta_sweep_multi_gpu(
             # Wait for all workers to finish
             for p in workers:
                 p.join()
-            
-            log_line("\\n" + "=" * 80)
+
+            log_line("\n" + "=" * 80)
             log_line("TTA Sweep Complete - Summary")
             log_line("=" * 80)
             
@@ -1323,12 +1619,12 @@ def run_tta_sweep_multi_gpu(
                     )
             
             if vanilla_tbfm_results:
-                log_line("\\nVanilla TBFM Baseline:")
+                log_line("\nVanilla TBFM Baseline:")
                 for entry in sorted([e for e in tta_runs if e.get("strategy") == "vanilla_tbfm"], key=lambda x: x["support_size"]):
                     log_line(f"  Support={entry['support_size']:>5} | R²={entry['r2']:.4f}")
-            
+
             if fresh_tbfm_results:
-                log_line("\\nFresh TBFM (no multisession) Baseline:")
+                log_line("\nFresh TBFM (no multisession) Baseline:")
                 for entry in sorted([e for e in tta_runs if e.get("strategy") == "fresh_tbfm"], key=lambda x: x["support_size"]):
                     log_line(f"  Support={entry['support_size']:>5} | R²={entry['r2']:.4f}")
     
@@ -1369,6 +1665,13 @@ def run_tta_sweep(
     fresh_tbfm_epochs: int = 7001,
     use_multi_gpu: bool = False,
     gpu_ids: List[int] = None,
+    progressive_unfreezing_enabled: bool = False,
+    use_coadapt: bool = False,
+    adapt_ae: bool = True,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
+    ablation_overrides: dict | None = None,
+    zero_rest_embeddings: bool = False,
 ) -> Dict:
     """
     Run comprehensive TTA sweep across models, support sizes, and strategies.
@@ -1394,7 +1697,7 @@ def run_tta_sweep(
     Returns:
         Dictionary containing all results and metadata
     """
-    tta_strategies = get_tta_strategies()
+    tta_strategies = get_tta_strategies(use_coadapt=use_coadapt)
     model_names = list(model_paths.keys())
 
     # Cache embeddings per model
@@ -1485,6 +1788,12 @@ def run_tta_sweep(
             embeddings_cache,
             timestamp,
             log_path,
+            progressive_unfreezing_enabled,
+            adapt_ae=adapt_ae,
+            random_sample_support=random_sample_support,
+            support_seed=support_seed,
+            ablation_overrides=ablation_overrides,
+            zero_rest_embeddings=zero_rest_embeddings,
         )
 
     with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
@@ -1607,80 +1916,208 @@ def run_tta_sweep(
                 model_path = model_paths[model_key]
                 params = load_model_hyperparameters(model_path)
                 if params:
+                    OmegaConf.set_struct(cfg_eval, False)
                     if 'latent_dim' in params and params['latent_dim'] is not None:
                         cfg_eval.latent_dim = params['latent_dim']
+                        cfg_eval.ae.module.latent_dim = params['latent_dim']
+                        cfg_eval.tbfm.module.in_dim = params['latent_dim']
                     if 'num_bases' in params and params['num_bases'] is not None:
                         cfg_eval.tbfm.module.num_bases = params['num_bases']
                     if 'basis_residual_rank' in params and params['basis_residual_rank'] is not None:
                         cfg_eval.meta.basis_residual_rank = params['basis_residual_rank']
+                        cfg_eval.tbfm.module.basis_residual_rank = params['basis_residual_rank']
                     if 'residual_mlp_hidden' in params and params['residual_mlp_hidden'] is not None:
                         cfg_eval.meta.residual_mlp_hidden = params['residual_mlp_hidden']
+                        cfg_eval.tbfm.module.residual_mlp_hidden = params['residual_mlp_hidden']
                     if 'embed_dim_stim' in params and params['embed_dim_stim'] is not None:
                         cfg_eval.tbfm.module.embed_dim_stim = params['embed_dim_stim']
+                    OmegaConf.set_struct(cfg_eval, True)
 
-                # Find model file
-                model_file = model_paths[model_key] / "model_nf_1.torch"
-                if not model_file.exists():
-                    model_file = model_paths[model_key] / "model.torch"
+                # Apply ablation overrides
+                cfg_eval = apply_ablation_overrides(cfg_eval, ablation_overrides, log_prefix="")
+                print(f"[VERIFY] post-override cfg: "
+                      f"normalizer={cfg_eval.normalizers.module._target_}, "
+                      f"use_tanh={cfg_eval.tbfm.module.get('use_tanh_basis_weights', True)}, "
+                      f"lambda_ae_recon={cfg_eval.ae.training.lambda_ae_recon}, "
+                      f"lambda_fro={cfg_eval.tbfm.training.lambda_fro}, "
+                      f"lambda_l2={cfg_eval.meta.training.lambda_l2}, "
+                      f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}")
 
-                if not model_file.exists():
-                    raise FileNotFoundError(f"Model file not found for {model_key}")
+                is_coadapt = params.get('coadapt', False)
+                is_split_format = (model_paths[model_key] / "tbfm.torch").exists()
+
+                if not is_coadapt and not is_split_format:
+                    # Find model file
+                    model_file = model_paths[model_key] / "model_nf_1.torch"
+                    if not model_file.exists():
+                        model_file = model_paths[model_key] / "model.torch"
+
+                    if not model_file.exists():
+                        raise FileNotFoundError(f"Model file not found for {model_key}")
 
                 # Build model
-                ms_eval = multisession.build_from_cfg(
-                    cfg_eval,
-                    data_train,
-                    base_model_path=str(model_file),
-                    device=device,
-                )
+                if is_coadapt or is_split_format:
+                    label = "Coadapt" if is_coadapt else "Split-format"
+                    print(f"{label} model detected — loading per-session weights from {model_paths[model_key].name}")
+                    ms_eval = multisession.build_from_cfg(
+                        cfg_eval,
+                        data_train,
+                        base_model_path=None,
+                        device=device,
+                    )
+                    multisession.load_model_components(model_paths[model_key], ms_eval, device=device)
+                else:
+                    ms_eval = multisession.build_from_cfg(
+                        cfg_eval,
+                        data_train,
+                        base_model_path=str(model_file),
+                        device=device,
+                    )
+
+                # Zero rest embeddings if no_rest ablation
+                rest_embeds = embeddings_cache[model_key]
+                if zero_rest_embeddings:
+                    rest_embeds = {sid: torch.zeros_like(v) for sid, v in rest_embeds.items()}
+                    print(f"[ABLATION] Zeroed rest embeddings for {len(rest_embeds)} sessions")
 
                 # Run TTA
                 adapted_embeddings, strategy_results = multisession.test_time_adaptation(
                     cfg_eval,
                     ms_eval,
-                    embeddings_cache[model_key],
+                    rest_embeds,
                     data_train,
                     epochs=tta_epochs,
                     data_test=data_test,
                     ae_warm_start=True,
-                    adapt_ae=True,
+                    adapt_ae=adapt_ae,
                     support_size=support_size,
                     coadapt_embeddings=strategy_cfg["coadapt_embeddings"],
                     quiet=True,
+                    random_sample_support=random_sample_support,
+                    support_seed=support_seed,
                 )
 
                 # Store results
                 final_r2 = strategy_results["final_test_r2"]
                 tta_comparison[model_key][strategy_key].append((support_size, final_r2))
                 per_session_r2s = strategy_results.get("final_test_r2s", {})
+                final_train_r2 = strategy_results.get("final_train_r2")
+                per_session_train_r2s = strategy_results.get("final_train_r2s", {})
                 tta_runs.append({
                     "model": model_key,
                     "support_size": support_size,
                     "strategy": strategy_key,
                     "r2": final_r2,
                     "per_session_r2s": per_session_r2s,
+                    "train_r2": final_train_r2,
+                    "per_session_train_r2s": per_session_train_r2s,
                 })
 
-                # Save adapted model
-                adapted_model_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
-                adapted_model_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save adapted model (TBFM only)
-                multisession.save_model(ms_eval, adapted_model_dir / "model_adapted.torch", tbfm_only=True)
-                
-                # Save adapted embeddings
-                torch.save(adapted_embeddings, adapted_model_dir / "embeddings_stim_adapted.torch")
-                
-                # Save metadata
-                metadata = {
-                    "model_key": model_key,
-                    "support_size": support_size,
-                    "strategy_key": strategy_key,
-                    "final_r2": final_r2,
-                    "tta_epochs": tta_epochs,
-                    "adapt_session_ids": adapt_session_ids,
-                }
-                torch.save(metadata, adapted_model_dir / "metadata.torch")
+                # Determine save location based on whether progressive unfreezing is active
+                # Progressive unfreezing modifies shared components, so each session needs separate storage
+                progressive_unfreezing_active = (
+                    hasattr(cfg_eval.meta.training, 'progressive_unfreezing_threshold') and
+                    cfg_eval.meta.training.progressive_unfreezing_threshold <= support_size and
+                    (cfg_eval.meta.training.get('unfreeze_basis_weights', False) or
+                     cfg_eval.meta.training.get('unfreeze_bases', False))
+                )
+
+                # Base directory for this model/support/strategy combination
+                base_adapted_dir = output_dir / "adapted_models" / f"{model_key}_support{support_size}_{strategy_key}"
+
+                if progressive_unfreezing_active:
+                    # Progressive unfreezing enabled: save each session to its own subfolder
+                    # With batch size 1, adapt_session_ids should have exactly one session
+                    if len(adapt_session_ids) == 1:
+                        session_id = adapt_session_ids[0]
+                        adapted_model_dir = base_adapted_dir / session_id
+                    else:
+                        # Fallback for multiple sessions (shouldn't happen with our batching logic)
+                        session_names = "_".join([s.split('_')[-1] for s in adapt_session_ids[:3]])
+                        if len(adapt_session_ids) > 3:
+                            session_names += f"_plus{len(adapt_session_ids)-3}"
+                        adapted_model_dir = base_adapted_dir / session_names
+
+                    adapted_model_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Save adapted model with all components (TBFM, AE, normalizers, embeddings)
+                    multisession.save_model(ms_eval, adapted_model_dir, tbfm_only=False, embeddings_stim=adapted_embeddings)
+
+                    # Save metadata
+                    metadata = {
+                        "model_key": model_key,
+                        "support_size": support_size,
+                        "strategy_key": strategy_key,
+                        "final_r2": final_r2,
+                        "tta_epochs": tta_epochs,
+                        "adapt_session_ids": adapt_session_ids,
+                        "per_session_r2s": per_session_r2s,
+                        "progressive_unfreezing": True,
+                    }
+                    torch.save(metadata, adapted_model_dir / "metadata.torch")
+
+                else:
+                    # Progressive unfreezing disabled: merge session embeddings into single model
+                    # Load previous adapted embeddings if they exist and merge with new ones
+                    adapted_model_dir = base_adapted_dir
+                    adapted_model_dir.mkdir(parents=True, exist_ok=True)
+
+                    # Check for embeddings in new format first, then fall back to old format
+                    previous_embeddings_path = adapted_model_dir / "embeddings_stim.torch"
+                    if not previous_embeddings_path.exists():
+                        previous_embeddings_path = adapted_model_dir / "embeddings_stim_adapted.torch"
+                    previous_metadata_path = adapted_model_dir / "metadata.torch"
+
+                    # Load and merge with previous embeddings if they exist
+                    if previous_embeddings_path.exists():
+                        try:
+                            previous_embeddings = torch.load(previous_embeddings_path, map_location=device)
+                            # Merge: new embeddings override, but keep previous ones for other sessions
+                            previous_embeddings.update(adapted_embeddings)
+                            adapted_embeddings = previous_embeddings
+                            print(f"  Merged {len(adapt_session_ids)} new session(s) with {len(previous_embeddings) - len(adapt_session_ids)} previous session(s)")
+                        except Exception as e:
+                            print(f"  Warning: Could not load previous embeddings: {e}")
+
+                    # Load and merge metadata (accumulate session lists and R² scores)
+                    accumulated_sessions = list(adapt_session_ids)
+                    accumulated_r2s = dict(per_session_r2s)
+
+                    if previous_metadata_path.exists():
+                        try:
+                            previous_metadata = torch.load(previous_metadata_path, map_location='cpu')
+                            prev_sessions = previous_metadata.get("adapt_session_ids", [])
+                            prev_r2s = previous_metadata.get("per_session_r2s", {})
+
+                            # Merge session lists (keep unique, preserve order)
+                            seen = set(prev_sessions)
+                            accumulated_sessions = list(prev_sessions)
+                            for sid in adapt_session_ids:
+                                if sid not in seen:
+                                    accumulated_sessions.append(sid)
+                                    seen.add(sid)
+
+                            # Merge R² scores (new ones override)
+                            accumulated_r2s = {**prev_r2s, **per_session_r2s}
+                        except Exception as e:
+                            print(f"  Warning: Could not load previous metadata: {e}")
+
+                    # Save adapted model with all components (TBFM, AE, normalizers, embeddings)
+                    multisession.save_model(ms_eval, adapted_model_dir, tbfm_only=False, embeddings_stim=adapted_embeddings)
+
+                    # Save accumulated metadata
+                    metadata = {
+                        "model_key": model_key,
+                        "support_size": support_size,
+                        "strategy_key": strategy_key,
+                        "final_r2": final_r2,  # R² from this batch
+                        "tta_epochs": tta_epochs,
+                        "adapt_session_ids": accumulated_sessions,  # All sessions processed
+                        "per_session_r2s": accumulated_r2s,  # All per-session R²s
+                        "progressive_unfreezing": False,
+                        "num_sessions_accumulated": len(accumulated_sessions),
+                    }
+                    torch.save(metadata, adapted_model_dir / "metadata.torch")
 
                 log_line(
                     f"Complete  | Strategy={strategy_cfg['label']:<24} | "
@@ -1770,9 +2207,10 @@ def save_per_session_csv(results: Dict, csv_path: Path):
         strategy = run["strategy"]
         overall_r2 = run["r2"]
         per_session_r2s = run.get("per_session_r2s", {})
-        
+        overall_train_r2 = run.get("train_r2")
+        per_session_train_r2s = run.get("per_session_train_r2s", {})
+
         if per_session_r2s:
-            # Create a row for each session
             for session_id, session_r2 in per_session_r2s.items():
                 rows.append({
                     "model": model,
@@ -1781,9 +2219,10 @@ def save_per_session_csv(results: Dict, csv_path: Path):
                     "session_id": session_id,
                     "session_r2": session_r2,
                     "overall_r2": overall_r2,
+                    "session_train_r2": per_session_train_r2s.get(session_id),
+                    "overall_train_r2": overall_train_r2,
                 })
         else:
-            # No per-session data, just record the overall
             rows.append({
                 "model": model,
                 "strategy": strategy,
@@ -1791,11 +2230,13 @@ def save_per_session_csv(results: Dict, csv_path: Path):
                 "session_id": "(overall)",
                 "session_r2": overall_r2,
                 "overall_r2": overall_r2,
+                "session_train_r2": overall_train_r2,
+                "overall_train_r2": overall_train_r2,
             })
-    
+
     if rows:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
-            fieldnames = ["model", "strategy", "support_size", "session_id", "session_r2", "overall_r2"]
+            fieldnames = ["model", "strategy", "support_size", "session_id", "session_r2", "overall_r2", "session_train_r2", "overall_train_r2"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
@@ -1918,6 +2359,21 @@ def _main_impl(args):
         setup_environment(args.cuda_device)
     device = "cuda"
 
+    # Build ablation overrides dict from CLI args
+    ablation_overrides = {
+        "normalizer": args.normalizer,
+        "lambda_ae_recon": args.lambda_ae_recon,
+        "lambda_fro": args.lambda_fro,
+        "lambda_l2": args.lambda_l2,
+        "lambda_ortho": args.lambda_ortho,
+        "no_tanh_basis_weights": args.no_tanh_basis_weights,
+    }
+    # Drop None/False entries so apply_ablation_overrides only logs real overrides
+    ablation_overrides = {k: v for k, v in ablation_overrides.items()
+                          if v is not None and v is not False}
+    print(f"[MAIN] Ablation overrides for this run: {ablation_overrides}")
+    print(f"[MAIN] Zero rest embeddings: {args.zero_rest_embeddings}")
+
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1974,36 +2430,50 @@ def _main_impl(args):
         args.adapt_session
     )
 
-    # Process sessions in groups of 5 to manage memory
-    SESSION_GROUP_SIZE = 5 if max(args.support_sizes) >= 2500 else 15
+    # Determine session batch size based on progressive unfreezing
+    # With progressive unfreezing, shared components are adapted, so each session needs individual processing
+    # Without it, only session-specific embeddings differ, so we can batch for memory efficiency
+    progressive_unfreezing_enabled = (
+        cfg.meta.training.progressive_unfreezing_threshold <= max(args.support_sizes) and
+        (cfg.meta.training.get('unfreeze_basis_weights', False) or
+         cfg.meta.training.get('unfreeze_bases', False))
+    )
+
+    if progressive_unfreezing_enabled:
+        # Process each session individually to get per-session adapted models
+        SESSION_GROUP_SIZE = 1
+        print(f"\nProgressive unfreezing enabled: processing each session individually")
+    else:
+        # Batch sessions for memory efficiency (only session embeddings differ)
+        SESSION_GROUP_SIZE = 5 if max(args.support_sizes) >= 2500 else 15
+        print(f"\nProgressive unfreezing disabled: batching sessions for efficiency")
+
     session_groups = [
         adapt_session_ids[i:i + SESSION_GROUP_SIZE]
         for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
     ]
 
-    print(f"\nProcessing {len(adapt_session_ids)} sessions in {len(session_groups)} group(s) of up to {SESSION_GROUP_SIZE}")
+    print(f"Processing {len(adapt_session_ids)} sessions in {len(session_groups)} group(s) of up to {SESSION_GROUP_SIZE}")
 
-    # Run TTA for each group and aggregate results
-    all_results = []
-    for group_idx, session_group in enumerate(session_groups):
-        print(f"\n{'='*80}")
-        print(f"Processing group {group_idx + 1}/{len(session_groups)}: {len(session_group)} sessions")
-        print(f"{'='*80}\n")
+    # Multi-GPU with progressive unfreezing: process all sessions in parallel
+    # Skip session grouping to allow full parallelization across sessions
+    if args.use_multi_gpu and progressive_unfreezing_enabled:
+        print(f"\nMulti-GPU mode with progressive unfreezing: processing all sessions in parallel")
 
-        # Prepare data for this group
+        # Prepare data for all sessions
         data_train, data_test, embeddings_rest = prepare_data(
-            session_group,
+            adapt_session_ids,
             window_size,
             args.batch_size_per_session,
             device
         )
 
-        # Run TTA sweep for this group
-        group_results = run_tta_sweep(
+        # Run TTA sweep on all sessions (multi-GPU will create per-session jobs)
+        results = run_tta_sweep(
             model_paths,
             held_in_sessions_map,
             args.support_sizes,
-            session_group,
+            adapt_session_ids,
             cfg,
             data_train,
             data_test,
@@ -2016,13 +2486,63 @@ def _main_impl(args):
             fresh_tbfm_epochs=args.fresh_tbfm_epochs,
             use_multi_gpu=args.use_multi_gpu,
             gpu_ids=args.gpu_ids,
+            progressive_unfreezing_enabled=progressive_unfreezing_enabled,
+            use_coadapt=args.coadapt_tta,
+            adapt_ae=not args.no_adapt_ae,
+            random_sample_support=args.random_support,
+            support_seed=args.support_seed,
+            ablation_overrides=ablation_overrides,
+            zero_rest_embeddings=args.zero_rest_embeddings,
         )
+        all_results = [results]
 
-        all_results.append(group_results)
+    else:
+        # Single-GPU or non-progressive-unfreezing: use session grouping
+        all_results = []
+        for group_idx, session_group in enumerate(session_groups):
+            print(f"\n{'='*80}")
+            print(f"Processing group {group_idx + 1}/{len(session_groups)}: {len(session_group)} sessions")
+            print(f"{'='*80}\n")
 
-        # Clean up GPU memory between groups
-        del data_train, data_test, embeddings_rest
-        torch.cuda.empty_cache()
+            # Prepare data for this group
+            data_train, data_test, embeddings_rest = prepare_data(
+                session_group,
+                window_size,
+                args.batch_size_per_session,
+                device
+            )
+
+            # Run TTA sweep for this group
+            group_results = run_tta_sweep(
+                model_paths,
+                held_in_sessions_map,
+                args.support_sizes,
+                session_group,
+                cfg,
+                data_train,
+                data_test,
+                args.tta_epochs,
+                device,
+                args.output_dir,
+                include_vanilla_tbfm=args.include_vanilla_tbfm,
+                vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
+                include_fresh_tbfm=args.include_fresh_tbfm,
+                fresh_tbfm_epochs=args.fresh_tbfm_epochs,
+                use_multi_gpu=args.use_multi_gpu,
+                gpu_ids=args.gpu_ids,
+                use_coadapt=args.coadapt_tta,
+                adapt_ae=not args.no_adapt_ae,
+                random_sample_support=args.random_support,
+                support_seed=args.support_seed,
+                ablation_overrides=ablation_overrides,
+                zero_rest_embeddings=args.zero_rest_embeddings,
+            )
+
+            all_results.append(group_results)
+
+            # Clean up GPU memory between groups
+            del data_train, data_test, embeddings_rest
+            torch.cuda.empty_cache()
 
     # Aggregate results from all groups
     print(f"\n{'='*80}")

@@ -21,6 +21,8 @@ tbfm:
     embed_dim_rest: 3
     embed_dim_stim: 15
     use_hypernetwork: ${meta.use_hypernetwork}
+    use_tanh_basis_weights: true
+    use_basis_weight_row_norm: true
     hypernet_context_dim: ${meta.hypernetwork.context_dim}
     hypernet_context_encoder_hidden: ${meta.hypernetwork.context_encoder_hidden}
     hypernet_param_generator_hidden: ${meta.hypernetwork.param_generator_hidden}
