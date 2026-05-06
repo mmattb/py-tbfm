@@ -64,8 +64,10 @@ gcloud compute ssh "${BUILDER_VM}" --zone="${ZONE}" --project="${PROJECT}" --com
     . .venv/bin/activate
     pip install --upgrade pip
     pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
-    pip install -r requirements.txt
-    pip install -e .
+    # Use the minimal cloud requirements; full requirements.txt has many yanked/
+    # source-only pins from the research env that we do not need for headless TTA.
+    pip install -r requirements_cloud.txt
+    pip install --no-deps -e .
     python -c "import torch; assert torch.cuda.is_available() or True; print(torch.__version__)"
     sudo mkdir -p /mnt/data
     sudo chown -R $USER:$USER /mnt/data

@@ -1,0 +1,17 @@
+# Minimal deps for TTA inference on cloud VMs.
+# Used by scripts/cloud/build_image.sh instead of full requirements.txt to avoid
+# yanked / source-only pins from the research env that aren't needed for headless TTA.
+#
+# torch and torchvision are installed separately in build_image.sh against the
+# cu129 wheel index; pin them out of this file.
+
+hydra-core==1.3.2
+omegaconf==2.3.0
+numpy==1.26.4
+scipy==1.13.1
+pandas==2.2.2
+matplotlib==3.9.2
+tqdm==4.66.5
+statsmodels==0.14.2
+torcheval==0.0.7
+google-cloud-storage>=2.10.0
