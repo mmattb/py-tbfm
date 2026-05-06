@@ -169,3 +169,20 @@ training_log.txt
 archive/
 state_dependency_results*
 session_*
+
+# Generated experiment results and outputs
+results/
+figures/
+figures_portable/
+random_folds_*/
+random_folds_coadapt_*/
+sweep_rr_mlp_*/
+ablations_*/
+
+# Generated data/analysis files
+tbfm_cv_data*.csv
+all_inference_times.csv
+all_train_times.csv
+vanilla_training_times.csv
+wilcoxon.txt
+predictions_*.png
