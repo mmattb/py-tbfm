@@ -38,7 +38,7 @@ get_gpu_flags() {
     fi
 }
 
-SUPPORT_SIZE=2500
+: "${SUPPORT_SIZE:=2500}"   # honor pre-set value (e.g. SUPPORT_SIZE=5000 for cloud runs)
 STANDARD_TTA_FLAGS="--unfreeze-bases --progressive-unfreezing-threshold 0 --max-adapt-sessions 20 --tta-epochs 7001"
 
 # Per-ablation TTA cfg overrides — must mirror the training overrides in scripts/train_ablations.sh
@@ -52,15 +52,18 @@ declare -A ABLATION_TTA_FLAGS=(
     ["no_l2"]="--lambda-l2 0"
 )
 
-ABLATION_NAMES=(
-    "baseline"
-    "zscore_norm"
-    "no_tanh"
-    "no_ae_recon"
-    "with_ortho"
-    "no_rest"
-    "no_l2"
-)
+# ABLATION_NAMES can be pre-set in the env (e.g. for single-ablation cloud runs).
+if [ -z "${ABLATION_NAMES+x}" ]; then
+    ABLATION_NAMES=(
+        "baseline"
+        "zscore_norm"
+        "no_tanh"
+        "no_ae_recon"
+        "with_ortho"
+        "no_rest"
+        "no_l2"
+    )
+fi
 
 # WINNERS_ONLY=1 restricts the sweep to the 4 ablations that significantly beat
 # baseline at support=500. Used to prioritize the 2500 sweep.

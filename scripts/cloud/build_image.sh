@@ -21,7 +21,7 @@ IMAGE_NAME="${IMAGE_NAME:-py-tbfm-base}"
 IMAGE_FAMILY="${IMAGE_FAMILY:-py-tbfm}"
 BUILDER_VM="${BUILDER_VM:-py-tbfm-image-builder}"
 BUILDER_MACHINE="${BUILDER_MACHINE:-n1-standard-4}"
-SOURCE_IMAGE_FAMILY="${SOURCE_IMAGE_FAMILY:-pytorch-latest-gpu}"
+SOURCE_IMAGE_FAMILY="${SOURCE_IMAGE_FAMILY:-pytorch-2-9-cu129-ubuntu-2204-nvidia-580}"
 SOURCE_IMAGE_PROJECT="${SOURCE_IMAGE_PROJECT:-deeplearning-platform-release}"
 REPO_URL="${REPO_URL:?REPO_URL env var required (e.g. https://github.com/you/py-tbfm.git)}"
 REPO_BRANCH="${REPO_BRANCH:-main}"
@@ -55,7 +55,7 @@ done
 gcloud compute ssh "${BUILDER_VM}" --zone="${ZONE}" --project="${PROJECT}" --command='
     set -euo pipefail
     sudo apt-get update -qq
-    sudo apt-get install -y -qq tmux git build-essential
+    sudo apt-get install -y -qq tmux git build-essential python3-venv python3-pip
     cd /opt
     sudo git clone --depth 1 --branch '"${REPO_BRANCH}"' '"${REPO_URL}"' py-tbfm
     sudo chown -R $USER:$USER /opt/py-tbfm
@@ -63,7 +63,7 @@ gcloud compute ssh "${BUILDER_VM}" --zone="${ZONE}" --project="${PROJECT}" --com
     python3 -m venv .venv
     . .venv/bin/activate
     pip install --upgrade pip
-    pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu124
+    pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu129
     pip install -r requirements.txt
     pip install -e .
     python -c "import torch; assert torch.cuda.is_available() or True; print(torch.__version__)"
