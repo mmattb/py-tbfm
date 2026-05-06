@@ -45,7 +45,7 @@ meta:
     embed_steps_per_other_step: 1  # How many embedding updates per other parameter updates
     inner_steps: 20  # Number of inner loop steps for MAML
     support_size: 300
-    lambda_l2: 1e-3
+    lambda_l2: 1e-2
     
     # Progressive unfreezing for high support sizes (supervised fine-tuning)
     progressive_unfreezing_threshold: 2000  # Support size threshold for enabling supervised fine-tuning
