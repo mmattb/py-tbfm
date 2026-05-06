@@ -168,7 +168,7 @@ test/
 training_log.txt
 archive/
 state_dependency_results*
-session_*
+/session_*
 
 # Generated experiment results and outputs
 results/
