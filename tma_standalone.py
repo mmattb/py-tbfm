@@ -1,0 +1,532 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import os
+import random
+import shutil
+import sys
+
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # see issue #152
+
+from pathlib import Path
+from hydra import initialize_config_dir, compose
+from hydra.utils import instantiate
+from omegaconf import OmegaConf
+import tqdm
+import torch
+import matplotlib.pyplot as plt
+
+from tbfm import dataset
+from tbfm import meta
+from tbfm import multisession
+from tbfm import utils
+
+
+class _NotificationsStub:
+    """No-op fallback so optional progress notifications don't require the module."""
+    def __getattr__(self, name):
+        return lambda *args, **kwargs: None
+
+
+notifications = _NotificationsStub()
+
+DATA_DIR = os.getenv("TBFM_DATA_DIR", "/var/data/opto-coproc/")
+
+OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc folder.
+EMBEDDING_REST_SUBDIR = "embedding_rest"
+DEVICE = "cuda"  # cfg.device
+
+# All 40 valid sessions with complete preprocessing
+ALL_VALID_SESSIONS = [
+    "MonkeyG_20150914_Session1_S1",
+    "MonkeyG_20150914_Session3_S1",
+    "MonkeyG_20150915_Session2_S1",
+    "MonkeyG_20150915_Session3_S1",
+    "MonkeyG_20150915_Session4_S1",
+    "MonkeyG_20150915_Session5_S1",
+    "MonkeyG_20150916_Session4_S1",
+    "MonkeyG_20150917_Session1_M1",
+    "MonkeyG_20150917_Session1_S1",
+    "MonkeyG_20150917_Session2_M1",
+    "MonkeyG_20150917_Session2_S1",
+    "MonkeyG_20150917_Session3_M1",
+    "MonkeyG_20150917_Session3_S1",
+    "MonkeyG_20150918_Session1_M1",
+    "MonkeyG_20150918_Session1_S1",
+    "MonkeyG_20150921_Session3_S1",
+    "MonkeyG_20150921_Session5_S1",
+    "MonkeyG_20150922_Session1_S1",
+    "MonkeyG_20150922_Session2_S1",
+    "MonkeyG_20150922_Session3_S1",
+    "MonkeyG_20150925_Session1_S1",
+    "MonkeyG_20150925_Session2_S1",
+    "MonkeyJ_20160426_Session1_S1",
+    "MonkeyJ_20160426_Session2_S1",
+    "MonkeyJ_20160426_Session3_S1",
+    "MonkeyJ_20160428_Session2_S1",
+    "MonkeyJ_20160428_Session3_S1",
+    "MonkeyJ_20160429_Session1_S1",
+    "MonkeyJ_20160429_Session3_S1",
+    "MonkeyJ_20160502_Session1_S1",
+    "MonkeyJ_20160624_Session3_S1",
+    "MonkeyJ_20160624_Session4_S1",
+    "MonkeyJ_20160625_Session4_S1",
+    "MonkeyJ_20160625_Session5_S1",
+    "MonkeyJ_20160627_Session1_S1",
+    "MonkeyJ_20160627_Session2_S1",
+    "MonkeyJ_20160630_Session1_S1",
+    "MonkeyJ_20160630_Session3_S1",
+    "MonkeyJ_20160702_Session2_S1",
+    "MonkeyJ_20160702_Session4_S1",
+]
+
+
+def main(num_bases, num_sessions, gpu, coadapt=False, basis_residual_rank_in=None, train_size=5000, shuffle=False,
+         latent_dim=None, batch_size_per_session=None, residual_mlp_hidden=None, out_dir=None, use_two_stage=False,
+         embed_dim_stim=None, random_seed=None, held_in_sessions=None,
+         normalizer=None, lambda_ae_recon=None, lambda_fro=None, lambda_ortho=None, lambda_l2=None,
+         no_rest_embeddings=False, no_tanh_basis_weights=False, no_row_norm=False):
+
+    if out_dir is None:
+        my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
+        if basis_residual_rank_in is not None:
+            my_out_dir += f"_rr{basis_residual_rank_in}" + f"_{ 'coadapt' if coadapt else 'inner' }"
+
+        # Add train_size and shuffle to folder name
+        my_out_dir += f"_ts{train_size}"
+        if shuffle:
+            my_out_dir += "_shuffle"
+        
+        # Add hyperparameter info to folder name
+        if latent_dim is not None:
+            my_out_dir += f"_ld{latent_dim}"
+        if batch_size_per_session is not None:
+            my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
+        if residual_mlp_hidden is not None:
+            my_out_dir += f"_mlp{residual_mlp_hidden}"
+        if embed_dim_stim is not None:
+            my_out_dir += f"_eds{embed_dim_stim}"
+        if use_two_stage:
+            my_out_dir += "_2stage"
+    else:
+        my_out_dir = out_dir
+
+    try:
+        shutil.rmtree(my_out_dir)
+    except OSError:
+        pass
+    os.makedirs(my_out_dir)
+
+    print(f"----------- Device: {gpu}, out: {my_out_dir} ------------")
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+
+    meta = dataset.load_meta(DATA_DIR)
+    conf_dir = Path("./conf").resolve()
+
+    # Initialize Hydra with the configuration directory
+    with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+        # Compose the configuration
+        cfg = compose(config_name="config")  # i.e. conf/config.yaml
+
+    WINDOW_SIZE = cfg.data.trial_len
+    NUM_HELD_OUT_SESSIONS = cfg.training.num_held_out_sessions
+
+    if num_sessions == 40:
+        held_in_session_ids = None
+    elif held_in_sessions is not None:
+        # Explicit session list provided — use as-is
+        held_in_session_ids = held_in_sessions
+        if batch_size_per_session is None:
+            MAX_BATCH_SIZE = 62500 // 8
+            batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        else:
+            batch_size = batch_size_per_session * num_sessions
+    elif num_sessions < 40:
+        # Select sessions based on random seed or use default order
+        if random_seed is not None:
+            # Use random seed to select sessions from all valid sessions
+            rng = random.Random(random_seed)
+            held_in_session_ids = rng.sample(ALL_VALID_SESSIONS, num_sessions)
+        else:
+            # Use the default first N sessions (original behavior)
+            held_in_session_ids = [
+                "MonkeyJ_20160426_Session2_S1",
+                "MonkeyG_20150914_Session1_S1",
+                "MonkeyG_20150915_Session3_S1",
+                "MonkeyG_20150915_Session5_S1",
+                "MonkeyG_20150916_Session4_S1",
+                "MonkeyG_20150917_Session1_M1",
+                "MonkeyG_20150917_Session1_S1",
+                "MonkeyG_20150917_Session2_M1",
+                "MonkeyG_20150917_Session2_S1",
+                "MonkeyG_20150921_Session3_S1",
+                "MonkeyG_20150921_Session5_S1",
+                "MonkeyG_20150922_Session1_S1",
+                "MonkeyG_20150922_Session2_S1",
+                "MonkeyG_20150925_Session1_S1",
+                "MonkeyG_20150925_Session2_S1",
+                "MonkeyJ_20160426_Session3_S1",
+                "MonkeyJ_20160428_Session3_S1",
+                "MonkeyJ_20160429_Session1_S1",
+                "MonkeyJ_20160502_Session1_S1",
+                "MonkeyJ_20160624_Session3_S1",
+                "MonkeyJ_20160625_Session4_S1",
+                "MonkeyJ_20160625_Session5_S1",
+                "MonkeyJ_20160627_Session1_S1",
+                "MonkeyJ_20160630_Session3_S1",
+                "MonkeyJ_20160702_Session2_S1",
+            ][:num_sessions]
+
+        if batch_size_per_session is None:
+            MAX_BATCH_SIZE = 62500 // 8
+            batch_size = (MAX_BATCH_SIZE // num_sessions) * num_sessions
+        else:
+            batch_size = batch_size_per_session * num_sessions
+    else:
+        raise ValueError("blah")
+
+    d, held_out_session_ids = multisession.load_stim_batched(
+        window_size=WINDOW_SIZE,
+        session_subdir="torchraw",
+        data_dir=DATA_DIR,
+        unpack_stiminds=True,
+        held_in_session_ids=held_in_session_ids,
+        batch_size=batch_size,
+        num_held_out_sessions=NUM_HELD_OUT_SESSIONS,
+    )
+    data_train, data_test = d.train_test_split(train_size, test_cut=2500)
+
+    held_in_session_ids = data_train.session_ids
+
+    # Gather cached rest embeddings...
+    embeddings_rest = multisession.load_rest_embeddings(
+        held_in_session_ids, device=DEVICE
+    )
+    if no_rest_embeddings:
+        embeddings_rest = {sid: torch.zeros_like(v) for sid, v in embeddings_rest.items()}
+
+    # Batch sizes will be:
+    print("Batch shapes:")
+    print("Train")
+    b = next(iter(data_train))
+    k = list(b.keys())
+    k0 = k[0]
+
+    for batch in iter(data_train):
+        print(batch[k0][0].shape)
+
+    print("Test")
+    b = next(iter(data_test))
+    k = list(b.keys())
+    k0 = k[0]
+
+    for batch in iter(data_test):
+        print(batch[k0][0].shape)
+
+    def cfg_identity(cfg, dim):
+        cfg.ae.training.coadapt = False
+        cfg.ae.warm_start_is_identity = True
+        cfg.latent_dim = dim
+
+    def cfg_base(cfg, dim):
+        cfg_identity(cfg, dim)
+        # cfg.training.grad_clip = 2.0
+        # cfg.tbfm.training.lambda_ortho = 0.05
+        cfg.tbfm.module.use_film_bases = False
+        cfg.tbfm.module.num_bases = 12
+        cfg.tbfm.module.latent_dim = 2
+        cfg.training.epochs = 12001
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerZscore"
+
+    def cfg_big_bases(cfg):
+        # cfg.training.grad_clip = 2.0
+        # cfg.tbfm.training.lambda_ortho = 0.05
+        cfg.tbfm.module.use_film_bases = False
+        cfg.tbfm.module.num_bases = 100
+        cfg.tbfm.module.latent_dim = 3
+        cfg.training.epochs = 12001
+        cfg.latent_dim = 74
+        cfg.ae.use_two_stage = False
+        cfg.ae.training.lambda_ae_recon = 0.03
+        cfg.tbfm.training.lambda_fro = 60.0
+
+    cfg.training.epochs = 12001
+    cfg.latent_dim = latent_dim if latent_dim is not None else 85
+    cfg.tbfm.module.num_bases = num_bases
+    cfg.ae.training.lambda_ae_recon = 0.03
+    cfg.ae.use_two_stage = False
+    cfg.ae.two_stage.freeze_only_shared = False
+    cfg.ae.two_stage.lambda_mu = 0.01
+    cfg.ae.two_stage.lambda_cov = 0.01
+    cfg.tbfm.training.lambda_fro = 75.0
+
+    if basis_residual_rank_in == 0:
+        cfg.meta.is_basis_residual = False
+    else:
+        cfg.meta.is_basis_residual = True
+        cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
+        cfg.meta.training.lambda_l2 = lambda_l2 if lambda_l2 is not None else 1e-2
+        if residual_mlp_hidden is not None:
+            cfg.meta.residual_mlp_hidden = residual_mlp_hidden
+    
+    # Set stim embedding dimension if provided
+    if embed_dim_stim is not None:
+        cfg.tbfm.module.embed_dim_stim = embed_dim_stim
+    
+    cfg.meta.training.coadapt = coadapt  # Enable co-adaptation of embeddings
+
+    # Ablation overrides (applied after all hardcoded defaults above)
+    if normalizer == "zscore":
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerZscore"
+    elif normalizer == "quant":
+        cfg.normalizers.module._target_ = "tbfm.normalizers.ScalerQuant"
+    if lambda_ae_recon is not None:
+        cfg.ae.training.lambda_ae_recon = lambda_ae_recon
+    if lambda_fro is not None:
+        cfg.tbfm.training.lambda_fro = lambda_fro
+    if lambda_ortho is not None:
+        cfg.tbfm.training.lambda_ortho = lambda_ortho
+    if no_tanh_basis_weights:
+        cfg.tbfm.module.use_tanh_basis_weights = False
+    if no_row_norm:
+        cfg.tbfm.module.use_basis_weight_row_norm = False
+
+    ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
+
+    # Initialize trainable stim embeddings for co-adaptation if enabled
+    if cfg.meta.training.coadapt:
+        embed_dim_stim = ms.model.bases.embed_dim_stim
+        embeddings_stim_init = {}
+        for session_id in held_in_session_ids:
+            emb = torch.randn(embed_dim_stim, device=DEVICE) * 0.1
+            emb.requires_grad = True
+            embeddings_stim_init[session_id] = emb
+    else:
+        embeddings_stim_init = None
+
+    model_optims = multisession.get_optims(cfg, ms, embeddings_stim=embeddings_stim_init)
+
+    # Create progress notification
+    model_name = f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in or 0}"
+    job_id = None
+    try:
+        job_id = notifications.create_progress_notification(
+            job_id=f"train_{model_name}",
+            title=f"Training {model_name}",
+            initial_message=f"Starting {cfg.training.epochs} epochs with {num_sessions} sessions..."
+        )
+    except Exception as e:
+        print(f"Failed to create progress notification: {e}")
+    
+    embeddings_stim, results = multisession.train_from_cfg(
+        cfg,
+        ms,
+        data_train,
+        model_optims,
+        embeddings_rest,
+        embeddings_stim=embeddings_stim_init,
+        data_test=data_test,
+        test_interval=1000,
+        epochs=cfg.training.epochs,
+        random_sample_support=shuffle,
+        progress_job_id=job_id,
+    )
+
+    # Save hyperparameters for TTA evaluation
+    hyperparameters = {
+        'num_bases': num_bases,
+        'num_sessions': num_sessions,
+        'latent_dim': cfg.latent_dim,
+        'basis_residual_rank': cfg.meta.basis_residual_rank if cfg.meta.is_basis_residual else None,
+        'residual_mlp_hidden': cfg.meta.residual_mlp_hidden if cfg.meta.is_basis_residual else None,
+        'embed_dim_stim': cfg.tbfm.module.embed_dim_stim,
+        'embed_dim_rest': cfg.tbfm.module.embed_dim_rest,
+        'is_basis_residual': cfg.meta.is_basis_residual,
+        'coadapt': coadapt,
+        'train_size': train_size,
+        'shuffle': shuffle,
+        'batch_size_per_session': batch_size_per_session,
+        'use_two_stage': use_two_stage,
+    }
+    torch.save(hyperparameters, os.path.join(my_out_dir, "hyperparameters.torch"))
+    
+    torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
+    torch.save(results, os.path.join(my_out_dir, "r.torch"))
+    torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi.torch"))
+    multisession.save_model(ms, os.path.join(my_out_dir, "model.torch"))
+
+    txt = [t[0] for t in results["train_losses"]]
+    tlt = [t[1] for t in results["train_losses"]]
+    plt.plot(txt[-500:], tlt[-500:], label="train")
+    plt.savefig(os.path.join(my_out_dir, "losses_last.png"))
+    plt.clf()
+
+    plt.plot(txt, tlt, label="train")
+    tx = [t[0] for t in results["test_losses"]]
+    tl = [t[1] for t in results["test_losses"]]
+    plt.plot(tx, tl, label="test")
+    plt.legend()
+    plt.savefig(os.path.join(my_out_dir, "losses.png"))
+    plt.clf()
+
+    tx = [t[0] for t in results["train_r2s"]]
+    tr = [t[1] for t in results["train_r2s"]]
+    plt.plot(tx, tr, label="train")
+    te = [t[1] for t in results["test_r2s"]]
+    plt.plot(tx, te, label="test")
+    plt.legend()
+    plt.savefig(os.path.join(my_out_dir, "r2s.png"))
+    plt.clf()
+
+    def graph_for_sid(sid, results, cidx=30):
+        from tbfm import test
+
+        y_hats = results["y_hat"][sid].detach().cpu()
+        y_hats_test = results["y_hat_test"][sid].detach().cpu()
+
+        y = results["y"][sid].detach().cpu()
+        y_test = results["y_test"][sid][2].detach().cpu()
+
+        y_hat_mean = torch.mean(y_hats, dim=0)
+        y_hat_test_mean = torch.mean(y_hats_test, dim=0)
+        y_mean = torch.mean(y, dim=0)
+        y_test_mean = torch.mean(y_test, dim=0)
+
+        plt.plot(y_hat_mean[20:, cidx], label="hat")
+        plt.plot(y_mean[20:, cidx], label="y")
+        plt.legend()
+        plt.savefig(os.path.join(my_out_dir, "ymean.png"))
+        plt.clf()
+
+        plt.plot(y_hat_test_mean[20:, cidx], label="hat")
+        plt.plot(y_test_mean[20:, cidx], label="y")
+        plt.legend()
+        plt.savefig(os.path.join(my_out_dir, "ytestmean.png"))
+        plt.clf()
+
+        test.graph_state_dependency(y, y_hats, title="Train", runway_length=0, ch=cidx)
+        plt.savefig(os.path.join(my_out_dir, "statedep.png"))
+        plt.clf()
+
+        test.graph_state_dependency(
+            y_test, y_hats_test, title="Test", runway_length=0, ch=cidx
+        )
+        plt.savefig(os.path.join(my_out_dir, "statedeptest.png"))
+        plt.clf()
+
+    # Only graph specific session if it was included in training
+    if "MonkeyJ_20160426_Session2_S1" in results.get("y_hat", {}):
+        graph_for_sid("MonkeyJ_20160426_Session2_S1", results, cidx=30)
+    
+    # Send completion notification
+    try:
+        final_train_r2 = results["train_r2s"][-1][1] if results.get("train_r2s") else None
+        final_test_r2 = results["test_r2s"][-1][1] if results.get("test_r2s") else None
+        
+        # Complete progress notification if it was created
+        if job_id:
+            notifications.complete_progress_notification(
+                job_id,
+                final_message=f"Training complete!\nTrain R²: {final_train_r2:.4f}\nTest R²: {final_test_r2:.4f}\nOutput: {my_out_dir}",
+                title="✓ Training Complete"
+            )
+        else:
+            # Fallback to regular notification
+            metrics = {
+                "train_r2": final_train_r2,
+                "test_r2": final_test_r2,
+            }
+            notifications.notify_training_complete(
+                model_name=f"{num_bases}_{num_sessions}_rr{basis_residual_rank_in}",
+                metrics=metrics,
+                output_dir=my_out_dir
+            )
+    except Exception as e:
+        print(f"Failed to send notification: {e}")
+
+
+if __name__ == "__main__":
+    import sys
+    import argparse
+
+    # Parse command line arguments with support for both positional and named arguments
+    parser = argparse.ArgumentParser(description='Train multisession TBFM model')
+    parser.add_argument('num_bases', type=int, help='Number of bases')
+    parser.add_argument('num_sessions', type=int, help='Number of training sessions')
+    parser.add_argument('gpu', type=str, help='GPU ID to use')
+    parser.add_argument('coadapt', type=str, nargs='?', default='false', help='Use co-adaptation (true/false)')
+    parser.add_argument('basis_residual_rank', type=str, nargs='?', default=None, help='Basis residual rank')
+    parser.add_argument('train_size', type=int, nargs='?', default=1000, help='Training set size')
+    parser.add_argument('shuffle', type=str, nargs='?', default='false', help='Shuffle support set (true/false)')
+    
+    # New hyperparameter arguments
+    parser.add_argument('--latent-dim', type=int, default=None, help='Latent dimension for autoencoder')
+    parser.add_argument('--batch-size-per-session', type=int, default=None, help='Batch size per session')
+    parser.add_argument('--residual-mlp-hidden', type=int, default=None, help='Hidden dimension for residual MLP')
+    parser.add_argument('--embed-dim-stim', type=int, default=None, help='Stim embedding dimension')
+    parser.add_argument('--out-dir', type=str, default=None, help='Custom output directory')
+    parser.add_argument('--two-stage', action='store_true', help='Use two-stage autoencoder')
+    parser.add_argument('--random-seed', type=int, default=None, help='Random seed for session selection')
+    parser.add_argument('--held-in-sessions', type=str, default=None,
+                        help='Comma-separated list of session IDs to use as held-in sessions (overrides random-seed)')
+
+    # Ablation flags
+    parser.add_argument('--normalizer', type=str, default=None, choices=['quant', 'zscore'],
+                        help='Normalizer type (default: quant = IQR/percentile-based)')
+    parser.add_argument('--lambda-ae-recon', type=float, default=None,
+                        help='Override AE reconstruction loss weight (default: 0.03)')
+    parser.add_argument('--lambda-fro', type=float, default=None,
+                        help='Override Frobenius regularization weight on basis weights (default: 75.0)')
+    parser.add_argument('--lambda-ortho', type=float, default=None,
+                        help='Override orthonormality penalty on bases (default: 0.0)')
+    parser.add_argument('--lambda-l2', type=float, default=None,
+                        help='Override L2 regularization on stimulus embeddings (default: 1e-2)')
+    parser.add_argument('--no-rest-embeddings', action='store_true',
+                        help='Zero out rest embeddings (ablate c_rest)')
+    parser.add_argument('--no-tanh-basis-weights', action='store_true',
+                        help='Remove tanh activation from basis weight network')
+    parser.add_argument('--no-row-norm', action='store_true',
+                        help='Disable L2 row-norm of basis weights (only meaningful with --no-tanh-basis-weights)')
+
+    args = parser.parse_args()
+    
+    # Parse boolean arguments
+    coadapt = args.coadapt.lower() == 'true'
+    shuffle = args.shuffle.lower() == 'true'
+    basis_residual_rank = int(args.basis_residual_rank) if args.basis_residual_rank and args.basis_residual_rank.isdigit() else None
+    held_in_sessions = args.held_in_sessions.split(',') if args.held_in_sessions else None
+
+    try:
+        main(
+            args.num_bases,
+            args.num_sessions,
+            args.gpu,
+            coadapt=coadapt,
+            basis_residual_rank_in=basis_residual_rank,
+            train_size=args.train_size,
+            shuffle=shuffle,
+            latent_dim=args.latent_dim,
+            batch_size_per_session=args.batch_size_per_session,
+            residual_mlp_hidden=args.residual_mlp_hidden,
+            out_dir=args.out_dir,
+            use_two_stage=args.two_stage,
+            embed_dim_stim=args.embed_dim_stim,
+            random_seed=args.random_seed,
+            held_in_sessions=held_in_sessions,
+            normalizer=args.normalizer,
+            lambda_ae_recon=args.lambda_ae_recon,
+            lambda_fro=args.lambda_fro,
+            lambda_ortho=args.lambda_ortho,
+            lambda_l2=args.lambda_l2,
+            no_rest_embeddings=args.no_rest_embeddings,
+            no_tanh_basis_weights=args.no_tanh_basis_weights,
+            no_row_norm=args.no_row_norm,
+        )
+    except Exception as e:
+        notifications.notify_error(
+            script_name="tma_standalone.py",
+            error=e,
+            context=f"Training {args.num_bases}_{args.num_sessions} on GPU {args.gpu}"
+        )
+        raise

@@ -34,6 +34,12 @@ class Bases(nn.Module):
         basis_residual_rank: int = 5,
         residual_mlp_hidden: int = 16,
         basis_gen_dropout: float = 0.0,
+        use_hypernetwork: bool = False,
+        hypernet_context_dim: int = 32,
+        hypernet_context_encoder_hidden: int = 64,
+        hypernet_param_generator_hidden: int = 128,
+        hypernet_use_attention: bool = False,
+        hypernet_num_attention_heads: int = 4,
         device=None,
     ):
         """
@@ -62,6 +68,7 @@ class Bases(nn.Module):
         self.is_basis_residual = is_basis_residual
         self.proj_meta_dim = proj_meta_dim
         self.stimdim = stimdim
+        self.use_hypernetwork = use_hypernetwork
 
         # Input is just stimdim (not flattened over time)
         in_dim = stimdim
@@ -110,7 +117,7 @@ class Bases(nn.Module):
             self.proj_meta = None
         
         # Residual network (low-rank basis corrections)
-        if use_meta and is_basis_residual:
+        if use_meta and is_basis_residual and not use_hypernetwork:
             self.residual_net = meta_module.BasisResidualNet(
                 embed_dim_stim=embed_dim_stim,
                 basis_residual_rank=basis_residual_rank,
@@ -121,6 +128,42 @@ class Bases(nn.Module):
             )
         else:
             self.residual_net = None
+
+        # Hypernetwork components (for fast adaptation)
+        if use_meta and use_hypernetwork:
+            # Determine input dimension for support encoder
+            # We'll encode statistics: [error_mean, error_std, y_mean, y_std, y_pred_mean, y_pred_std]
+            # Each has shape (channels,), so total is 6 * in_dim
+            # Note: in_dim here refers to output channels, which we'll get from trial_len
+            # Actually, we need to know the output dimension, which isn't passed here
+            # We'll use a placeholder and the actual dimension will be determined at runtime
+            # For now, assume support_encoder_input_dim will be set externally or computed dynamically
+            self.support_encoder = meta_module.SupportSetEncoder(
+                input_dim=1,  # Placeholder, will be updated when we know channel count
+                hidden_dim=hypernet_context_encoder_hidden,
+                context_dim=hypernet_context_dim,
+                use_attention=hypernet_use_attention,
+                num_heads=hypernet_num_attention_heads,
+                device=device,
+            )
+
+            # Hypernetwork that generates residual network parameters from context
+            if is_basis_residual:
+                self.hyper_residual_net = meta_module.HyperResidualNet(
+                    context_dim=hypernet_context_dim,
+                    embed_dim_stim=embed_dim_stim,
+                    basis_residual_rank=basis_residual_rank,
+                    trial_len=trial_len,
+                    num_bases=num_bases,
+                    residual_mlp_hidden=residual_mlp_hidden,
+                    hypernet_hidden=hypernet_param_generator_hidden,
+                    device=device,
+                )
+            else:
+                self.hyper_residual_net = None
+        else:
+            self.support_encoder = None
+            self.hyper_residual_net = None
 
         self.to(device)
 
@@ -163,10 +206,16 @@ class Bases(nn.Module):
         if self.use_meta and self.proj_meta is not None:
             for layer in self.proj_meta:
                 bases_meta_params.extend(list(layer.parameters()))
-        
+
         if self.residual_net is not None:
             # Add all residual network parameters (MLP + W)
             bases_meta_params.extend(list(self.residual_net.parameters()))
+
+        # Add hypernetwork parameters
+        if self.support_encoder is not None:
+            bases_meta_params.extend(list(self.support_encoder.parameters()))
+        if self.hyper_residual_net is not None:
+            bases_meta_params.extend(list(self.hyper_residual_net.parameters()))
 
         return bases_core_params, bases_meta_params
 
@@ -179,6 +228,7 @@ class Bases(nn.Module):
         stiminds: torch.Tensor,  # (batch, stimdim) - NOTE: no trial_len dimension
         embedding_rest: torch.Tensor | None = None,  # (embed_dim_rest,)
         embedding_stim: torch.Tensor | None = None,  # (embed_dim_stim,) or None
+        support_context: torch.Tensor | None = None,  # (context_dim,) - for hypernetwork
     ):
         """
         Generate bases from unpacked stimulus descriptors.
@@ -236,11 +286,16 @@ class Bases(nn.Module):
 
         # Unflatten to (batch, trial_len, num_bases)
         bases = bases.unflatten(dim=1, sizes=(self.trial_len, self.num_bases))
-        
+
         # Add low-rank residual if in residual mode
         if self.residual_net is not None:
-            # Compute residual from stim embedding
+            # MAML mode: compute residual from stim embedding
             residual = self.residual_net(embedding_stim)
+            # Add to base bases
+            bases = bases + residual
+        elif self.hyper_residual_net is not None and support_context is not None:
+            # Hypernetwork mode: generate residual from support context
+            residual = self.hyper_residual_net(support_context, embedding_stim)
             # Add to base bases
             bases = bases + residual
 

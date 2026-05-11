@@ -81,6 +81,219 @@ class BasisResidualNet(nn.Module):
         return residual
 
 
+# Hypernetwork Meta-Learning ------------------------------------------------------
+
+
+class SupportSetEncoder(nn.Module):
+    """
+    Encodes a support set into a fixed-size context vector.
+
+    Takes predictions and targets from support set and aggregates them
+    into a context representation for the hypernetwork.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,  # Dimension of each support example feature
+        hidden_dim: int = 64,
+        context_dim: int = 32,
+        use_attention: bool = False,
+        num_heads: int = 4,
+        device=None,
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.context_dim = context_dim
+        self.use_attention = use_attention
+
+        # Encode individual support examples
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.ReLU(),
+        )
+
+        if use_attention:
+            # Multi-head attention for aggregating support examples
+            self.attention = nn.MultiheadAttention(
+                hidden_dim, num_heads, batch_first=True
+            )
+            # Learnable query for attention
+            self.query = nn.Parameter(torch.randn(1, 1, hidden_dim))
+
+        # Project to context dimension
+        self.projector = nn.Sequential(
+            nn.Linear(hidden_dim, context_dim),
+            nn.Tanh(),
+        )
+
+        self.to(device)
+
+    def forward(self, support_features: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            support_features: (batch_size, input_dim) - features from support set
+                             Can be statistics, prediction errors, etc.
+
+        Returns:
+            context: (context_dim,) - aggregated context vector
+        """
+        # Encode each support example
+        # support_features: (n_support, input_dim)
+        encoded = self.encoder(support_features)  # (n_support, hidden_dim)
+
+        if self.use_attention:
+            # Use attention to aggregate
+            batch_size = encoded.shape[0]
+            query = self.query.expand(batch_size, -1, -1)  # (n_support, 1, hidden_dim)
+
+            # Attention: query attends to encoded support examples
+            aggregated, _ = self.attention(
+                query, encoded.unsqueeze(1), encoded.unsqueeze(1)
+            )  # (n_support, 1, hidden_dim)
+            aggregated = aggregated.squeeze(1)  # (n_support, hidden_dim)
+            aggregated = aggregated.mean(dim=0)  # (hidden_dim,)
+        else:
+            # Simple mean aggregation
+            aggregated = encoded.mean(dim=0)  # (hidden_dim,)
+
+        # Project to context dimension
+        context = self.projector(aggregated)  # (context_dim,)
+
+        return context
+
+
+class HyperResidualNet(nn.Module):
+    """
+    Hypernetwork that generates parameters for BasisResidualNet from support context.
+
+    Instead of optimizing embeddings via gradient descent (MAML), this network
+    takes a support set context and directly generates the residual network parameters.
+
+    Architecture:
+        support_context -> HyperNet -> BasisResidualNet parameters
+    """
+
+    def __init__(
+        self,
+        context_dim: int,
+        embed_dim_stim: int,  # For compatibility, but we generate residual params directly
+        basis_residual_rank: int,
+        trial_len: int,
+        num_bases: int,
+        residual_mlp_hidden: int = 16,
+        hypernet_hidden: int = 128,
+        device=None,
+    ):
+        super().__init__()
+
+        self.context_dim = context_dim
+        self.embed_dim_stim = embed_dim_stim
+        self.basis_residual_rank = basis_residual_rank
+        self.trial_len = trial_len
+        self.num_bases = num_bases
+        self.residual_mlp_hidden = residual_mlp_hidden
+
+        # Calculate parameter counts for residual network
+        # Residual MLP has: embed_stim -> hidden -> rank
+        self.mlp_params_count = (
+            embed_dim_stim * residual_mlp_hidden + residual_mlp_hidden +  # Layer 1 + bias
+            residual_mlp_hidden * basis_residual_rank + basis_residual_rank  # Layer 2 + bias
+        )
+
+        # W matrix: rank -> trial_len * num_bases (no bias)
+        self.W_params_count = basis_residual_rank * trial_len * num_bases
+
+        self.total_params = self.mlp_params_count + self.W_params_count
+
+        # Hypernetwork: context -> residual network parameters
+        self.hypernet = nn.Sequential(
+            nn.Linear(context_dim, hypernet_hidden),
+            nn.ReLU(),
+            nn.Linear(hypernet_hidden, hypernet_hidden),
+            nn.ReLU(),
+            nn.Linear(hypernet_hidden, self.total_params),
+        )
+
+        # Initialize to generate small residual parameters (near-zero initialization)
+        nn.init.normal_(self.hypernet[-1].weight, mean=0, std=0.001)
+        nn.init.zeros_(self.hypernet[-1].bias)
+
+        self.to(device)
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        embedding_stim: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Generate residual basis corrections from support context.
+
+        Args:
+            context: (context_dim,) - encoded support set context
+            embedding_stim: (embed_dim_stim,) or (batch, embed_dim_stim) -
+                           task embedding (used as input to generated residual net)
+
+        Returns:
+            residual: (batch, trial_len, num_bases) - basis residuals
+        """
+        # Generate parameters
+        params = self.hypernet(context)  # (total_params,)
+
+        # Split into MLP and W parameters
+        mlp_params = params[:self.mlp_params_count]
+        W_params = params[self.mlp_params_count:]
+
+        # Parse MLP parameters
+        offset = 0
+        # Layer 1: embed_stim -> hidden
+        w1_size = self.embed_dim_stim * self.residual_mlp_hidden
+        w1 = mlp_params[offset:offset + w1_size].view(
+            self.residual_mlp_hidden, self.embed_dim_stim
+        )
+        offset += w1_size
+        b1 = mlp_params[offset:offset + self.residual_mlp_hidden]
+        offset += self.residual_mlp_hidden
+
+        # Layer 2: hidden -> rank
+        w2_size = self.residual_mlp_hidden * self.basis_residual_rank
+        w2 = mlp_params[offset:offset + w2_size].view(
+            self.basis_residual_rank, self.residual_mlp_hidden
+        )
+        offset += w2_size
+        b2 = mlp_params[offset:offset + self.basis_residual_rank]
+
+        # W matrix: rank -> trial_len * num_bases
+        W = W_params.view(self.trial_len * self.num_bases, self.basis_residual_rank)
+
+        # Apply generated residual network
+        # Handle both batched and single embedding
+        if embedding_stim.dim() == 1:
+            embedding_stim = embedding_stim.unsqueeze(0)  # (1, embed_dim_stim)
+
+        batch_size = embedding_stim.shape[0]
+
+        # Forward through generated MLP
+        h = torch.nn.functional.linear(embedding_stim, w1, b1)  # (batch, hidden)
+        h = torch.tanh(h)
+        h = torch.nn.functional.linear(h, w2, b2)  # (batch, rank)
+
+        # Forward through generated W
+        residual_flat = torch.nn.functional.linear(h, W)  # (batch, trial_len * num_bases)
+
+        # Reshape to (batch, trial_len, num_bases)
+        residual = residual_flat.unflatten(
+            dim=1, sizes=(self.trial_len, self.num_bases)
+        )
+
+        return residual
+
+
 def dispatch(data, func):
     d_out = {}
     for sid, d in data.items():
@@ -301,6 +514,102 @@ def inner_update_stopgrad(
     if quiet:
         return embeddings_stim
     return embeddings_stim, losses
+
+
+def hypernetwork_adapt(
+    model: nn.Module,
+    data_support,
+    embeddings_rest,
+    cfg,
+    quiet=True,
+) -> Dict[str, torch.Tensor]:
+    """
+    Fast adaptation using hypernetwork (single forward pass).
+    Generates support context and produces adapted parameters directly.
+
+    Args:
+        model: TBFMMultisession model with hypernetwork components
+        data_support: Support data dict {session_id: (runway, stiminds, y)}
+        embeddings_rest: Rest embeddings dict {session_id: embedding}
+        cfg: Config object
+        quiet: If True, suppress progress messages
+
+    Returns:
+        support_contexts: Dict mapping session_id -> context vector
+    """
+    device = model.device
+
+    # Normalize targets for computing support statistics
+    with torch.no_grad():
+        ys = {sid: d[2] for sid, d in data_support.items()}
+        ys_norm = model.norms(ys)
+
+    model.eval()  # Ensure model is in eval mode for forward pass
+
+    support_contexts = {}
+
+    for session_id, data in data_support.items():
+        runway, stiminds, y = data
+        y_norm = ys_norm[session_id]
+
+        # Get embedding_rest for this session
+        embedding_rest = embeddings_rest[session_id]
+
+        # Forward pass to get predictions with rest embedding only
+        # We'll use a dummy embedding_stim initially
+        dummy_embed_stim = torch.zeros(
+            model.model.bases.embed_dim_stim, device=device
+        )
+
+        with torch.no_grad():
+            # Create temporary data dict for this session
+            session_data = {session_id: (runway, stiminds, y)}
+            session_embeddings_rest = {session_id: embedding_rest}
+            session_embeddings_stim = {session_id: dummy_embed_stim}
+
+            # Get predictions
+            y_pred = model(
+                session_data,
+                embeddings_rest=session_embeddings_rest,
+                embeddings_stim=session_embeddings_stim,
+            )
+
+            y_pred_session = y_pred[session_id]
+
+            # Compute prediction errors and aggregate statistics
+            # Features: [prediction_error, y_norm_mean, y_norm_std, y_pred_mean, y_pred_std]
+            errors = (y_pred_session - y_norm).flatten(end_dim=-2)  # (batch*time, channels)
+
+            # Aggregate statistics across batch and time
+            error_mean = errors.mean(dim=0)  # (channels,)
+            error_std = errors.std(dim=0)  # (channels,)
+            y_norm_flat = y_norm.flatten(end_dim=-2)
+            y_mean = y_norm_flat.mean(dim=0)
+            y_std = y_norm_flat.std(dim=0)
+            y_pred_flat = y_pred_session.flatten(end_dim=-2)
+            y_pred_mean = y_pred_flat.mean(dim=0)
+            y_pred_std = y_pred_flat.std(dim=0)
+
+            # Concatenate all statistics as support features
+            # Shape: (n_features, channels) where n_features=5
+            support_features = torch.stack([
+                error_mean, error_std, y_mean, y_std, y_pred_mean, y_pred_std
+            ], dim=0)  # (6, channels)
+
+            # Flatten for encoder input
+            support_features_flat = support_features.flatten()  # (6 * channels,)
+
+            # Encode to context
+            # Get the support encoder from the model
+            support_encoder = model.model.bases.support_encoder
+            context = support_encoder(support_features_flat.unsqueeze(0)).squeeze(0)
+
+            support_contexts[session_id] = context
+
+            if not quiet:
+                print(f"Encoded support for {session_id}: context shape {context.shape}")
+
+    return support_contexts
 
 
 def cache_rest_embeds(
