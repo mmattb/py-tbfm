@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from typing import Optional, Union
 
-from .utils import SessionDispatcher
+from .utils import SessionDispatcher, iter_loader
 
 
 class LinearChannelAE(nn.Module):
@@ -43,8 +43,6 @@ class LinearChannelAE(nn.Module):
             )
         else:
             self.b_enc = None
-
-
 
     def pca_warm_start(
         self,
@@ -178,6 +176,9 @@ class SessionDispatcherLinearAE(SessionDispatcher):
 
 
 def dispatch_warm_start(aes, data, is_identity=False, device=None):
+    if not isinstance(data, dict):
+        # Materialise a single batch from a SessionLoader so we can index by session
+        _, data = iter_loader(iter(data), data, device=device)
     for session_id in data.keys():
         d = data[session_id]
 
