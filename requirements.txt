@@ -3,3 +3,8 @@ scipy
 numpy
 matplotlib
 hydra-core
+omegaconf
+statsmodels
+pandas
+tqdm
+pytest
