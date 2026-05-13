@@ -6,7 +6,6 @@ import sys
 import torch
 from torch import nn
 from torch.optim.lr_scheduler import LambdaLR
-from torcheval.metrics.functional import r2_score
 from typing import Dict, Tuple, List
 
 from . import ae
@@ -15,6 +14,7 @@ from . import meta
 from . import normalizers
 from . import tbfm
 from . import utils
+from .utils import r2_score
 
 from ._multisession_module import TBFMMultisession
 
@@ -83,7 +83,9 @@ def save_model(model, path):
     torch.save(model_tbfm.state_dict(), os.path.join(path, "tbfm.torch"))
     ae_states = {sid: inst.state_dict() for sid, inst in model.ae.instances.items()}
     torch.save(ae_states, os.path.join(path, "ae.torch"))
-    norm_states = {sid: inst.state_dict() for sid, inst in model.norms.instances.items()}
+    norm_states = {
+        sid: inst.state_dict() for sid, inst in model.norms.instances.items()
+    }
     torch.save(norm_states, os.path.join(path, "norms.torch"))
 
 

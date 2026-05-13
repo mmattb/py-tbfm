@@ -7,7 +7,14 @@ from collections.abc import Iterable
 
 import torch
 from torch import nn
-from torcheval.metrics.functional import r2_score
+
+
+def r2_score(input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """R² score averaged across output dimensions. input/target: [N, D]."""
+    ss_res = ((target - input) ** 2).sum(dim=0)
+    ss_tot = ((target - target.mean(dim=0)) ** 2).sum(dim=0)
+    r2_per_dim = 1.0 - ss_res / ss_tot.clamp_min(1e-8)
+    return r2_per_dim.mean()
 
 
 def zscore(data, mean, std):
