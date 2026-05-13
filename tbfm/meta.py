@@ -174,6 +174,10 @@ def inner_update_stopgrad(
     )
 
     # Freeze model parameters during inner loop (stopgrad: no gradients w.r.t. model params)
+    # Save per-parameter requires_grad state so we restore exactly what was frozen before entry.
+    saved_requires_grad = {
+        name: param.requires_grad for name, param in model.named_parameters()
+    }
     model.requires_grad_(False)
     model.eval()  # Disable dropout during inner loop optimization
 
@@ -219,8 +223,9 @@ def inner_update_stopgrad(
         optimizer_inner.clip_grad(grad_clip)
         optimizer_inner.step()
 
-    # Re-enable gradients for model parameters (for outer loop)
-    model.requires_grad_(True)
+    # Restore per-parameter requires_grad state (preserves any params frozen before entry)
+    for name, param in model.named_parameters():
+        param.requires_grad_(saved_requires_grad[name])
 
     embeddings_stim = {
         session_id: es.detach() for session_id, es in embeddings_stim.items()
