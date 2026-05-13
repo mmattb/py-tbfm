@@ -235,7 +235,6 @@ class TBFM(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
-        # XXX
         basis_weights = torch.tanh(basis_weights)
         basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 

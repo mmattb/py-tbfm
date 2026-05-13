@@ -9,7 +9,6 @@ from . import utils
 
 from ._multisession_module import TBFMMultisession
 
-
 # Basis Residual Network ------------------------------------------------------
 
 
@@ -119,78 +118,6 @@ def embed_rest(rest_data):
 
 def embed_rest_sessions(rest_datas):
     return dispatch(rest_datas, embed_rest)
-
-
-def embed_stim_residual_sessions(
-    data,
-    embeddings_rest,
-    model_ms: TBFMMultisession,
-    model_optims,
-    attempt_count=5,
-    epochs=1000,
-    lr=1e-2,
-):
-    """
-    Return estimated optimal stim embeddings, given a fixed rest embedding set and
-    model.  This is not the interactive training loop for the whole model; it's for
-    TTA where the model is frozen except session-specific bits.
-    data: (batch_size, time, ch)
-    """
-    if (
-        model_ms.model.bases.embed_dim_rest is None
-        or model_ms.model.bases.embed_dim_stim is None
-    ):
-        raise ValueError("Cannot embed stim without embed_dim_stim set")
-
-    embed_dim_stim = model_ms.model.bases.embed_dim_stim
-
-    with torch.no_grad():
-        embeddings_stim = {
-            sid: nn.Parameter(torch.zeros(embed_dim_stim).to(model_ms.device))
-            for sid in data.keys()
-        }
-        _optims = [
-            torch.optim.AdamW((embeddings_stim[sid],), lr=lr) for sid in data.keys()
-        ]
-        optims = utils.OptimCollection(_optims)
-
-        ys = {sid: d[2] for sid, d in data.items()}
-        # {sid: ([loss,], [embedding,])}
-        embeds = {sid: ([], []) for sid in data.keys()}
-
-    model_ms.eval()
-    for _ in range(attempt_count):
-        optims.zero_grad()
-        with torch.no_grad():
-            for sid, embed in embeddings_stim.items():
-                embed[:] = torch.randn(embed_dim_stim)
-        model_optims.zero_grad()
-
-        for _ in range(epochs):
-            yhats = model_ms(
-                data, embeddings_rest=embeddings_rest, embeddings_stim=embeddings_stim
-            )
-
-            losses = {}
-            for sid, y in ys.items():
-                loss = nn.MSELoss()(yhats[sid], y)
-                losses[sid] = loss
-            sum(losses.values()).backward()
-            optims.step()
-
-        for sid, loss in losses.items():
-            embed_stim = embeddings_stim[sid]
-            idx = len(embeds[sid][0])
-            embeds[sid][0].append((loss.item(), idx))
-            embeds[sid][1].append(embed_stim.clone())
-
-    embeddings_out = {}
-    for sid, (losses, candidates) in embeds.items():
-        min_idx = min(losses)[1]  # idx of lowest loss embedding
-        embeddings_out[sid] = candidates[
-            min_idx
-        ]  # i.e. embed which induced the lowest loss
-    return embeddings_out
 
 
 # Training ------------------------------------------------------
@@ -329,6 +256,3 @@ def cache_rest_embeds(
 
         embeddings_rest = embed_rest_sessions({sid: resting_data})[sid]
         torch.save(embeddings_rest, os.path.join(_out_dir, "er.torch"))
-
-
-# TODO: trust region or other regularization for embed stim in addition to weight decay

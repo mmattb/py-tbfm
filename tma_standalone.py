@@ -150,7 +150,6 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         cfg.tbfm.module.latent_dim = 3
         cfg.training.epochs = 12001
         cfg.latent_dim = 74
-        cfg.ae.use_two_stage = False
         cfg.ae.training.lambda_ae_recon = 0.03
         cfg.tbfm.training.lambda_fro = 60.0
 
@@ -158,10 +157,6 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
     cfg.latent_dim = 85
     cfg.tbfm.module.num_bases = num_bases
     cfg.ae.training.lambda_ae_recon = 0.03
-    cfg.ae.use_two_stage = False
-    cfg.ae.two_stage.freeze_only_shared = False
-    cfg.ae.two_stage.lambda_mu = 0.01
-    cfg.ae.two_stage.lambda_cov = 0.01
     cfg.tbfm.training.lambda_fro = 75.0
 
     if basis_residual_rank_in == 0:
@@ -174,6 +169,7 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
     model_optims = multisession.get_optims(cfg, ms)
 
+    best_model_dir = os.path.join(my_out_dir, "best")
     embeddings_stim, results = multisession.train_from_cfg(
         cfg,
         ms,
@@ -183,12 +179,13 @@ def main(num_bases, num_sessions, gpu, basis_residual_rank_in=None):
         data_test=data_test,
         test_interval=1000,
         epochs=cfg.training.epochs,
+        model_save_path=best_model_dir,
     )
 
     torch.save(embeddings_stim, os.path.join(my_out_dir, "es.torch"))
     torch.save(results, os.path.join(my_out_dir, "r.torch"))
     torch.save(held_in_session_ids, os.path.join(my_out_dir, "hisi.torch"))
-    multisession.save_model(ms, os.path.join(my_out_dir, "model.torch"))
+    multisession.save_model(ms, os.path.join(my_out_dir, "model"))
 
     txt = [t[0] for t in results["train_losses"]]
     tlt = [t[1] for t in results["train_losses"]]
