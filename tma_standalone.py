@@ -77,6 +77,7 @@ def main(
     num_sessions,
     gpu,
     basis_residual_rank_in=None,
+    epochs=12001,
     train_size=5000,
     latent_dim=None,
     batch_size_per_session=None,
@@ -223,7 +224,7 @@ def main(
     for batch in iter(data_test):
         print(batch[k0][0].shape)
 
-    cfg.training.epochs = 12001
+    cfg.training.epochs = epochs
     cfg.latent_dim = latent_dim if latent_dim is not None else 85
     cfg.tbfm.module.num_bases = num_bases
     cfg.ae.training.lambda_ae_recon = 0.03
@@ -385,6 +386,12 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=12001,
+        help="Number of training epochs/steps (default: 12001)",
+    )
+    parser.add_argument(
         "--latent-dim",
         type=int,
         default=None,
@@ -476,6 +483,7 @@ if __name__ == "__main__":
         args.num_sessions,
         args.gpu,
         basis_residual_rank_in=basis_residual_rank,
+        epochs=args.epochs,
         train_size=args.train_size,
         latent_dim=args.latent_dim,
         batch_size_per_session=args.batch_size_per_session,
