@@ -21,9 +21,9 @@ from tbfm import meta
 from tbfm import multisession
 from tbfm import utils
 
-DATA_DIR = os.getenv("TBFM_DATA_DIR", "/home/mmattb/Projects/opto-coproc/data")
+DATA_DIR = os.getenv("TBFM_DATA_DIR", None)
 
-OUT_DIR = "test"  # Local data cache; i.e. not reading from the opto-coproc folder.
+OUT_DIR = "runs"  # Local data cache; i.e. not reading from the opto-coproc folder.
 EMBEDDING_REST_SUBDIR = "embedding_rest"
 DEVICE = "cuda"  # cfg.device
 
@@ -82,6 +82,7 @@ def main(
     train_size=5000,
     shuffle=True,
     latent_dim=None,
+    data_dir=DATA_DIR,
     batch_size_per_session=None,
     residual_mlp_hidden=None,
     embed_dim_stim=None,
@@ -97,7 +98,6 @@ def main(
     no_tanh_basis_weights=False,
     no_row_norm=False,
 ):
-
     if out_dir is None:
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
         if basis_residual_rank_in is not None:
@@ -459,6 +459,9 @@ if __name__ == "__main__":
         "--out-dir", type=str, default=None, help="Custom output directory"
     )
     parser.add_argument(
+        "--data-dir", type=str, default=DATA_DIR, help="Data directory"
+    )
+    parser.add_argument(
         "--random-seed",
         type=int,
         default=None,
@@ -546,6 +549,7 @@ if __name__ == "__main__":
         residual_mlp_hidden=args.residual_mlp_hidden,
         embed_dim_stim=args.embed_dim_stim,
         out_dir=args.out_dir,
+        data_dir=args.data_dir,
         random_seed=args.random_seed,
         held_in_sessions=held_in_sessions,
         normalizer=args.normalizer,

@@ -1,5 +1,6 @@
 import os
 
+from pathlib import Path
 import torch
 from torch import nn
 from typing import Dict, Tuple, List
@@ -237,7 +238,7 @@ def inner_update_stopgrad(
 
 def cache_rest_embeds(
     session_ids,
-    data_dir="/home/mmattb/Projects/opto-coproc/data",
+    data_dir=Path("data"),
     out_dir="data",
     out_subdir="embedding_rest",
     quiet=False,

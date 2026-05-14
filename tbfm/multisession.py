@@ -225,7 +225,9 @@ def train_from_cfg(
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
     use_meta = cfg.tbfm.module.use_meta_learning
-    coadapt_embeddings = bool(cfg.meta.training.get("coadapt", False)) if use_meta else False
+    coadapt_embeddings = (
+        bool(cfg.meta.training.get("coadapt", False)) if use_meta else False
+    )
     embed_steps_per_other_step = int(
         cfg.meta.training.get("embed_steps_per_other_step", 1)
     )
@@ -773,11 +775,15 @@ def load_stim_batched(
     batch_size=1000,
     window_size=184,
     session_subdir="torchraw",
-    data_dir="/home/mmattb/Projects/opto-coproc/data",
+    data_dir=None,
     held_in_session_ids=None,
     num_held_out_sessions=10,
     unpack_stiminds=True,
 ):
+
+    if not data_dir:
+        raise ValueError("Must supply data_dir")
+
     held_in_session_ids, held_out_session_ids = gather_session_ids(
         data_dir, num_held_out_sessions, held_in_session_ids=held_in_session_ids
     )

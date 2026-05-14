@@ -1,9 +1,6 @@
 import re
 from setuptools import setup
 
-# This file adapted from https://github.com/meejah/python-skeleton/blob/master/setup.py
-# Accessed: 02/14/24
-
 
 def pip_to_requirements(s):
     """
@@ -21,7 +18,7 @@ def pip_to_requirements(s):
 setup(
     name="tbfm",
     version=open("VERSION", "r").read().strip(),
-    author="mmattb",
+    author="Matthew J. Bryan, Daniel Muir",
     author_email="mmattb@gmx.com",
     license_files="LICENSE",
     url="https://github.com/mmattb/py-tbfm",

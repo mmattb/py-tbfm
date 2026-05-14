@@ -1,44 +1,78 @@
 # py-tbfm
-Implementation of the Temporal Basis Function Model (TBFM)
+PyTorch implementation of the Temporal Basis Function Model (TBFM) for neural time-series forecasting under stimulation.
 
-## Quick start
-If you are looking to use the TBFM implementation, simply install this module; e.g.:
+## Installation
 
 ```
 pip install .
 ```
 
-then use it as follows:
+## Single-session quick start
 
-```
-model = tbfm.TBFM(NUM_CHANNELS,              # Dimensionality of time series
-                  STIM_DESC_DIM,             # Dimensionality of stimulation descriptor
-                  RUNWAY_LENGTH,             # Length of runway, in time steps
-                  NUM_BASES,                 # Number of bases we will learn
-                  FORECAST_HORIZON,          # Length of forecast, in time steps
-                  batchy=y_train,            # A training dataset, for estimating means/stdevs
-                  latent_dim=LATENT_DIM,     # Latent dimension of basis generator network
-                  basis_depth=BASIS_DEPTH,   # Depth of basis generator network
-                  device=DEVICE)             # Choice of device, e.g. "cpu" or "cuda:0"
-optim = model.get_optim(lr=2e-4)             # Optimizer for use in training
-```
+Instantiate and train a TBFM on a single recording session:
 
-A forward pass looks like this:
-```
+```python
+from tbfm import tbfm as tbfm_module
+
 FORECAST_HORIZON = TRIAL_LENGTH - RUNWAY_LENGTH
 
-yhat = model(
-             runways,            # tensor shaped (batch_size, RUNWAY_LENGTH, NUM_CHANNELS)
-             stim_descriptor,    # tensor shaped (batch_size, FORECAST_HORIZON, STIM_DESC_DIM)
-       )
-
-# yhat is a tensor shaped (batch_size, FORECAST_HORIZON, NUM_CHANNELS)
+model = tbfm_module.TBFM(
+    NUM_CHANNELS,              # Dimensionality of time series
+    STIM_DESC_DIM,             # Dimensionality of stimulation descriptor
+    RUNWAY_LENGTH,             # Length of runway, in time steps
+    NUM_BASES,                 # Number of temporal bases to learn
+    FORECAST_HORIZON,          # Length of forecast, in time steps
+    batchy=y_train,            # Training dataset, used to estimate means/stdevs
+    latent_dim=LATENT_DIM,     # Latent dimension of the basis generator network
+    basis_depth=BASIS_DEPTH,   # Depth of the basis generator network
+    device=DEVICE,             # e.g. "cpu" or "cuda:0"
+)
+optim = model.get_optim(lr=2e-4)
 ```
 
-## Walkthrough and demo
+A forward pass:
 
-``TBFM Demo.ipynb`` provides a detailed walkthrough which uses some synthetic data.
-``TBFM FSAM Demo.ipynb`` provides an additional demo where we build the TBFM using forward stagewise additive modeling. It's recommended to go through this one after the first.
+```python
+yhat = model(
+    runways,           # (batch_size, RUNWAY_LENGTH, NUM_CHANNELS)
+    stim_descriptor,   # (batch_size, FORECAST_HORIZON, STIM_DESC_DIM)
+)
+# yhat: (batch_size, FORECAST_HORIZON, NUM_CHANNELS)
+```
+
+## Multi-session training
+
+For multi-session meta-learning, use the `tma_standalone.py` training script. It trains a shared TBFM across many sessions using MAML-style inner-loop adaptation, with per-session learnable stimulus embeddings.
+
+**Required environment variable:**
+```bash
+export TBFM_DATA_DIR=/path/to/your/data
+```
+
+The data directory should contain one subdirectory per session (e.g. `MonkeyG_20150914_Session1_S1/`), each with a `torchraw/` subdirectory containing pre-processed trial tensors.
+
+**Basic usage:**
+```bash
+python tma_standalone.py NUM_BASES NUM_SESSIONS GPU_ID COADAPT BASIS_RESIDUAL_RANK TRAIN_SIZE SHUFFLE
+```
+
+Key arguments:
+- `NUM_BASES` — number of temporal bases (e.g. `100`)
+- `NUM_SESSIONS` — number of sessions to include in training
+- `GPU_ID` — GPU index, or `-1` for CPU
+- `COADAPT` — `true` to use co-adaptation (trains per-session embeddings via outer loop); `false` for MAML inner-loop adaptation
+- `BASIS_RESIDUAL_RANK` — rank of the per-session basis residual (LoRA-style correction); `0` disables residual mode and uses concatenation instead
+- `TRAIN_SIZE` — number of training trials per session
+- `SHUFFLE` — `true` to randomly sample support sets each epoch (recommended)
+
+See `python tma_standalone.py --help` for the full list of options, including ablation flags.
+
+## Demos and walkthroughs
+
+- **`TBFM Demo.ipynb`** — single-session walkthrough using synthetic data
+- **`TBFM FSAM Demo.ipynb`** — builds the TBFM via forward stagewise additive modeling; recommended after the first demo
+- **`TBFM Traveling Wave Demo.ipynb`** — demonstrates TBFM applied to traveling wave data
+- **`TBFM Multisession Demo.ipynb`** — multi-session meta-learning walkthrough *(coming soon)*
 
 ## Architecture
 

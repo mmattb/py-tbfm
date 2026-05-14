@@ -15,7 +15,7 @@ covariate_dim: 3 # e.g. dim of stim parameters
 
 data:
   runway: 20
-  y_len: 164   # XXX set to trial_len - runway or expect bugs
+  y_len: 164   # Note: set to (trial_len - runway) unless you are sure what you're doing
   trial_len: 184
 
 training:
