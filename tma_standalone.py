@@ -237,8 +237,10 @@ def main(
         print(batch[k0][0].shape)
 
     cfg.training.epochs = epochs
-    cfg.latent_dim = latent_dim if latent_dim is not None else 85
+    cfg.latent_dim = latent_dim if latent_dim is not None else 96
     cfg.tbfm.module.num_bases = num_bases
+    # These match the config defaults; kept explicit so ablation overrides below
+    # always start from a known baseline regardless of config drift.
     cfg.ae.training.lambda_ae_recon = 0.03
     cfg.tbfm.training.lambda_fro = 75.0
 

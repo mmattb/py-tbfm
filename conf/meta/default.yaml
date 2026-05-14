@@ -5,7 +5,7 @@ meta:
   # Residual-based meta-learning (MAML-style)
   # basis_residual_rank > 0 enables low-rank residual mode: bases += W*f(embed_stim)
   # Set to 0 (or omit) to use full concatenation mode.
-  basis_residual_rank: 5     # Rank of residual subspace; 0 = disabled (concatenation mode)
+  basis_residual_rank: 16    # Rank of residual subspace; 0 = disabled (concatenation mode)
   residual_mlp_hidden: 16    # Hidden dimension for residual MLP
   
   training:
