@@ -3,14 +3,18 @@
 
 meta:
   # Residual-based meta-learning (MAML-style)
-  is_basis_residual: false  # If true, use low-rank residual mode: bases += W*f(embed_stim)
-  basis_residual_rank: 5     # Rank of residual subspace
+  # basis_residual_rank > 0 enables low-rank residual mode: bases += W*f(embed_stim)
+  # Set to 0 (or omit) to use full concatenation mode.
+  basis_residual_rank: 5     # Rank of residual subspace; 0 = disabled (concatenation mode)
   residual_mlp_hidden: 16    # Hidden dimension for residual MLP
   
   training:
+    coadapt: false   # If true, co-adapt per-session stim embeddings via outer loop
+                     # instead of MAML-style inner-loop adaptation each step.
+    embed_steps_per_other_step: 1  # Updates of embed group per other-group update when coadapt=true
     inner_steps: 20
     support_size: 300
-    lambda_l2: 1e-3
+    stim_embedding_lambda_l2: 1e-3
     optim:
       lr: 1e-2
       weight_decay: 1e-4

@@ -209,7 +209,7 @@ def inner_update_stopgrad(
 
         # Optional L2 penalty to maintain a small sorta trust region
         # Using mean() for dimension normalization so penalty is scale-invariant
-        lambda_l2 = cfg.meta.training.lambda_l2
+        lambda_l2 = cfg.meta.training.stim_embedding_lambda_l2
         if lambda_l2:
             l2_reg = 0.0
             for emb in embeddings_stim.values():

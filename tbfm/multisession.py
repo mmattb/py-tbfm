@@ -89,7 +89,7 @@ def save_model(model, path):
     torch.save(norm_states, os.path.join(path, "norms.torch"))
 
 
-def get_optims(cfg, model_ms: TBFMMultisession):
+def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     optims_norms = tuple()
     if cfg.normalizers.training.coadapt:
         raise NotImplementedError("No normalizer adaptation yet")
@@ -132,6 +132,19 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         if optim_meta is not None:
             meta_optims.append(optim_meta)
 
+    # Optional optimizer for trainable per-session stim embeddings (used when
+    # cfg.meta.training.coadapt=true, i.e. outer-loop co-adaptation instead of
+    # MAML inner-loop adaptation).
+    embed_optims = []
+    if embeddings_stim is not None:
+        embed_lr = cfg.meta.training.optim.lr
+        embed_wd = cfg.meta.training.optim.weight_decay
+        embed_optims.append(
+            torch.optim.AdamW(
+                list(embeddings_stim.values()), lr=embed_lr, weight_decay=embed_wd
+            )
+        )
+
     # Create named optimizer groups
     groups = {
         "norm": {"optimizers": optims_norms, "schedulers": []},
@@ -139,6 +152,7 @@ def get_optims(cfg, model_ms: TBFMMultisession):
         "bw": {"optimizers": bw_optims, "schedulers": bw_schedulers},
         "bg": {"optimizers": bg_optims, "schedulers": bg_schedulers},
         "meta": {"optimizers": meta_optims, "schedulers": []},
+        "embed": {"optimizers": embed_optims, "schedulers": []},
     }
 
     return utils.OptimCollection(groups)
@@ -150,12 +164,21 @@ def get_optims(cfg, model_ms: TBFMMultisession):
 def split_support_query_sessions(
     data_train,
     support_size: int,
+    random_sample: bool = True,
 ):
     support = {}
     query = {}
     for session_id, d in data_train.items():
-        support[session_id] = tuple(dd[:support_size] for dd in d)
-        query[session_id] = tuple(dd[support_size:] for dd in d)
+        if random_sample:
+            n_samples = len(d[0])
+            indices = torch.randperm(n_samples)
+            support_indices = indices[:support_size]
+            query_indices = indices[support_size:]
+            support[session_id] = tuple(dd[support_indices] for dd in d)
+            query[session_id] = tuple(dd[query_indices] for dd in d)
+        else:
+            support[session_id] = tuple(dd[:support_size] for dd in d)
+            query[session_id] = tuple(dd[support_size:] for dd in d)
 
     return support, query
 
@@ -166,6 +189,7 @@ def train_from_cfg(
     data_train,  # yields per-session batches (stiminds, runways, y)
     model_optims,
     embeddings_rest,
+    embeddings_stim=None,  # Pre-initialized trainable stim embeddings for co-adaptation
     data_test=None,
     epochs: int = 10000,
     test_interval: int | None = None,
@@ -177,10 +201,13 @@ def train_from_cfg(
         int | None
     ) = None,  # How many basis weight updates per basis update
     model_save_path: str | None = None,
+    random_sample_support: bool = True,  # Randomly sample support set instead of sequential
 ):
     """
     One epoch over sessions with:
-      - inner loop on support to adapt stim_embed (per-episode latent)
+      - inner loop on support to adapt stim_embed (per-episode latent)  -- MAML mode
+        OR
+      - outer-loop co-adaptation of per-session embeddings (cfg.meta.training.coadapt)
       - outer update on query for shared params
       - slow AE updates every step (small lr)
       - optional alternating updates: update basis weights more frequently than basis generator
@@ -190,6 +217,7 @@ def train_from_cfg(
       - Basis generator (Bases) changes more slowly
       - By updating basis weights N times per basis generator update, we let the
         weighting layer stabilize to the current bases before changing the bases
+      - When co-adapting embeddings, alternate between embedding and other-param updates
 
     Notes:
       • To add EMA for AE: keep a shadow copy of AE params and update with EMA after each optimizer.step().
@@ -197,6 +225,10 @@ def train_from_cfg(
     # cfg overrides
     test_interval = test_interval or cfg.training.test_interval
     use_meta = cfg.tbfm.module.use_meta_learning
+    coadapt_embeddings = bool(cfg.meta.training.get("coadapt", False)) if use_meta else False
+    embed_steps_per_other_step = int(
+        cfg.meta.training.get("embed_steps_per_other_step", 1)
+    )
     bw_steps_per_bg_step = bw_steps_per_bg_step or cfg.training.bw_steps_per_bg_step
     grad_clip = grad_clip or cfg.training.grad_clip or 10.0
     epochs = epochs or cfg.training.epochs
@@ -205,7 +237,15 @@ def train_from_cfg(
     lambda_ae_recon = cfg.ae.training.lambda_ae_recon
     device = model.device
 
-    embeddings_stim = None  # default
+    if coadapt_embeddings and embeddings_stim is None:
+        # Initialize trainable stim embeddings if user requested co-adaptation
+        # but didn't pre-create them (e.g. for warm-start). These should be
+        # added to the optimizer via get_optims(..., embeddings_stim=...).
+        raise ValueError(
+            "cfg.meta.training.coadapt=true requires passing trainable "
+            "embeddings_stim into train_from_cfg AND registering them with "
+            "get_optims(..., embeddings_stim=...)."
+        )
     iter_train = iter(data_train)
 
     train_losses = []
@@ -241,6 +281,7 @@ def train_from_cfg(
         support, query = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
         )
 
         with torch.no_grad():
@@ -248,7 +289,9 @@ def train_from_cfg(
             y_query = model.norms(y_query)
 
         # ----- inner adaptation on support -----
-        if use_meta:
+        # If coadapt_embeddings is true, skip MAML inner loop and use the
+        # outer-optimized embeddings_stim directly.
+        if use_meta and not coadapt_embeddings:
             model.eval()
             embeddings_stim = meta.inner_update_stopgrad(
                 model,
@@ -323,7 +366,22 @@ def train_from_cfg(
             # Otherwise, only update basis weights
             update_basis_gen = (eidx % bw_steps_per_bg_step) == 0 or eidx < 200
 
-            if update_basis_gen:
+            if coadapt_embeddings:
+                # Also gate the 'embed' group so the trainable session embeddings
+                # don't fight the basis weighting on every step.
+                update_embeddings = (
+                    eidx % embed_steps_per_other_step
+                ) == 0 or eidx < 200
+
+                if update_embeddings and update_basis_gen:
+                    model_optims.step(skip=skip_groups)
+                elif update_embeddings:
+                    model_optims.step(skip=["bg", "meta"] + skip_groups)
+                elif update_basis_gen:
+                    model_optims.step(skip=["embed"] + skip_groups)
+                else:
+                    model_optims.step(skip=["bg", "meta", "embed"] + skip_groups)
+            elif update_basis_gen:
                 # Update everything (basis weights, basis gen, meta, ae, norm) minus frozen groups
                 model_optims.step(skip=skip_groups)
             else:
@@ -377,7 +435,7 @@ def train_from_cfg(
     #     p_ema.data.mul_(1 - ema_alpha).add_(p.data, alpha=ema_alpha)
 
     use_meta = cfg.tbfm.module.use_meta_learning
-    if use_meta:
+    if use_meta and not coadapt_embeddings:
         iter_train, _data_train = utils.iter_loader(
             iter_train, data_train, device=device
         )
@@ -385,6 +443,7 @@ def train_from_cfg(
         support, _ = split_support_query_sessions(
             _data_train,
             support_size=support_size,
+            random_sample=random_sample_support,
         )
 
         model_optims.zero_grad(set_to_none=True)

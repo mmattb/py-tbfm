@@ -31,12 +31,13 @@ class TBFM(nn.Module):
         zscore=True,
         use_meta_learning: bool = False,
         proj_meta_dim: int = 32,
-        is_basis_residual: bool = False,
         basis_residual_rank: int = 5,
         residual_mlp_hidden: int = 16,
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
         basis_gen_dropout: float = 0.0,
+        use_tanh_basis_weights: bool = True,
+        use_basis_weight_row_norm: bool = True,
         device=None,
     ):
         """
@@ -60,6 +61,8 @@ class TBFM(nn.Module):
         self.prev_bases = None
         self.prev_basis_weights = None
         self.use_meta_learning = use_meta_learning
+        self.use_tanh_basis_weights = use_tanh_basis_weights
+        self.use_basis_weight_row_norm = use_basis_weight_row_norm
 
         if zscore:
             self.normalizer = normalizers.ScalerZscore()
@@ -78,7 +81,6 @@ class TBFM(nn.Module):
             basis_depth=basis_depth,
             use_meta=use_meta_learning,
             proj_meta_dim=proj_meta_dim,
-            is_basis_residual=is_basis_residual,
             basis_residual_rank=basis_residual_rank,
             residual_mlp_hidden=residual_mlp_hidden,
             embed_dim_rest=embed_dim_rest,
@@ -235,8 +237,10 @@ class TBFM(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
-        basis_weights = torch.tanh(basis_weights)
-        basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
+        if self.use_tanh_basis_weights:
+            basis_weights = torch.tanh(basis_weights)
+        if self.use_basis_weight_row_norm:
+            basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 
         # Store for regularization (keep graph for outer loop backprop)
         self.prev_basis_weights = basis_weights
@@ -268,6 +272,8 @@ class TBFMCompiled(nn.Module):
         self.basis_weighting = tbfm.basis_weighting
         self.in_dim = tbfm.in_dim
         self.num_bases = tbfm.num_bases
+        self.use_tanh_basis_weights = tbfm.use_tanh_basis_weights
+        self.use_basis_weight_row_norm = tbfm.use_basis_weight_row_norm
 
     def zscore(self, data):
         """
@@ -305,6 +311,10 @@ class TBFMCompiled(nn.Module):
         basis_weights = self.basis_weighting(runway.flatten(start_dim=1))
         # basis_weights: (batch, in_dim, num_bases)
         basis_weights = basis_weights.unflatten(1, (self.in_dim, self.num_bases))
+        if self.use_tanh_basis_weights:
+            basis_weights = torch.tanh(basis_weights)
+        if self.use_basis_weight_row_norm:
+            basis_weights = torch.nn.functional.normalize(basis_weights, p=2, dim=-1)
 
         # preds: (batch, time (after runway), in_dim)
         preds = (basis_weights @ self.bases.permute(0, 2, 1)).permute(0, 2, 1)

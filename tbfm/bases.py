@@ -30,7 +30,6 @@ class Bases(nn.Module):
         embed_dim_rest: int | None = None,
         embed_dim_stim: int | None = None,
         proj_meta_dim: int = 32,
-        is_basis_residual: bool = False,
         basis_residual_rank: int = 5,
         residual_mlp_hidden: int = 16,
         basis_gen_dropout: float = 0.0,
@@ -47,13 +46,15 @@ class Bases(nn.Module):
             embed_dim_rest: dimensionality of the rest data embedding
             embed_dim_stim: dimensionality of the stim data embedding
             proj_meta_dim: dimensionality of the meta embedding projection network
-            is_basis_residual: if True, use residual mode (bases += W*f(embed_stim))
-            basis_residual_rank: rank of the residual subspace
+            basis_residual_rank: rank of residual subspace; 0 (or None) disables
+                residual mode and uses concatenation mode instead.
             residual_mlp_hidden: hidden dimension for residual MLP
             basis_gen_dropout: dropout rate for basis generator hidden layers
             device []: something tensor.to() would accept
         """
         super().__init__()
+
+        is_basis_residual = bool(basis_residual_rank)
 
         self.num_bases = num_bases
         self.trial_len = trial_len

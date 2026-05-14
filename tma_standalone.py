@@ -76,11 +76,15 @@ def main(
     num_bases,
     num_sessions,
     gpu,
+    coadapt=False,
     basis_residual_rank_in=None,
     epochs=12001,
     train_size=5000,
+    shuffle=True,
     latent_dim=None,
     batch_size_per_session=None,
+    residual_mlp_hidden=None,
+    embed_dim_stim=None,
     out_dir=None,
     random_seed=None,
     held_in_sessions=None,
@@ -88,7 +92,7 @@ def main(
     lambda_ae_recon=None,
     lambda_fro=None,
     lambda_ortho=None,
-    lambda_l2=None,
+    stim_embedding_lambda_l2=None,
     no_rest_embeddings=False,
     no_tanh_basis_weights=False,
     no_row_norm=False,
@@ -98,11 +102,19 @@ def main(
         my_out_dir = os.path.join(OUT_DIR, f"{num_bases}_{num_sessions}")
         if basis_residual_rank_in is not None:
             my_out_dir += f"_rr{basis_residual_rank_in}"
+        if coadapt:
+            my_out_dir += "_coadapt"
         my_out_dir += f"_ts{train_size}"
+        if not shuffle:
+            my_out_dir += "_noshuf"
         if latent_dim is not None:
             my_out_dir += f"_ld{latent_dim}"
         if batch_size_per_session is not None:
             my_out_dir += f"_bs{batch_size_per_session * num_sessions}"
+        if residual_mlp_hidden is not None:
+            my_out_dir += f"_mlp{residual_mlp_hidden}"
+        if embed_dim_stim is not None:
+            my_out_dir += f"_eds{embed_dim_stim}"
     else:
         my_out_dir = out_dir
 
@@ -230,12 +242,24 @@ def main(
     cfg.ae.training.lambda_ae_recon = 0.03
     cfg.tbfm.training.lambda_fro = 75.0
 
-    if basis_residual_rank_in == 0:
-        cfg.meta.is_basis_residual = False
-    else:
-        cfg.meta.is_basis_residual = True
-        cfg.meta.basis_residual_rank = basis_residual_rank_in or 16
-        cfg.meta.training.lambda_l2 = lambda_l2 if lambda_l2 is not None else 1e-2
+    # Co-adaptation of stim embeddings: trainable outer-loop embeddings
+    # instead of (or alongside) MAML inner-loop adaptation.
+    cfg.meta.training.coadapt = coadapt
+
+    # basis_residual_rank_in > 0  →  residual (LoRA) mode; 0 or None  →  disabled.
+    cfg.meta.basis_residual_rank = basis_residual_rank_in or 0
+    if basis_residual_rank_in:
+        if residual_mlp_hidden is not None:
+            cfg.meta.residual_mlp_hidden = residual_mlp_hidden
+
+    # stim_embedding_lambda_l2 regularizes the inner-loop stim embedding (trust region on
+    # embedding_stim during MAML adaptation). Valid in both concatenation and
+    # residual mode; apply whenever the user requests it.
+    if stim_embedding_lambda_l2 is not None:
+        cfg.meta.training.stim_embedding_lambda_l2 = stim_embedding_lambda_l2
+
+    if embed_dim_stim is not None:
+        cfg.tbfm.module.embed_dim_stim = embed_dim_stim
 
     # Ablation overrides
     if normalizer == "zscore":
@@ -254,7 +278,20 @@ def main(
         cfg.tbfm.module.use_basis_weight_row_norm = False
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
-    model_optims = multisession.get_optims(cfg, ms)
+
+    # If co-adapting, pre-initialize trainable per-session stim embeddings and
+    # register them with the optimizer collection (so the outer loop updates them).
+    if coadapt:
+        embed_dim_stim_eff = ms.model.bases.embed_dim_stim
+        embeddings_stim_init = {}
+        for sid in held_in_session_ids:
+            emb = torch.randn(embed_dim_stim_eff, device=DEVICE) * 0.1
+            emb.requires_grad = True
+            embeddings_stim_init[sid] = emb
+    else:
+        embeddings_stim_init = None
+
+    model_optims = multisession.get_optims(cfg, ms, embeddings_stim=embeddings_stim_init)
 
     best_model_dir = os.path.join(my_out_dir, "best")
     embeddings_stim, results = multisession.train_from_cfg(
@@ -263,9 +300,11 @@ def main(
         data_train,
         model_optims,
         embeddings_rest,
+        embeddings_stim=embeddings_stim_init,
         data_test=data_test,
         test_interval=1000,
         epochs=cfg.training.epochs,
+        random_sample_support=shuffle,
         model_save_path=best_model_dir,
     )
 
@@ -273,12 +312,12 @@ def main(
         "num_bases": num_bases,
         "num_sessions": num_sessions,
         "latent_dim": cfg.latent_dim,
-        "basis_residual_rank": (
-            cfg.meta.basis_residual_rank if cfg.meta.is_basis_residual else None
-        ),
+        "basis_residual_rank": cfg.meta.basis_residual_rank,
+        "residual_mlp_hidden": cfg.meta.residual_mlp_hidden,
         "embed_dim_stim": cfg.tbfm.module.embed_dim_stim,
         "embed_dim_rest": cfg.tbfm.module.embed_dim_rest,
-        "is_basis_residual": cfg.meta.is_basis_residual,
+        "coadapt": coadapt,
+        "shuffle": shuffle,
         "train_size": train_size,
         "batch_size_per_session": batch_size_per_session,
     }
@@ -358,13 +397,13 @@ if __name__ == "__main__":
     parser.add_argument("num_bases", type=int, help="Number of bases")
     parser.add_argument("num_sessions", type=int, help="Number of training sessions")
     parser.add_argument("gpu", type=str, help="GPU index (sets CUDA_VISIBLE_DEVICES)")
-    # coadapt positional kept for compatibility with ablation scripts (ignored — not implemented)
     parser.add_argument(
         "coadapt",
         type=str,
         nargs="?",
         default="false",
-        help="[ignored] Co-adaptation flag — not implemented in this branch",
+        help="Co-adapt stim embeddings via outer loop (true/false). "
+        "When true, skips MAML inner loop and trains per-session embeddings.",
     )
     parser.add_argument(
         "basis_residual_rank",
@@ -376,13 +415,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "train_size", type=int, nargs="?", default=5000, help="Training set size"
     )
-    # shuffle positional kept for script compatibility (ignored — not implemented)
     parser.add_argument(
         "shuffle",
         type=str,
         nargs="?",
-        default="false",
-        help="[ignored] Shuffle support set — not implemented in this branch",
+        default="true",
+        help="Randomly sample support set each epoch (true/false). Default: true.",
     )
 
     parser.add_argument(
@@ -402,6 +440,18 @@ if __name__ == "__main__":
         type=int,
         default=None,
         help="Batch size per session",
+    )
+    parser.add_argument(
+        "--residual-mlp-hidden",
+        type=int,
+        default=None,
+        help="Hidden dim for residual MLP (only used if basis_residual_rank > 0)",
+    )
+    parser.add_argument(
+        "--embed-dim-stim",
+        type=int,
+        default=None,
+        help="Stim embedding dimension (default: 15)",
     )
     parser.add_argument(
         "--out-dir", type=str, default=None, help="Custom output directory"
@@ -446,10 +496,10 @@ if __name__ == "__main__":
         help="Orthonormality penalty on bases (default: 0.0)",
     )
     parser.add_argument(
-        "--lambda-l2",
+        "--stim-embedding-lambda-l2",
         type=float,
         default=None,
-        help="L2 regularization on stim embeddings (default: 1e-2)",
+        help="L2 regularization on stim embeddings during inner-loop adaptation (default: 1e-3)",
     )
     parser.add_argument(
         "--no-rest-embeddings",
@@ -469,6 +519,8 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    coadapt = args.coadapt.lower() == "true"
+    shuffle = args.shuffle.lower() == "true"
     basis_residual_rank = (
         int(args.basis_residual_rank)
         if args.basis_residual_rank and args.basis_residual_rank.isdigit()
@@ -482,11 +534,15 @@ if __name__ == "__main__":
         args.num_bases,
         args.num_sessions,
         args.gpu,
+        coadapt=coadapt,
         basis_residual_rank_in=basis_residual_rank,
         epochs=args.epochs,
         train_size=args.train_size,
+        shuffle=shuffle,
         latent_dim=args.latent_dim,
         batch_size_per_session=args.batch_size_per_session,
+        residual_mlp_hidden=args.residual_mlp_hidden,
+        embed_dim_stim=args.embed_dim_stim,
         out_dir=args.out_dir,
         random_seed=args.random_seed,
         held_in_sessions=held_in_sessions,
@@ -494,7 +550,7 @@ if __name__ == "__main__":
         lambda_ae_recon=args.lambda_ae_recon,
         lambda_fro=args.lambda_fro,
         lambda_ortho=args.lambda_ortho,
-        lambda_l2=args.lambda_l2,
+        stim_embedding_lambda_l2=args.stim_embedding_lambda_l2,
         no_rest_embeddings=args.no_rest_embeddings,
         no_tanh_basis_weights=args.no_tanh_basis_weights,
         no_row_norm=args.no_row_norm,
