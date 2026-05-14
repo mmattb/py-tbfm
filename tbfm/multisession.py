@@ -361,6 +361,16 @@ def train_from_cfg(
                     max_test_r2 = r2_test
                     if model_save_path:
                         save_model(model, model_save_path)
+                        torch.save(
+                            {
+                                "epoch": eidx,
+                                "train_loss": train_losses[-1][-1],
+                                "train_r2": train_r2s[-1][-1],
+                                "test_loss": loss,
+                                "test_r2": r2_test,
+                            },
+                            os.path.join(model_save_path, "best_metrics.torch"),
+                        )
 
     # ----- (optional) EMA of AE params -----
     # for p, p_ema in zip(model.ae_parameters(), ae_ema_params):
@@ -426,6 +436,16 @@ def train_from_cfg(
             max_test_r2 = r2_test
             if model_save_path:
                 save_model(model, model_save_path)
+                torch.save(
+                    {
+                        "epoch": epochs - 1,
+                        "train_loss": train_losses[-1][-1] if train_losses else None,
+                        "train_r2": train_r2s[-1][-1] if train_r2s else None,
+                        "test_loss": loss,
+                        "test_r2": r2_test,
+                    },
+                    os.path.join(model_save_path, "best_metrics.torch"),
+                )
 
     print("Final:", loss, r2_test)
 
