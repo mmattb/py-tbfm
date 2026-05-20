@@ -73,20 +73,113 @@ def build_from_cfg(
     return TBFMMultisession(norms, aes, _tbfm, device=device)
 
 
-def save_model(model, path):
-    """Save full model to a directory (split format: tbfm.torch, ae.torch, norms.torch)."""
+def save_model(model, path, tbfm_only=False, embeddings_stim=None):
+    """Save model to a directory (split format: tbfm.torch, ae.torch, norms.torch).
+
+    Args:
+        model: TBFMMultisession instance.
+        path: Directory to save into (created if needed).
+        tbfm_only: If True, only save tbfm.torch (skip AE and normalizers).
+        embeddings_stim: Optional {sid: tensor} dict; saved as embeddings_stim.torch.
+    """
     os.makedirs(path, exist_ok=True)
     instances = set(model.model.instances.values())
     if len(instances) != 1:
         raise NotImplementedError("Only single shared TBFM supported for save")
     model_tbfm = next(iter(instances))
     torch.save(model_tbfm.state_dict(), os.path.join(path, "tbfm.torch"))
-    ae_states = {sid: inst.state_dict() for sid, inst in model.ae.instances.items()}
-    torch.save(ae_states, os.path.join(path, "ae.torch"))
-    norm_states = {
-        sid: inst.state_dict() for sid, inst in model.norms.instances.items()
-    }
-    torch.save(norm_states, os.path.join(path, "norms.torch"))
+    if not tbfm_only:
+        ae_states = {sid: inst.state_dict() for sid, inst in model.ae.instances.items()}
+        torch.save(ae_states, os.path.join(path, "ae.torch"))
+        norm_states = {
+            sid: inst.state_dict() for sid, inst in model.norms.instances.items()
+        }
+        torch.save(norm_states, os.path.join(path, "norms.torch"))
+    if embeddings_stim is not None:
+        torch.save(embeddings_stim, os.path.join(path, "embeddings_stim.torch"))
+
+
+def load_model_components(path, model, device=None):
+    """Load saved model components (split format) into an existing model.
+
+    Counterpart to :func:`save_model`.  Call after
+    :func:`build_from_cfg` to restore the trained weights:
+
+    .. code-block:: python
+
+        ms = multisession.build_from_cfg(cfg, data_for_held_out, device=device)
+        embeddings_stim, embeddings_rest = multisession.load_model_components(
+            "my_fold/model/best", ms, device=device
+        )
+
+    The TBFM is shared so any per-session key in ``tbfm.torch`` will be used as
+    the fallback for held-out sessions that were not seen during training.
+
+    Args:
+        path: Directory containing ``tbfm.torch``, ``ae.torch``, ``norms.torch``.
+        model: Existing :class:`TBFMMultisession` to load weights into.
+        device: ``torch.device`` or string — tensors are mapped here on load.
+
+    Returns:
+        ``(embeddings_stim, embeddings_rest)`` — both are ``{sid: tensor}`` dicts
+        if the files were present, else ``(None, None)``.
+    """
+    save_dir = path
+
+    # TBFM weights ─────────────────────────────────────────────────────────────
+    tbfm_path = os.path.join(save_dir, "tbfm.torch")
+    if os.path.exists(tbfm_path):
+        tbfm_state = torch.load(tbfm_path, map_location=device)
+        # The file may contain a bare state_dict (single shared TBFM) or a
+        # {sid: state_dict} mapping (per-session TBFM).
+        if isinstance(tbfm_state, dict) and all(
+            isinstance(v, dict) for v in tbfm_state.values()
+        ):
+            # Per-session mapping — try to match by session ID.
+            loaded_sids = set()
+            for sid, state in tbfm_state.items():
+                if sid in model.model.instances:
+                    model.model.instances[sid].load_state_dict(state)
+                    loaded_sids.add(sid)
+            # Held-out sessions won't be in tbfm_state; use any saved state as
+            # fallback (valid for shared TBFM).
+            if tbfm_state:
+                fallback_state = next(iter(tbfm_state.values()))
+                for sid in model.model.instances:
+                    if sid not in loaded_sids:
+                        model.model.instances[sid].load_state_dict(fallback_state)
+        else:
+            # Bare state_dict saved by save_model() in this branch.
+            for inst in model.model.instances.values():
+                inst.load_state_dict(tbfm_state)
+
+    # AE weights ────────────────────────────────────────────────────────────────
+    ae_path = os.path.join(save_dir, "ae.torch")
+    if os.path.exists(ae_path):
+        ae_states = torch.load(ae_path, map_location=device)
+        for sid, state in ae_states.items():
+            if sid in model.ae.instances:
+                model.ae.instances[sid].load_state_dict(state)
+
+    # Normalizer states ─────────────────────────────────────────────────────────
+    norms_path = os.path.join(save_dir, "norms.torch")
+    if os.path.exists(norms_path):
+        norm_states = torch.load(norms_path, map_location=device)
+        for sid, state in norm_states.items():
+            if sid in model.norms.instances:
+                model.norms.instances[sid].load_state_dict(state)
+
+    # Optional saved embeddings ─────────────────────────────────────────────────
+    embeddings_stim = None
+    embeddings_rest = None
+    stim_path = os.path.join(save_dir, "embeddings_stim.torch")
+    if os.path.exists(stim_path):
+        embeddings_stim = torch.load(stim_path, map_location=device)
+    rest_path = os.path.join(save_dir, "embeddings_rest.torch")
+    if os.path.exists(rest_path):
+        embeddings_rest = torch.load(rest_path, map_location=device)
+
+    return embeddings_stim, embeddings_rest
 
 
 def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
@@ -295,12 +388,13 @@ def train_from_cfg(
         # outer-optimized embeddings_stim directly.
         if use_meta and not coadapt_embeddings:
             model.eval()
-            embeddings_stim = meta.inner_update_stopgrad(
+            _result = meta.inner_update_stopgrad(
                 model,
                 support,
                 embeddings_rest,
                 cfg,
             )
+            embeddings_stim = _result[0] if isinstance(_result, tuple) else _result
             model.train()
 
         model_optims.zero_grad(set_to_none=True)
@@ -449,13 +543,14 @@ def train_from_cfg(
         )
 
         model_optims.zero_grad(set_to_none=True)
-        embeddings_stim = meta.inner_update_stopgrad(
+        _result = meta.inner_update_stopgrad(
             model,
             support,
             embeddings_rest,
             cfg,
             inner_steps=(3 * cfg.meta.training.inner_steps),
         )
+        embeddings_stim = _result[0] if isinstance(_result, tuple) else _result
 
     # Final test evaluation
     model_optims.zero_grad(set_to_none=True)
@@ -528,7 +623,7 @@ def train_from_cfg(
     return embeddings_stim, results
 
 
-def test_time_adaptation(
+def test_time_adaptation_inner_outer(
     cfg,
     model,
     embeddings_rest,
@@ -615,7 +710,7 @@ def test_time_adaptation(
     if optimize_embeddings and not adapt_ae:
         # Only optimizing embeddings (not AE)
         print("TTA: Optimizing embeddings...")
-        embeddings_stim, _ = meta.inner_update_stopgrad(
+        result = meta.inner_update_stopgrad(
             model,
             data_for_adaptation,
             embeddings_rest,
@@ -623,6 +718,7 @@ def test_time_adaptation(
             inner_steps=epochs,
             quiet=quiet,
         )
+        embeddings_stim = result if quiet else result[0]
 
     # AE optimization (alone or jointly with embeddings)
     # AE optimization using meta-learning approach
@@ -652,13 +748,18 @@ def test_time_adaptation(
 
         for outer_step in range(epochs):
             # Inner loop: optimize embeddings on data_for_adaptation
-            embeddings_stim_adapted = meta.inner_update_stopgrad(
+            # Normalize return value: some versions of meta.py return a bare dict
+            # when quiet=True, others always return a (dict, losses) tuple.
+            _result = meta.inner_update_stopgrad(
                 model,
                 data_for_adaptation,
                 embeddings_rest,
                 cfg,
                 inner_steps=inner_steps,
                 quiet=True,
+            )
+            embeddings_stim_adapted = (
+                _result[0] if isinstance(_result, tuple) else _result
             )
 
             # Outer step: update AE on data_for_adaptation using adapted embeddings
@@ -686,6 +787,22 @@ def test_time_adaptation(
                 ys[session_id] = y.detach()
             loss = loss / len(data_for_adaptation)
 
+            # AE reconstruction loss — anchors the AE so it can't collapse to a
+            # degenerate rotation that happens to minimise the prediction loss on
+            # the tiny support set but fails to generalise.
+            lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+            if lambda_ae_recon > 0:
+                runway_norm, runway_recon = model.forward_reconstruct(
+                    data_for_adaptation
+                )
+                recon_loss = 0
+                for session_id in data_for_adaptation.keys():
+                    recon_loss += nn.MSELoss()(
+                        runway_recon[session_id], runway_norm[session_id]
+                    )
+                recon_loss = recon_loss / len(data_for_adaptation)
+                loss = loss + lambda_ae_recon * recon_loss
+
             # Backward and update AE
             loss.backward()
             for opt in ae_optims:
@@ -694,15 +811,18 @@ def test_time_adaptation(
             if outer_step % 1000 == 0 and not quiet:
                 print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
 
-        # After outer loop, do final inner optimization for embeddings to return
-        embeddings_stim, _ = meta.inner_update_stopgrad(
+        # After outer loop, do final inner optimization for embeddings to return.
+        # Use `epochs` steps (not the short meta-train inner_steps) so the
+        # embeddings can fully converge against the now-adapted AE weights.
+        _result = meta.inner_update_stopgrad(
             model,
             data_for_adaptation,
             embeddings_rest,
             cfg,
-            inner_steps=inner_steps,
+            inner_steps=epochs,
             quiet=False,
         )
+        embeddings_stim = _result[0] if isinstance(_result, tuple) else _result
 
         print(
             f"TTA: Meta-learning optimization complete. Final loss: {loss.item():.6f}"
@@ -753,6 +873,319 @@ def test_time_adaptation(
     results["y_test"] = test_batch
     results["y_hat_test"] = y_hat_test
     return embeddings_stim, results
+
+
+def test_time_adaptation_joint(
+    cfg,
+    model,
+    embeddings_rest,
+    data_train,
+    epochs=1000,
+    data_test=None,
+    ae_warm_start: bool = True,
+    adapt_ae: bool = True,
+    embeddings_stim=None,
+    support_size: int | None = None,
+    quiet: bool = False,
+    emb_steps_per_ae_step: int = 5,
+    ae_lr: float | None = None,
+) -> tuple:
+    """
+    Co-adaptive test-time adaptation.
+
+    Maintains persistent embedding tensors and persistent AE parameters that are
+    jointly walked toward convergence:
+
+        for step in range(epochs):
+            # embedding steps — AE weights fixed
+            for _ in range(emb_steps_per_ae_step):
+                gradient step on embeddings_stim (TBFM + AE both frozen)
+            # AE step — embeddings fixed  (skipped when adapt_ae=False)
+            gradient step on AE weights (TBFM frozen, embeddings detached)
+
+    Both optimizers carry momentum across all steps so neither component is ever
+    re-initialized mid-run. The TBFM is never modified.
+
+    Args:
+        cfg: Hydra config object.
+        model: TBFMMultisession instance (TBFM weights kept frozen throughout).
+        embeddings_rest: {session_id: tensor} — fixed rest embeddings.
+        data_train: SyntheticMultisessionData (or any iterable) for the support set.
+        epochs: Total number of co-adaptation steps.
+        data_test: Optional held-out data for evaluation after adaptation.
+        ae_warm_start: If True, PCA-warm-start the AE before co-adaptation.
+        adapt_ae: If False, skip AE gradient steps (only embedding steps are taken).
+        embeddings_stim: Optional warm-start for embeddings. If provided, used as
+            initialization instead of randn * 0.1; optimization still runs.
+        support_size: Override cfg.meta.training.support_size.
+        quiet: Suppress per-step logging.
+        emb_steps_per_ae_step: Embedding gradient steps taken per AE step.
+
+    Returns:
+        embeddings_stim: {session_id: detached tensor}
+        results: dict with test metrics.
+    """
+    model.eval(ae=adapt_ae)  # AE stays in train mode only when we will adapt it
+    device = model.device
+
+    support_size = support_size or cfg.meta.training.support_size
+
+    # Materialise support set (assumed small — single batch)
+    _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
+    data_train, filter_stats = utils.filter_batch_outliers(data_train, model.norms, cfg)
+    if cfg.training.use_outlier_filtering:
+        print(
+            f"TTA: Training data filtered: "
+            f"{filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
+        )
+
+    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    print(f"TTA: Using {support_size} samples for adaptation (support set)")
+
+    # Refit normalizers from support set
+    print("TTA: Refitting normalizers from support set...")
+    with torch.no_grad():
+        for session_id, d in data_for_adaptation.items():
+            x = torch.cat((d[0], d[2]), dim=1)
+            model.norms.instances[session_id].fit(x)
+
+    # AE PCA warm-start
+    if ae_warm_start:
+        print("TTA: Warm starting autoencoder...")
+        with torch.no_grad():
+            for session_id, data in data_for_adaptation.items():
+                runway_norm = model.norms({session_id: data[0]})[session_id]
+                ae_inst = model.ae.instances.get(session_id)
+                if ae_inst is not None:
+                    ae_inst.pca_warm_start(runway_norm, center="median", whiten=False)
+                    print(f"  Warm started AE for {session_id}")
+
+    # ── Freeze TBFM; set up persistent optimizers ─────────────────────────────
+    # Freeze every parameter except AE weights (unfrozen below if adapt_ae).
+    saved_requires_grad = {
+        name: p.requires_grad for name, p in model.named_parameters()
+    }
+    model.requires_grad_(False)
+
+    # AE parameters — unfreeze and build optimizer (only when adapt_ae=True)
+    ae_params = []
+    if adapt_ae:
+        for session_id in data_for_adaptation.keys():
+            ae_inst = model.ae.instances.get(session_id)
+            if ae_inst is not None:
+                for p in ae_inst.parameters():
+                    p.requires_grad_(True)
+                    ae_params.append(p)
+
+    ae_optim = torch.optim.AdamW(
+        ae_params if ae_params else [torch.zeros(1, requires_grad=True)],
+        lr=ae_lr if ae_lr is not None else cfg.ae.training.optim.lr,
+        weight_decay=cfg.ae.training.optim.weight_decay,
+    )
+
+    # Embedding tensors — use provided warm-start or randn init; persistent across steps
+    embed_dim_stim = model.model.bases.embed_dim_stim
+    if embeddings_stim is not None:
+        # Warm-start from provided embeddings; clone so we don't mutate the input
+        embeddings_stim = {
+            sid: embeddings_stim[sid].detach().clone().requires_grad_(True)
+            for sid in data_for_adaptation.keys()
+        }
+    else:
+        embeddings_stim = {
+            sid: (torch.randn(embed_dim_stim, device=device) * 0.1).requires_grad_(True)
+            for sid in data_for_adaptation.keys()
+        }
+    emb_optim = torch.optim.AdamW(
+        list(embeddings_stim.values()),
+        lr=cfg.meta.training.optim.lr,
+        weight_decay=cfg.meta.training.optim.weight_decay,
+    )
+
+    embeddings_rest_detached = {
+        sid: emb.detach() for sid, emb in embeddings_rest.items()
+    }
+
+    lambda_l2 = cfg.meta.training.stim_embedding_lambda_l2
+    lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+    grad_clip = cfg.training.grad_clip
+
+    with torch.no_grad():
+        ys_norm = {
+            sid: model.norms({sid: d[2]})[sid] for sid, d in data_for_adaptation.items()
+        }
+
+    print(
+        f"TTA: {'Co-adapting' if adapt_ae else 'Optimizing embeddings'} for {epochs} steps"
+        + (f" ({emb_steps_per_ae_step} emb steps per AE step)" if adapt_ae else "")
+        + "..."
+    )
+
+    last_loss = None
+    for step in range(epochs):
+        # ── Embedding steps (AE frozen during backward) ───────────────────────
+        for _ in range(emb_steps_per_ae_step):
+            emb_optim.zero_grad()
+            model.model.reset_state()
+
+            preds = model(
+                data_for_adaptation,
+                embeddings_rest=embeddings_rest_detached,
+                embeddings_stim=embeddings_stim,
+            )
+
+            emb_loss = sum(
+                nn.MSELoss()(preds[sid], ys_norm[sid]) for sid in data_for_adaptation
+            ) / len(data_for_adaptation)
+
+            if lambda_l2:
+                l2 = sum((e**2).mean() for e in embeddings_stim.values())
+                emb_loss = emb_loss + lambda_l2 * l2 / len(embeddings_stim)
+
+            emb_loss.backward()
+            nn.utils.clip_grad_norm_(list(embeddings_stim.values()), grad_clip)
+            emb_optim.step()
+
+        # ── AE step (embeddings detached; skipped when adapt_ae=False) ──────────
+        if adapt_ae:
+            ae_optim.zero_grad()
+            model.model.reset_state()
+
+            emb_stim_detached = {sid: e.detach() for sid, e in embeddings_stim.items()}
+
+            preds = model(
+                data_for_adaptation,
+                embeddings_rest=embeddings_rest_detached,
+                embeddings_stim=emb_stim_detached,
+            )
+
+            ae_loss = sum(
+                nn.MSELoss()(preds[sid], ys_norm[sid]) for sid in data_for_adaptation
+            ) / len(data_for_adaptation)
+
+            if lambda_ae_recon > 0:
+                runway_norm, runway_recon = model.forward_reconstruct(data_for_adaptation)
+                recon_loss = sum(
+                    nn.MSELoss()(runway_recon[sid], runway_norm[sid])
+                    for sid in data_for_adaptation
+                ) / len(data_for_adaptation)
+                ae_loss = ae_loss + lambda_ae_recon * recon_loss
+
+            ae_loss.backward()
+            nn.utils.clip_grad_norm_(ae_params, grad_clip)
+            ae_optim.step()
+
+            last_loss = ae_loss.item()
+        else:
+            last_loss = emb_loss.item()
+
+        if not quiet and step % 100 == 0:
+            msg = f"  step {step}/{epochs}  loss={last_loss:.6f}"
+            if adapt_ae:
+                msg += f"  emb_loss={emb_loss.item():.6f}"
+            print(msg)
+
+    # Restore requires_grad state
+    for name, p in model.named_parameters():
+        p.requires_grad_(saved_requires_grad[name])
+
+    embeddings_stim = {sid: e.detach() for sid, e in embeddings_stim.items()}
+
+    if not quiet:
+        print(f"TTA: Done. Final loss={last_loss:.6f}")
+
+    # ── Optional test evaluation ───────────────────────────────────────────────
+    if data_test:
+        model.eval()
+        with torch.no_grad():
+            test_results = utils.evaluate_test_batches(
+                model,
+                data_test,
+                embeddings_rest,
+                embeddings_stim,
+                model.norms,
+                cfg,
+                device,
+                track_per_session_r2=True,
+            )
+        r2_test = test_results["r2"]
+        loss_test = test_results["loss"]
+        final_test_r2s = test_results["per_session_r2"]
+        y_hat_test = test_results["y_hat"]
+        test_batch = test_results["y_test"]
+        print(f"TTA: Test results - Loss: {loss_test:.6f}, R2: {r2_test:.4f}")
+    else:
+        r2_test = final_test_r2s = loss_test = y_hat_test = test_batch = None
+
+    results = {
+        "final_test_r2": r2_test,
+        "final_test_r2s": final_test_r2s,
+        "final_test_loss": loss_test,
+        "y_hat_test": y_hat_test,
+        "y_test": test_batch,
+    }
+    return embeddings_stim, results
+
+
+def test_time_adaptation(
+    cfg,
+    model,
+    embeddings_rest,
+    data_train,
+    epochs=1000,
+    data_test=None,
+    ae_warm_start: bool = True,
+    adapt_ae: bool = True,
+    embeddings_stim=None,
+    support_size: int | None = None,
+    quiet: bool = False,
+    joint: bool = False,
+    emb_steps_per_ae_step: int = 5,
+    ae_lr: float | None = None,
+) -> tuple:
+    """Dispatcher: routes to inner-outer (default) or joint TTA.
+
+    Pass ``joint=True`` to use the persistent co-adaptive strategy
+    (``test_time_adaptation_joint``).  The default (``joint=False``) uses
+    ``test_time_adaptation_inner_outer``, which re-initialises embeddings from
+    noise each outer step and runs MAML-style inner updates — currently the
+    best-performing strategy on held-out sessions (R²=0.450).
+
+    ``emb_steps_per_ae_step`` is forwarded only when ``joint=True``.
+    """
+    if joint:
+        return test_time_adaptation_joint(
+            cfg,
+            model,
+            embeddings_rest,
+            data_train,
+            epochs=epochs,
+            data_test=data_test,
+            ae_warm_start=ae_warm_start,
+            adapt_ae=adapt_ae,
+            embeddings_stim=embeddings_stim,
+            support_size=support_size,
+            quiet=quiet,
+            emb_steps_per_ae_step=emb_steps_per_ae_step,
+            ae_lr=ae_lr,
+        )
+    return test_time_adaptation_inner_outer(
+        cfg,
+        model,
+        embeddings_rest,
+        data_train,
+        epochs=epochs,
+        data_test=data_test,
+        ae_warm_start=ae_warm_start,
+        adapt_ae=adapt_ae,
+        embeddings_stim=embeddings_stim,
+        support_size=support_size,
+        quiet=quiet,
+    )
+
+
+# Backwards-compatible alias.
+test_time_adaptation_v2 = test_time_adaptation_joint  # joint / persistent co-adaptation
 
 
 # Multisession batched data loading ----------------------------

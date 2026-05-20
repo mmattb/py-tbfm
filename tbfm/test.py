@@ -413,3 +413,148 @@ def plot_grid_activity(
 
     # Add colorbar
     return fig
+
+
+# ---------------------------------------------------------------------------
+# Multi-session demo helpers
+#
+# These helpers let "TBFM Multisession Demo.ipynb" use the real production
+# multisession API (build_from_cfg, train_from_cfg, test_time_adaptation, ...)
+# against tiny low-dimensional procedurally generated data, without needing
+# any on-disk dataset.
+# ---------------------------------------------------------------------------
+
+
+class SyntheticMultisessionData:
+    """
+    Loader that mimics the contract of ``tbfm.dataset.SessionLoader`` enough
+    to feed ``multisession.build_from_cfg`` / ``multisession.train_from_cfg``
+    / ``multisession.test_time_adaptation``.
+
+    Each iteration yields ``{session_id: (runway, stiminds, y)}`` batches
+    drawn from in-memory tensors. One pass through ``__iter__`` runs through
+    all trials once (in random order if ``shuffle=True``), then stops.
+    """
+
+    def __init__(self, session_data, batch_size_per_session, shuffle=True):
+        # session_data: {sid: (runway, stiminds, y)}
+        self._data = session_data
+        self._batch_size_per_session = batch_size_per_session
+        self._shuffle = shuffle
+
+    @property
+    def session_ids(self):
+        return list(self._data.keys())
+
+    def keys(self):
+        return self.session_ids
+
+    def get_session_num_feats(self, sid):
+        return self._data[sid][0].shape[-1]
+
+    def __iter__(self):
+        # Assume all sessions have the same trial count (we generate them that way).
+        first_sid = self.session_ids[0]
+        n = self._data[first_sid][0].shape[0]
+        bs = self._batch_size_per_session
+        if self._shuffle:
+            idx = torch.randperm(n)
+        else:
+            idx = torch.arange(n)
+
+        def _gen():
+            for start in range(0, n - bs + 1, bs):
+                chunk = idx[start : start + bs]
+                batch = {}
+                for sid, (r, s, y) in self._data.items():
+                    batch[sid] = (r[chunk], s[chunk], y[chunk])
+                yield batch
+
+        return _gen()
+
+    def train_test_split(self, train_cut, test_cut=None):
+        """Split each session along its trial axis. ``train_cut`` is a count."""
+        train_data = {}
+        test_data = {}
+        for sid, (r, s, y) in self._data.items():
+            tc = int(train_cut)
+            train_data[sid] = (r[:tc], s[:tc], y[:tc])
+            if test_cut is None:
+                test_data[sid] = (r[tc:], s[tc:], y[tc:])
+            else:
+                test_data[sid] = (
+                    r[tc : tc + int(test_cut)],
+                    s[tc : tc + int(test_cut)],
+                    y[tc : tc + int(test_cut)],
+                )
+        cls = type(self)
+        return (
+            cls(train_data, self._batch_size_per_session, shuffle=self._shuffle),
+            cls(test_data, self._batch_size_per_session, shuffle=self._shuffle),
+        )
+
+
+def generate_multisession_demo_data(
+    session_ids,
+    trials_per_session=1000,
+    runway_length=20,
+    forecast_horizon=40,
+    num_channels=3,
+    stimdim=2,
+    sigma=0.2,
+    scale_max=2.0,
+    phase_step=15,
+    device="cpu",
+    seed=0,
+):
+    """
+    Build procedural per-session data using ``generate_ou_sinusoidal_moving_mean``.
+
+    All sessions share the same wavelength but differ in phase and amplitude
+    scale, giving each session a distinctive (but learnable) character.
+    Returns ``{session_id: (runway, stiminds, y)}`` with tensors already on
+    ``device``.
+
+    runway:    (trials_per_session, runway_length, num_channels)
+    stiminds:  (trials_per_session, stimdim)        - "unpacked" covariates
+    y:         (trials_per_session, forecast_horizon, num_channels)
+    """
+    trial_len = runway_length + forecast_horizon
+    sessions = {}
+    num_sessions = len(session_ids)
+    for sidx, sid in enumerate(session_ids):
+        # Per-session idiosyncrasy: phase offset and amplitude scale.
+        session_phase = phase_step
+        session_scale = (
+            0.5 + (scale_max - 0.5) * (sidx % num_sessions) / num_sessions
+        )  # cycles 0.5 → scale_max
+
+        torch.manual_seed(seed + sidx)
+        data = torch.zeros(trials_per_session, trial_len, num_channels)
+        for cidx in range(num_channels):
+            phase = session_phase + phase_step * ((cidx + sidx) % num_channels)
+            ch = generate_ou_sinusoidal_moving_mean(
+                trial_len=trial_len,
+                batch_size=trials_per_session,
+                phase_shift=phase,
+                wavelength=40,
+                sigma=sigma,
+            ).squeeze()
+            data[:, :, cidx] = ch.float() * session_scale
+
+        # Null stimulus descriptor: all zeros.
+        # This OU sinusoidal process has no external per-trial stimulus, so we
+        # use a constant zero vector — analogous to the null stim_desc clock
+        # vector in TBFM Demo.ipynb. The Bases MLP drops the last dim ("clock
+        # vec"), so passing zeros means the remaining dim is also 0; all
+        # trial-specific variation is captured by the runway → basis_weights
+        # path and by session embeddings.
+        stiminds = torch.zeros(trials_per_session, stimdim)
+
+        runway = data[:, :runway_length, :].to(device)
+        y = data[:, runway_length:, :].to(device)
+        stiminds = stiminds.to(device)
+
+        sessions[sid] = (runway, stiminds, y)
+
+    return sessions

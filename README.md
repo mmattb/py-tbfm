@@ -72,7 +72,7 @@ See `python tma_standalone.py --help` for the full list of options, including ab
 - **`TBFM Demo.ipynb`** — single-session walkthrough using synthetic data
 - **`TBFM FSAM Demo.ipynb`** — builds the TBFM via forward stagewise additive modeling; recommended after the first demo
 - **`TBFM Traveling Wave Demo.ipynb`** — demonstrates TBFM applied to traveling wave data
-- **`TBFM Multisession Demo.ipynb`** — multi-session meta-learning walkthrough *(coming soon)*
+- **`TBFM Multisession Demo.ipynb`** — full multi-session workflow: pretraining across synthetic sessions and test-time adaptation to held-out sessions
 
 ## Architecture
 
