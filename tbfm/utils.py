@@ -684,7 +684,7 @@ def evaluate_test_batches(
                     per_session_r2[session_id] += 0.0
 
         loss /= len(batch)
-        r2_test = r2_test / valid_sessions if valid_sessions > 0 else 0.0
+        r2_test = r2_test / valid_sessions if valid_sessions > 0 else torch.tensor(0.0)
 
         r2_outer += r2_test.item()
         loss_outer += loss.item()

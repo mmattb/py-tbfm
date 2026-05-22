@@ -73,7 +73,9 @@ def build_from_cfg(
     return TBFMMultisession(norms, aes, _tbfm, device=device)
 
 
-def save_model(model, path, tbfm_only=False, embeddings_stim=None, embeddings_rest=None):
+def save_model(
+    model, path, tbfm_only=False, embeddings_stim=None, embeddings_rest=None
+):
     """Save model to a directory (split format: tbfm.torch, ae.torch, norms.torch).
 
     Args:
@@ -270,7 +272,9 @@ def split_support_query_sessions(
     for session_id, d in data_train.items():
         if random_sample:
             n_samples = len(d[0])
-            effective_size = min(train_set_size, n_samples) if train_set_size else n_samples
+            effective_size = (
+                min(train_set_size, n_samples) if train_set_size else n_samples
+            )
             indices = torch.randperm(effective_size)
             support_indices = indices[:support_size]
             query_indices = indices[support_size:]
@@ -693,7 +697,10 @@ def test_time_adaptation_inner_outer(
     if random_sample_support and support_seed is not None:
         torch.manual_seed(support_seed)
     data_for_adaptation, _ = split_support_query_sessions(
-        data_train, support_size, random_sample=random_sample_support, train_set_size=None
+        data_train,
+        support_size,
+        random_sample=random_sample_support,
+        train_set_size=None,
     )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
@@ -761,7 +768,9 @@ def test_time_adaptation_inner_outer(
 
         # Progressive unfreezing: optionally fine-tune TBFM components at high support sizes
         tbfm_optims = {}
-        progressive_unfreezing_threshold = cfg.meta.training.get("progressive_unfreezing_threshold", 2000)
+        progressive_unfreezing_threshold = cfg.meta.training.get(
+            "progressive_unfreezing_threshold", 2000
+        )
         unfreeze_basis_weights = cfg.meta.training.get("unfreeze_basis_weights", False)
         unfreeze_bases = cfg.meta.training.get("unfreeze_bases", False)
         basis_weight_lr = cfg.meta.training.get("basis_weight_lr", 1e-5)
@@ -771,26 +780,36 @@ def test_time_adaptation_inner_outer(
             and (unfreeze_basis_weights or unfreeze_bases)
         )
         if enable_progressive_unfreezing:
-            print(f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})")
+            print(
+                f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})"
+            )
             for session_id in data_for_adaptation.keys():
                 tbfm_instance = model.model.instances.get(session_id)
                 if tbfm_instance is not None:
                     params_to_optimize = []
                     if unfreeze_basis_weights:
-                        params_to_optimize.append({
-                            "params": tbfm_instance.basis_weighting.parameters(),
-                            "lr": basis_weight_lr,
-                        })
-                        print(f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})")
+                        params_to_optimize.append(
+                            {
+                                "params": tbfm_instance.basis_weighting.parameters(),
+                                "lr": basis_weight_lr,
+                            }
+                        )
+                        print(
+                            f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})"
+                        )
                     if unfreeze_bases:
-                        params_to_optimize.append({
-                            "params": tbfm_instance.bases.parameters(),
-                            "lr": bases_lr,
-                        })
+                        params_to_optimize.append(
+                            {
+                                "params": tbfm_instance.bases.parameters(),
+                                "lr": bases_lr,
+                            }
+                        )
                         print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
                     if params_to_optimize:
                         wd = cfg.tbfm.training.optim.get("weight_decay", 1e-4)
-                        tbfm_optims[session_id] = torch.optim.AdamW(params_to_optimize, weight_decay=wd)
+                        tbfm_optims[session_id] = torch.optim.AdamW(
+                            params_to_optimize, weight_decay=wd
+                        )
 
         lambda_ae_recon = cfg.ae.training.lambda_ae_recon
 
@@ -817,6 +836,8 @@ def test_time_adaptation_inner_outer(
 
             # Outer step: update AE on data_for_adaptation using adapted embeddings
             for opt in ae_optims:
+                opt.zero_grad()
+            for opt in tbfm_optims.values():
                 opt.zero_grad()
 
             # Forward on data_for_adaptation with adapted embeddings
@@ -861,9 +882,17 @@ def test_time_adaptation_inner_outer(
                     tbfm_instance = model.model.instances.get(sid)
                     if tbfm_instance is not None:
                         if unfreeze_basis_weights:
-                            loss = loss + cfg.tbfm.training.lambda_fro * tbfm_instance.get_weighting_reg()
+                            loss = (
+                                loss
+                                + cfg.tbfm.training.lambda_fro
+                                * tbfm_instance.get_weighting_reg()
+                            )
                         if unfreeze_bases:
-                            loss = loss + cfg.tbfm.training.lambda_ortho * tbfm_instance.get_basis_rms_reg()
+                            loss = (
+                                loss
+                                + cfg.tbfm.training.lambda_ortho
+                                * tbfm_instance.get_basis_rms_reg()
+                            )
 
             # Backward and update AE (and TBFM if progressive unfreezing)
             loss.backward()
@@ -879,7 +908,9 @@ def test_time_adaptation_inner_outer(
                         components.append("basis_weights")
                     if unfreeze_bases:
                         components.append("bases")
-                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{'+'.join(components)}]")
+                print(
+                    f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{'+'.join(components)}]"
+                )
 
         # After outer loop, do final inner optimization for embeddings to return.
         # Use `epochs` steps (not the short meta-train inner_steps) so the
@@ -1152,7 +1183,9 @@ def test_time_adaptation_joint(
             ) / len(data_for_adaptation)
 
             if lambda_ae_recon > 0:
-                runway_norm, runway_recon = model.forward_reconstruct(data_for_adaptation)
+                runway_norm, runway_recon = model.forward_reconstruct(
+                    data_for_adaptation
+                )
                 recon_loss = sum(
                     nn.MSELoss()(runway_recon[sid], runway_norm[sid])
                     for sid in data_for_adaptation

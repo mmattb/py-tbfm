@@ -1316,7 +1316,6 @@ def train_vanilla_tbfm(
     Returns:
         Tuple of (final_test_r2, per_session_r2s_dict)
     """
-    from torcheval.metrics.functional import r2_score
     from tbfm import tbfm as tbfm_module
 
     if not quiet:
@@ -1425,7 +1424,7 @@ def train_vanilla_tbfm(
                 y_test_norm = _tbfm.normalize(y_test)
 
                 y_pred_test = _tbfm(runway_test, stiminds_test)
-                test_r2 = r2_score(y_pred_test.flatten(), y_test_norm.flatten())
+                test_r2 = utils.r2_score(y_pred_test.flatten(), y_test_norm.flatten())
 
                 test_r2_acc += test_r2.item()
                 test_batch_count += 1
@@ -1488,8 +1487,6 @@ def train_fresh_tbfm_no_multisession(
     Returns:
         Tuple of (final_test_r2, per_session_r2s_dict)
     """
-    from torcheval.metrics.functional import r2_score
-
     if not quiet:
         print("Training fresh TBFM (per-session, no multisession) on support set...")
 
@@ -1584,9 +1581,7 @@ def train_fresh_tbfm_no_multisession(
                 y_test_norm = _tbfm.normalize(y_test)
                 y_pred_test = _tbfm(runway_test, stiminds_test)
 
-                from torcheval.metrics.functional import r2_score
-
-                test_r2 = r2_score(y_pred_test.flatten(), y_test_norm.flatten())
+                test_r2 = utils.r2_score(y_pred_test.flatten(), y_test_norm.flatten())
                 test_r2_acc += test_r2.item()
                 test_batch_count += 1
 
