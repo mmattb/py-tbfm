@@ -41,15 +41,17 @@ def zscore_inv(data, mean, std):
 
 def percentile_affine(x, p_low=0.1, p_high=0.9, floor=1e-3):
     # x: [B, T, C] few-shot stim samples
-    flat = x.flatten(end_dim=1)
-    q = torch.tensor([p_low, 0.5, p_high], device=x.device, dtype=x.dtype)
+    # Quantile computation on CPU to avoid GPU OOM on large tensors
+    device = x.device
+    flat = x.flatten(end_dim=1).cpu()
+    q = torch.tensor([p_low, 0.5, p_high], dtype=x.dtype)
     qs = torch.quantile(flat, q, dim=0)  # [3, C]
     ql, qm, qh = qs[0], qs[1], qs[2]
     s = (qh - ql).clamp_min(floor * (qh - ql).median().clamp_min(1e-6))
     a = 2.0 / s
     b = -(qh + ql) / 2.0  # Average high and low; that's our new center
     # returns scale a and bias b such that x' = a*(x + b)
-    return a, b
+    return a.to(device), b.to(device)
 
 
 class SessionDispatcher:
@@ -664,19 +666,25 @@ def evaluate_test_batches(
         # Compute loss and R2
         loss = 0
         r2_test = 0
+        valid_sessions = 0
         for session_id, d in batch.items():
             y_test = d[2]
             loss += nn.MSELoss()(y_hat_test[session_id], y_test)
-            _r2_test = r2_score(
-                y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1),
-                y_test.permute(0, 2, 1).flatten(end_dim=1),
-            )
-            r2_test += _r2_test
-            if track_per_session_r2:
-                per_session_r2[session_id] += _r2_test.item()
+            yhat_flat = y_hat_test[session_id].permute(0, 2, 1).flatten(end_dim=1)
+            y_flat = y_test.permute(0, 2, 1).flatten(end_dim=1)
+            # r2_score requires at least 2 samples to compute variance
+            if yhat_flat.shape[0] >= 2:
+                _r2_test = r2_score(yhat_flat, y_flat)
+                r2_test += _r2_test
+                valid_sessions += 1
+                if track_per_session_r2:
+                    per_session_r2[session_id] += _r2_test.item()
+            else:
+                if track_per_session_r2:
+                    per_session_r2[session_id] += 0.0
 
         loss /= len(batch)
-        r2_test /= len(batch)
+        r2_test = r2_test / valid_sessions if valid_sessions > 0 else 0.0
 
         r2_outer += r2_test.item()
         loss_outer += loss.item()
