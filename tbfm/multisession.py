@@ -73,7 +73,7 @@ def build_from_cfg(
     return TBFMMultisession(norms, aes, _tbfm, device=device)
 
 
-def save_model(model, path, tbfm_only=False, embeddings_stim=None):
+def save_model(model, path, tbfm_only=False, embeddings_stim=None, embeddings_rest=None):
     """Save model to a directory (split format: tbfm.torch, ae.torch, norms.torch).
 
     Args:
@@ -81,6 +81,7 @@ def save_model(model, path, tbfm_only=False, embeddings_stim=None):
         path: Directory to save into (created if needed).
         tbfm_only: If True, only save tbfm.torch (skip AE and normalizers).
         embeddings_stim: Optional {sid: tensor} dict; saved as embeddings_stim.torch.
+        embeddings_rest: Optional {sid: tensor} dict; saved as embeddings_rest.torch.
     """
     os.makedirs(path, exist_ok=True)
     instances = set(model.model.instances.values())
@@ -95,8 +96,12 @@ def save_model(model, path, tbfm_only=False, embeddings_stim=None):
             sid: inst.state_dict() for sid, inst in model.norms.instances.items()
         }
         torch.save(norm_states, os.path.join(path, "norms.torch"))
+        session_ids = list(model.model.instances.keys())
+        torch.save(session_ids, os.path.join(path, "session_ids.torch"))
     if embeddings_stim is not None:
         torch.save(embeddings_stim, os.path.join(path, "embeddings_stim.torch"))
+    if embeddings_rest is not None:
+        torch.save(embeddings_rest, os.path.join(path, "embeddings_rest.torch"))
 
 
 def load_model_components(path, model, device=None):
@@ -258,13 +263,15 @@ def split_support_query_sessions(
     data_train,
     support_size: int,
     random_sample: bool = True,
+    train_set_size: int | None = None,
 ):
     support = {}
     query = {}
     for session_id, d in data_train.items():
         if random_sample:
             n_samples = len(d[0])
-            indices = torch.randperm(n_samples)
+            effective_size = min(train_set_size, n_samples) if train_set_size else n_samples
+            indices = torch.randperm(effective_size)
             support_indices = indices[:support_size]
             query_indices = indices[support_size:]
             support[session_id] = tuple(dd[support_indices] for dd in d)
@@ -409,11 +416,14 @@ def train_from_cfg(
             _loss = nn.MSELoss()(yhat_query[sid], y)
             losses[sid] = _loss
 
-            r2_train = r2_score(
-                yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1),
-                y.permute(0, 2, 1).flatten(end_dim=1),
-            )
-            r2_trains.append(r2_train.item())
+            yhat_flat = yhat_query[sid].permute(0, 2, 1).flatten(end_dim=1)
+            y_flat = y.permute(0, 2, 1).flatten(end_dim=1)
+            # r2_score requires at least 2 samples to compute variance
+            if yhat_flat.shape[0] >= 2:
+                r2_train = r2_score(yhat_flat, y_flat)
+                r2_trains.append(r2_train.item())
+            else:
+                r2_trains.append(0.0)
 
         cur_loss = sum(losses.values()) / len(y_query)
         train_losses.append((eidx, cur_loss.item()))
@@ -635,6 +645,8 @@ def test_time_adaptation_inner_outer(
     embeddings_stim=None,
     support_size: int | None = None,
     quiet: bool = False,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
 ) -> torch.Tensor:
     """
     Test-time adaptation for new sessions.
@@ -650,6 +662,8 @@ def test_time_adaptation_inner_outer(
         adapt_ae: If True, optimize the autoencoder weights
         embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
         support_size: Override cfg.meta.training.support_size if provided.
+        random_sample_support: If True, randomly sample the support set instead of taking the first N.
+        support_seed: Optional RNG seed for reproducible random support sampling.
 
     Returns:
         embeddings_stim: Session embeddings (optimized or provided)
@@ -675,8 +689,12 @@ def test_time_adaptation_inner_outer(
             f"TTA: Training data filtered: {filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
         )
 
-    # Split into support/query if support_size is provided
-    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    # Split into support set; no train_set_size limit at TTA time (use all available data)
+    if random_sample_support and support_seed is not None:
+        torch.manual_seed(support_seed)
+    data_for_adaptation, _ = split_support_query_sessions(
+        data_train, support_size, random_sample=random_sample_support, train_set_size=None
+    )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
     # Refit normalizers from support set (not from the full training set)
@@ -741,6 +759,41 @@ def test_time_adaptation_inner_outer(
                 )
                 ae_optims.append(ae_optim)
 
+        # Progressive unfreezing: optionally fine-tune TBFM components at high support sizes
+        tbfm_optims = {}
+        progressive_unfreezing_threshold = cfg.meta.training.get("progressive_unfreezing_threshold", 2000)
+        unfreeze_basis_weights = cfg.meta.training.get("unfreeze_basis_weights", False)
+        unfreeze_bases = cfg.meta.training.get("unfreeze_bases", False)
+        basis_weight_lr = cfg.meta.training.get("basis_weight_lr", 1e-5)
+        bases_lr = cfg.meta.training.get("bases_lr", 1e-6)
+        enable_progressive_unfreezing = (
+            support_size >= progressive_unfreezing_threshold
+            and (unfreeze_basis_weights or unfreeze_bases)
+        )
+        if enable_progressive_unfreezing:
+            print(f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})")
+            for session_id in data_for_adaptation.keys():
+                tbfm_instance = model.model.instances.get(session_id)
+                if tbfm_instance is not None:
+                    params_to_optimize = []
+                    if unfreeze_basis_weights:
+                        params_to_optimize.append({
+                            "params": tbfm_instance.basis_weighting.parameters(),
+                            "lr": basis_weight_lr,
+                        })
+                        print(f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})")
+                    if unfreeze_bases:
+                        params_to_optimize.append({
+                            "params": tbfm_instance.bases.parameters(),
+                            "lr": bases_lr,
+                        })
+                        print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
+                    if params_to_optimize:
+                        wd = cfg.tbfm.training.optim.get("weight_decay", 1e-4)
+                        tbfm_optims[session_id] = torch.optim.AdamW(params_to_optimize, weight_decay=wd)
+
+        lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+
         print(f"  Running {epochs} outer steps, each with {inner_steps} inner steps")
         print(
             f"  Both inner and outer loops use data_for_adaptation ({len(next(iter(data_for_adaptation.values()))[0])} samples)"
@@ -790,7 +843,6 @@ def test_time_adaptation_inner_outer(
             # AE reconstruction loss — anchors the AE so it can't collapse to a
             # degenerate rotation that happens to minimise the prediction loss on
             # the tiny support set but fails to generalise.
-            lambda_ae_recon = cfg.ae.training.lambda_ae_recon
             if lambda_ae_recon > 0:
                 runway_norm, runway_recon = model.forward_reconstruct(
                     data_for_adaptation
@@ -803,13 +855,31 @@ def test_time_adaptation_inner_outer(
                 recon_loss = recon_loss / len(data_for_adaptation)
                 loss = loss + lambda_ae_recon * recon_loss
 
-            # Backward and update AE
+            # Add TBFM regularization if progressive unfreezing is active
+            if tbfm_optims:
+                for sid in data_for_adaptation.keys():
+                    tbfm_instance = model.model.instances.get(sid)
+                    if tbfm_instance is not None:
+                        if unfreeze_basis_weights:
+                            loss = loss + cfg.tbfm.training.lambda_fro * tbfm_instance.get_weighting_reg()
+                        if unfreeze_bases:
+                            loss = loss + cfg.tbfm.training.lambda_ortho * tbfm_instance.get_basis_rms_reg()
+
+            # Backward and update AE (and TBFM if progressive unfreezing)
             loss.backward()
             for opt in ae_optims:
                 opt.step()
+            for opt in tbfm_optims.values():
+                opt.step()
 
             if outer_step % 1000 == 0 and not quiet:
-                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f}")
+                components = ["AE"]
+                if tbfm_optims:
+                    if unfreeze_basis_weights:
+                        components.append("basis_weights")
+                    if unfreeze_bases:
+                        components.append("bases")
+                print(f"  Outer step {outer_step}/{epochs}, loss: {loss.item():.6f} [{'+'.join(components)}]")
 
         # After outer loop, do final inner optimization for embeddings to return.
         # Use `epochs` steps (not the short meta-train inner_steps) so the
@@ -864,10 +934,28 @@ def test_time_adaptation_inner_outer(
         y_hat_test = None
         test_batch = None
 
+    # Evaluate on support (train) data after adaptation
+    with torch.no_grad():
+        train_results = utils.evaluate_test_batches(
+            model,
+            [data_for_adaptation],
+            embeddings_rest,
+            embeddings_stim,
+            model.norms,
+            cfg,
+            device,
+            track_per_session_r2=True,
+        )
+    r2_train = train_results["r2"]
+    final_train_r2s = train_results["per_session_r2"]
+    print(f"TTA: Train results - R2: {r2_train:.4f}")
+
     results = {}
     results["final_test_r2"] = r2_test
     results["final_test_r2s"] = final_test_r2s
     results["final_test_loss"] = loss
+    results["final_train_r2"] = r2_train
+    results["final_train_r2s"] = final_train_r2s
     results["y"] = ys
     results["y_hat"] = yhat
     results["y_test"] = test_batch
@@ -1142,6 +1230,8 @@ def test_time_adaptation(
     joint: bool = False,
     emb_steps_per_ae_step: int = 5,
     ae_lr: float | None = None,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
 ) -> tuple:
     """Dispatcher: routes to inner-outer (default) or joint TTA.
 
@@ -1151,7 +1241,8 @@ def test_time_adaptation(
     noise each outer step and runs MAML-style inner updates — currently the
     best-performing strategy on held-out sessions (R²=0.450).
 
-    ``emb_steps_per_ae_step`` is forwarded only when ``joint=True``.
+    ``emb_steps_per_ae_step`` and ``ae_lr`` are forwarded only when ``joint=True``.
+    ``random_sample_support`` and ``support_seed`` are forwarded only when ``joint=False``.
     """
     if joint:
         return test_time_adaptation_joint(
@@ -1181,6 +1272,8 @@ def test_time_adaptation(
         embeddings_stim=embeddings_stim,
         support_size=support_size,
         quiet=quiet,
+        random_sample_support=random_sample_support,
+        support_seed=support_seed,
     )
 
 
@@ -1239,11 +1332,13 @@ def load_stim_batched(
 
 
 def load_rest_embeddings(
-    session_ids, in_dir="data", in_subdir="embedding_rest", device=None
+    session_ids, in_dir=None, in_subdir="embedding_rest", device=None
 ):
     """
     See meta.cache_rest_embeds.
     """
+    if in_dir is None:
+        in_dir = os.environ.get("TBFM_DATA_DIR", "data")
     embeddings_rest = {}
     for session_id in session_ids:
         path = os.path.join(in_dir, session_id, in_subdir, "er.torch")
