@@ -681,6 +681,8 @@ def test_time_adaptation_inner_outer(
 
     support_size = support_size or cfg.meta.training.support_size
     inner_steps = cfg.meta.training.inner_steps
+    tail_inner_steps = getattr(cfg.meta.training, "tail_inner_steps", 1000)
+    grad_clip = cfg.training.grad_clip
 
     # We materialize the training data set under the presumption it is small and a single batch.
     # TODO we should probably enforce that somehow.
@@ -896,6 +898,13 @@ def test_time_adaptation_inner_outer(
 
             # Backward and update AE (and TBFM if progressive unfreezing)
             loss.backward()
+            if grad_clip:
+                ae_params = [p for opt in ae_optims for pg in opt.param_groups for p in pg["params"]]
+                tbfm_params = [p for opt in tbfm_optims.values() for pg in opt.param_groups for p in pg["params"]]
+                if ae_params:
+                    nn.utils.clip_grad_norm_(ae_params, grad_clip)
+                if tbfm_params:
+                    nn.utils.clip_grad_norm_(tbfm_params, grad_clip)
             for opt in ae_optims:
                 opt.step()
             for opt in tbfm_optims.values():
@@ -913,14 +922,15 @@ def test_time_adaptation_inner_outer(
                 )
 
         # After outer loop, do final inner optimization for embeddings to return.
-        # Use `epochs` steps (not the short meta-train inner_steps) so the
-        # embeddings can fully converge against the now-adapted AE weights.
+        # Use tail_inner_steps (cfg.meta.training.tail_inner_steps, default 1000)
+        # to give embeddings a longer final convergence pass without using the
+        # full epoch budget.
         _result = meta.inner_update_stopgrad(
             model,
             data_for_adaptation,
             embeddings_rest,
             cfg,
-            inner_steps=epochs,
+            inner_steps=tail_inner_steps,
             quiet=False,
         )
         embeddings_stim = _result[0] if isinstance(_result, tuple) else _result
@@ -1044,7 +1054,7 @@ def test_time_adaptation_joint(
         embeddings_stim: {session_id: detached tensor}
         results: dict with test metrics.
     """
-    model.eval(ae=adapt_ae)  # AE stays in train mode only when we will adapt it
+    model.eval(ae=not adapt_ae)  # ae=False keeps AE in train mode when we are adapting it
     device = model.device
 
     support_size = support_size or cfg.meta.training.support_size

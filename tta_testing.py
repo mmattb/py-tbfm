@@ -108,6 +108,16 @@ def parse_args():
         help="Number of inner steps for inner-outer TTA strategy",
     )
     parser.add_argument(
+        "--tta-final-inner-steps",
+        type=int,
+        default=None,
+        help=(
+            "Number of inner steps for the final embedding convergence pass after AE adaptation. "
+            "Defaults to --tta-epochs (full convergence). "
+            "Set to --tta-inner-steps (e.g. 20) to match experiments-branch behaviour."
+        ),
+    )
+    parser.add_argument(
         "--batch-size-per-session",
         type=int,
         default=7500,
@@ -249,7 +259,7 @@ def parse_args():
         "--lambda-l2",
         type=float,
         default=None,
-        help="Override cfg.meta.training.lambda_l2 at TTA time",
+        help="Override cfg.meta.training.stim_embedding_lambda_l2 at TTA time",
     )
     parser.add_argument(
         "--lambda-ortho",
@@ -347,10 +357,10 @@ def apply_ablation_overrides(cfg, overrides: dict, log_prefix: str = ""):
             f"{log_prefix}[ABLATION]   lambda_fro: {prev} -> {cfg.tbfm.training.lambda_fro}"
         )
     if overrides.get("lambda_l2") is not None:
-        prev = cfg.meta.training.lambda_l2
-        cfg.meta.training.lambda_l2 = float(overrides["lambda_l2"])
+        prev = cfg.meta.training.stim_embedding_lambda_l2
+        cfg.meta.training.stim_embedding_lambda_l2 = float(overrides["lambda_l2"])
         print(
-            f"{log_prefix}[ABLATION]   lambda_l2: {prev} -> {cfg.meta.training.lambda_l2}"
+            f"{log_prefix}[ABLATION]   stim_embedding_lambda_l2: {prev} -> {cfg.meta.training.stim_embedding_lambda_l2}"
         )
     if overrides.get("lambda_ortho") is not None:
         prev = cfg.tbfm.training.get("lambda_ortho", 0.0)
@@ -573,7 +583,7 @@ def gpu_worker(
                     f"use_tanh={cfg_eval.tbfm.module.get('use_tanh_basis_weights', True)}, "
                     f"lambda_ae_recon={cfg_eval.ae.training.lambda_ae_recon}, "
                     f"lambda_fro={cfg_eval.tbfm.training.lambda_fro}, "
-                    f"lambda_l2={cfg_eval.meta.training.lambda_l2}, "
+                    f"lambda_l2={cfg_eval.meta.training.stim_embedding_lambda_l2}, "
                     f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}"
                 )
 
@@ -984,7 +994,7 @@ def load_configuration(config_dir: Path, model_path: Path = None):
     cfg.meta.basis_residual_rank = 16
     cfg.meta.residual_mlp_hidden = 16
     cfg.tbfm.module.embed_dim_stim = 15
-    cfg.meta.training.lambda_l2 = 1e-2
+    cfg.meta.training.stim_embedding_lambda_l2 = 1e-2
     cfg.meta.training.coadapt = False
 
     # Parse and apply model-specific hyperparameters if model_path provided
@@ -2238,7 +2248,7 @@ def run_tta_sweep(
                     f"use_tanh={cfg_eval.tbfm.module.get('use_tanh_basis_weights', True)}, "
                     f"lambda_ae_recon={cfg_eval.ae.training.lambda_ae_recon}, "
                     f"lambda_fro={cfg_eval.tbfm.training.lambda_fro}, "
-                    f"lambda_l2={cfg_eval.meta.training.lambda_l2}, "
+                    f"lambda_l2={cfg_eval.meta.training.stim_embedding_lambda_l2}, "
                     f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}"
                 )
 

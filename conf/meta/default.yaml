@@ -13,6 +13,7 @@ meta:
                      # instead of MAML-style inner-loop adaptation each step.
     embed_steps_per_other_step: 1  # Updates of embed group per other-group update when coadapt=true
     inner_steps: 20
+    tail_inner_steps: 1000   # Inner steps for the final embedding re-fit after the outer TTA loop
     support_size: 300
     stim_embedding_lambda_l2: 1e-3
     progressive_unfreezing_threshold: 0  # Support size above which TBFM fine-tuning is enabled (0 = always)
