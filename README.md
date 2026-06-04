@@ -37,10 +37,41 @@ yhat = model(
 
 ## Walkthrough and demo
 
-``TBFM Demo.ipynb`` provides a detailed walkthrough which uses some synthetic data.
-``TBFM FSAM Demo.ipynb`` provides an additional demo where we build the TBFM using forward stagewise additive modeling. It's recommended to go through this one after the first.
+For multi-session and meta-learning functionality, check out the [`multisession`](https://github.com/mmattb/py-tbfm/tree/multisession) branch of this repository and get started with the [`scripts/tma_standalone.py`](https://github.com/mmattb/py-tbfm/blob/multisession/scripts/tma_standalone.py) training script. It trains a shared TBFM across many sessions using MAML-style inner-loop adaptation, with per-session learnable stimulus embeddings.
+
+**Required environment variable:**
+```bash
+export TBFM_DATA_DIR=/path/to/your/data
+```
+
+The data directory should contain one subdirectory per session (e.g. `MonkeyG_20150914_Session1_S1/`), each with a `torchraw/` subdirectory containing pre-processed trial tensors.
+
+**Basic usage:**
+```bash
+python scripts/tma_standalone.py NUM_BASES NUM_SESSIONS GPU_ID COADAPT BASIS_RESIDUAL_RANK TRAIN_SIZE SHUFFLE
+```
+
+Key arguments:
+- `NUM_BASES` — number of temporal bases (e.g. `100`)
+- `NUM_SESSIONS` — number of sessions to include in training
+- `GPU_ID` — GPU index, or `-1` for CPU
+- `COADAPT` — `true` to use co-adaptation (trains per-session embeddings via outer loop); `false` for MAML inner-loop adaptation
+- `BASIS_RESIDUAL_RANK` — rank of the per-session basis residual (LoRA-style correction); `0` disables residual mode and uses concatenation instead
+- `TRAIN_SIZE` — number of training trials per session
+- `SHUFFLE` — `true` to randomly sample support sets each epoch (recommended)
+
+See [`python scripts/tma_standalone.py --help`](https://github.com/mmattb/py-tbfm/blob/multisession/scripts/tma_standalone.py) for the full list of options, including ablation flags.
+
+## Demos and walkthroughs
+
+- **`TBFM Demo.ipynb`** — single-session walkthrough using synthetic data
+- **`TBFM FSAM Demo.ipynb`** — builds the TBFM via forward stagewise additive modeling; recommended after the first demo
+- **`TBFM Traveling Wave Demo.ipynb`** — demonstrates TBFM applied to traveling wave data
+- **`TBFM Multisession Demo.ipynb`** — full multi-session workflow: pretraining across synthetic sessions and test-time adaptation to held-out sessions
 
 ## Architecture
 
-![detail_arch](https://github.com/user-attachments/assets/daf3fb08-f087-4dcb-b4fb-5835a2f8f5c0)
+![detail_arch](docs/images/detail_arch.png)
 
+## Multisession Architecture
+![multisession_arch](docs/images/multisession_arch.png)
