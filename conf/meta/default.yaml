@@ -15,9 +15,9 @@ meta:
     inner_steps: 20
     tail_inner_steps: 1000   # Inner steps for the final embedding re-fit after the outer TTA loop
     support_size: 300
-    stim_embedding_lambda_l2: 1e-3
+    stim_embedding_lambda_l2: 0.5e-3
     progressive_unfreezing_threshold: 0  # Support size above which TBFM fine-tuning is enabled (0 = always)
-    unfreeze_basis_weights: true   # Fine-tune basis weighting layer at TTA time
+    unfreeze_basis_weights: false   # Fine-tune basis weighting layer at TTA time
     unfreeze_bases: true           # Fine-tune basis generator at TTA time
     basis_weight_lr: 1e-5          # LR for basis weights when unfrozen
     bases_lr: 1e-6                 # LR for basis generator when unfrozen

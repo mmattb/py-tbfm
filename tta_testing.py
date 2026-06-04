@@ -282,6 +282,11 @@ def parse_args():
         action="store_true",
         help="Zero all rest embeddings before TTA (mirrors --no-rest-embeddings at training)",
     )
+    parser.add_argument(
+        "--per-session",
+        action="store_true",
+        help="Force per-session processing (SESSION_GROUP_SIZE=1) without unfreezing",
+    )
 
     return parser.parse_args()
 
@@ -484,14 +489,21 @@ def gpu_worker(
                 print(f"[GPU {gpu_id}] Worker received exit signal")
                 break
 
-            # Handle both per-session jobs (4-tuple) and batch jobs (3-tuple)
+            # Handle per-session jobs (4-tuple) and batch jobs (3-tuple)
             if len(job) == 4:
-                # Per-session job (progressive unfreezing)
-                model_key, support_size, strategy_key, session_id = job
-                current_session_ids = [session_id]
-                print(
-                    f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}, Session={session_id}"
-                )
+                model_key, support_size, strategy_key, session_spec = job
+                if isinstance(session_spec, list):
+                    # Session-group job (frozen multi-GPU split)
+                    current_session_ids = session_spec
+                    print(
+                        f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}, Sessions={len(current_session_ids)}"
+                    )
+                else:
+                    # Per-session job (progressive unfreezing)
+                    current_session_ids = [session_spec]
+                    print(
+                        f"[GPU {gpu_id}] Processing: Model={model_key}, Support={support_size}, Strategy={strategy_key}, Session={session_spec}"
+                    )
             else:
                 # Batch job (all sessions together)
                 model_key, support_size, strategy_key = job
@@ -1689,8 +1701,24 @@ def run_tta_sweep_multi_gpu(
         print(f"Expanded to {len(tta_jobs)} per-session TTA jobs")
     else:
         # Separate TTA jobs from baseline jobs
-        tta_jobs = [j for j in jobs if len(j) == 3]
         baseline_jobs = [j for j in jobs if len(j) == 2]
+        tta_jobs_base = [j for j in jobs if len(j) == 3]
+
+        # Split sessions across GPUs so all GPUs get work
+        if len(gpu_ids) > 1 and len(adapt_session_ids) >= len(gpu_ids):
+            n = len(gpu_ids)
+            groups = [adapt_session_ids[i::n] for i in range(n)]
+            groups = [g for g in groups if g]
+            tta_jobs = []
+            for job in tta_jobs_base:
+                model_key, support_size, strategy_key = job
+                for group in groups:
+                    tta_jobs.append((model_key, support_size, strategy_key, group))
+            print(
+                f"Split {len(adapt_session_ids)} sessions into {len(groups)} groups across {len(gpu_ids)} GPUs"
+            )
+        else:
+            tta_jobs = tta_jobs_base
 
     # Process baselines on single GPU (typically fast and not worth parallelizing)
     if baseline_jobs:
@@ -2551,44 +2579,61 @@ def save_results(results: Dict, output_dir: Path):
 
 def save_per_session_csv(results: Dict, csv_path: Path):
     """Save per-session R² scores to CSV file."""
-    rows = []
+    # Merge runs with the same (model, strategy, support_size) — handles session-group jobs
+    merged = {}  # (model, strategy, support_size) -> {session_id: (r2, train_r2)}
+    no_session_runs = []
 
     for run in results["runs"]:
         model = run["model"]
         support_size = run["support_size"]
         strategy = run["strategy"]
-        overall_r2 = run["r2"]
         per_session_r2s = run.get("per_session_r2s", {})
-        overall_train_r2 = run.get("train_r2")
         per_session_train_r2s = run.get("per_session_train_r2s", {})
 
         if per_session_r2s:
-            for session_id, session_r2 in per_session_r2s.items():
-                rows.append(
-                    {
-                        "model": model,
-                        "strategy": strategy,
-                        "support_size": support_size,
-                        "session_id": session_id,
-                        "session_r2": session_r2,
-                        "overall_r2": overall_r2,
-                        "session_train_r2": per_session_train_r2s.get(session_id),
-                        "overall_train_r2": overall_train_r2,
-                    }
-                )
+            key = (model, strategy, support_size)
+            if key not in merged:
+                merged[key] = {}
+            for sid, r2 in per_session_r2s.items():
+                merged[key][sid] = (r2, per_session_train_r2s.get(sid))
         else:
+            no_session_runs.append(run)
+
+    rows = []
+    for (model, strategy, support_size), sessions in sorted(merged.items()):
+        r2_vals = [r2 for r2, _ in sessions.values()]
+        train_vals = [tr for _, tr in sessions.values() if tr is not None]
+        overall_r2 = sum(r2_vals) / len(r2_vals)
+        overall_train_r2 = sum(train_vals) / len(train_vals) if train_vals else None
+        for session_id, (session_r2, session_train_r2) in sessions.items():
             rows.append(
                 {
                     "model": model,
                     "strategy": strategy,
                     "support_size": support_size,
-                    "session_id": "(overall)",
-                    "session_r2": overall_r2,
+                    "session_id": session_id,
+                    "session_r2": session_r2,
                     "overall_r2": overall_r2,
-                    "session_train_r2": overall_train_r2,
+                    "session_train_r2": session_train_r2,
                     "overall_train_r2": overall_train_r2,
                 }
             )
+
+    for run in no_session_runs:
+        overall_r2 = run["r2"]
+        overall_train_r2 = run.get("train_r2")
+        rows.append(
+            {
+                "model": run["model"],
+                "strategy": run["strategy"],
+                "support_size": run["support_size"],
+                "session_id": "(overall)",
+                "session_r2": overall_r2,
+                "overall_r2": overall_r2,
+                "session_train_r2": overall_train_r2,
+                "overall_train_r2": overall_train_r2,
+            }
+        )
 
     if rows:
         with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -2809,119 +2854,44 @@ def _main_impl(args):
             or cfg.meta.training.get("unfreeze_bases", False)
         )
     )
+    force_per_session = args.per_session
 
-    if progressive_unfreezing_enabled:
-        # Process each session individually to get per-session adapted models
-        SESSION_GROUP_SIZE = 1
-        print(f"\nProgressive unfreezing enabled: processing each session individually")
-    else:
-        # Batch sessions for memory efficiency (only session embeddings differ)
-        SESSION_GROUP_SIZE = 5 if max(args.support_sizes) >= 2500 else 15
-        print(f"\nProgressive unfreezing disabled: batching sessions for efficiency")
-
-    session_groups = [
-        adapt_session_ids[i : i + SESSION_GROUP_SIZE]
-        for i in range(0, len(adapt_session_ids), SESSION_GROUP_SIZE)
-    ]
-
-    print(
-        f"Processing {len(adapt_session_ids)} sessions in {len(session_groups)} group(s) of up to {SESSION_GROUP_SIZE}"
+    data_train, data_test, embeddings_rest = prepare_data(
+        adapt_session_ids, window_size, args.batch_size_per_session, device
     )
 
-    # Multi-GPU with progressive unfreezing: process all sessions in parallel
-    # Skip session grouping to allow full parallelization across sessions
-    if args.use_multi_gpu and progressive_unfreezing_enabled:
-        print(
-            f"\nMulti-GPU mode with progressive unfreezing: processing all sessions in parallel"
-        )
+    results = run_tta_sweep(
+        model_paths,
+        held_in_sessions_map,
+        args.support_sizes,
+        adapt_session_ids,
+        cfg,
+        data_train,
+        data_test,
+        args.tta_epochs,
+        device,
+        args.output_dir,
+        include_vanilla_tbfm=args.include_vanilla_tbfm,
+        vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
+        include_fresh_tbfm=args.include_fresh_tbfm,
+        fresh_tbfm_epochs=args.fresh_tbfm_epochs,
+        use_multi_gpu=args.use_multi_gpu,
+        gpu_ids=args.gpu_ids,
+        progressive_unfreezing_enabled=progressive_unfreezing_enabled or force_per_session,
+        use_coadapt=args.coadapt_tta,
+        both_methods=args.both_methods,
+        adapt_ae=not args.no_adapt_ae,
+        random_sample_support=args.random_support,
+        support_seed=args.support_seed,
+        ablation_overrides=ablation_overrides,
+        zero_rest_embeddings=args.zero_rest_embeddings,
+        ae_lr=args.ae_lr,
+    )
+    all_results = [results]
 
-        # Prepare data for all sessions
-        data_train, data_test, embeddings_rest = prepare_data(
-            adapt_session_ids, window_size, args.batch_size_per_session, device
-        )
-
-        # Run TTA sweep on all sessions (multi-GPU will create per-session jobs)
-        results = run_tta_sweep(
-            model_paths,
-            held_in_sessions_map,
-            args.support_sizes,
-            adapt_session_ids,
-            cfg,
-            data_train,
-            data_test,
-            args.tta_epochs,
-            device,
-            args.output_dir,
-            include_vanilla_tbfm=args.include_vanilla_tbfm,
-            vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
-            include_fresh_tbfm=args.include_fresh_tbfm,
-            fresh_tbfm_epochs=args.fresh_tbfm_epochs,
-            use_multi_gpu=args.use_multi_gpu,
-            gpu_ids=args.gpu_ids,
-            progressive_unfreezing_enabled=progressive_unfreezing_enabled,
-            use_coadapt=args.coadapt_tta,
-            both_methods=args.both_methods,
-            adapt_ae=not args.no_adapt_ae,
-            random_sample_support=args.random_support,
-            support_seed=args.support_seed,
-            ablation_overrides=ablation_overrides,
-            zero_rest_embeddings=args.zero_rest_embeddings,
-            ae_lr=args.ae_lr,
-        )
-        all_results = [results]
-
-    else:
-        # Single-GPU or non-progressive-unfreezing: use session grouping
-        all_results = []
-        for group_idx, session_group in enumerate(session_groups):
-            print(f"\n{'='*80}")
-            print(
-                f"Processing group {group_idx + 1}/{len(session_groups)}: {len(session_group)} sessions"
-            )
-            print(f"{'='*80}\n")
-
-            # Prepare data for this group
-            data_train, data_test, embeddings_rest = prepare_data(
-                session_group, window_size, args.batch_size_per_session, device
-            )
-
-            # Run TTA sweep for this group
-            group_results = run_tta_sweep(
-                model_paths,
-                held_in_sessions_map,
-                args.support_sizes,
-                session_group,
-                cfg,
-                data_train,
-                data_test,
-                args.tta_epochs,
-                device,
-                args.output_dir,
-                include_vanilla_tbfm=args.include_vanilla_tbfm,
-                vanilla_tbfm_epochs=args.vanilla_tbfm_epochs,
-                include_fresh_tbfm=args.include_fresh_tbfm,
-                fresh_tbfm_epochs=args.fresh_tbfm_epochs,
-                use_multi_gpu=args.use_multi_gpu,
-                gpu_ids=args.gpu_ids,
-                use_coadapt=args.coadapt_tta,
-                both_methods=args.both_methods,
-                adapt_ae=not args.no_adapt_ae,
-                random_sample_support=args.random_support,
-                support_seed=args.support_seed,
-                ablation_overrides=ablation_overrides,
-                zero_rest_embeddings=args.zero_rest_embeddings,
-                ae_lr=args.ae_lr,
-            )
-
-            all_results.append(group_results)
-
-            # Clean up GPU memory between groups
-            del data_train, data_test, embeddings_rest
-            torch.cuda.empty_cache()
-
-    # Aggregate results from all groups
+    # Aggregate results
     print(f"\n{'='*80}")
-    print(f"Aggregating results from {len(session_groups)} group(s)")
+    print(f"Aggregating results")
     print(f"{'='*80}\n")
 
     # Combine results (use first group's metadata and baselines, merge TTA runs)
@@ -2938,9 +2908,20 @@ def _main_impl(args):
     # Update metadata to reflect all sessions
     results["metadata"]["adapt_session_ids"] = adapt_session_ids
 
-    # Save and plot results
-    save_results(results, args.output_dir)
-    plot_results(results, args.output_dir, show=not args.no_plot_display)
+    print(f"Aggregation complete, {len(results.get('runs', []))} runs. Saving...")
+    print(f"Saving results to {args.output_dir}...")
+    try:
+        save_results(results, args.output_dir)
+    except Exception as e:
+        import traceback as _tb
+        print(f"ERROR in save_results: {e}")
+        _tb.print_exc()
+        raise
+
+    try:
+        plot_results(results, args.output_dir, show=not args.no_plot_display)
+    except Exception as e:
+        print(f"Warning: plot_results failed (non-fatal): {e}")
 
     print("\n" + "=" * 80)
     print("TTA Evaluation Complete!")
