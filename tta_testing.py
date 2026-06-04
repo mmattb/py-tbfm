@@ -402,6 +402,7 @@ def gpu_worker(
     support_seed: int | None = None,
     ablation_overrides: dict | None = None,
     zero_rest_embeddings: bool = False,
+    ae_lr: float | None = None,
 ):
     """
     Worker process for processing TTA jobs on a specific GPU.
@@ -678,6 +679,7 @@ def gpu_worker(
                     )
 
                 # Run TTA
+                _tta_t0 = time.perf_counter()
                 adapted_embeddings, strategy_results = _dispatch_tta(
                     strategy_cfg,
                     cfg_eval,
@@ -690,6 +692,7 @@ def gpu_worker(
                     support_size=support_size,
                     ae_lr=ae_lr,
                 )
+                adapt_time_s = time.perf_counter() - _tta_t0
 
                 final_r2 = strategy_results["final_test_r2"]
                 per_session_r2s = strategy_results.get("final_test_r2s", {})
@@ -854,6 +857,7 @@ def gpu_worker(
                         "train_r2": final_train_r2,
                         "per_session_train_r2s": per_session_train_r2s,
                         "gpu_id": gpu_id,
+                        "adapt_time_s": adapt_time_s,
                     }
                 )
 
@@ -1664,6 +1668,7 @@ def run_tta_sweep_multi_gpu(
     support_seed: int | None = None,
     ablation_overrides: dict | None = None,
     zero_rest_embeddings: bool = False,
+    ae_lr: float | None = None,
 ) -> Dict:
     """
     Multi-GPU version of run_tta_sweep using multiprocessing.
@@ -1818,6 +1823,7 @@ def run_tta_sweep_multi_gpu(
                     support_seed,
                     ablation_overrides,
                     zero_rest_embeddings,
+                    ae_lr,
                 ),
             )
             p.start()
@@ -2099,6 +2105,7 @@ def run_tta_sweep(
             support_seed=support_seed,
             ablation_overrides=ablation_overrides,
             zero_rest_embeddings=zero_rest_embeddings,
+            ae_lr=ae_lr,
         )
 
     with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
@@ -2589,23 +2596,26 @@ def save_per_session_csv(results: Dict, csv_path: Path):
         strategy = run["strategy"]
         per_session_r2s = run.get("per_session_r2s", {})
         per_session_train_r2s = run.get("per_session_train_r2s", {})
+        adapt_time_s = run.get("adapt_time_s")
+        n = len(per_session_r2s) or 1
+        per_session_time = adapt_time_s / n if adapt_time_s is not None else None
 
         if per_session_r2s:
             key = (model, strategy, support_size)
             if key not in merged:
                 merged[key] = {}
             for sid, r2 in per_session_r2s.items():
-                merged[key][sid] = (r2, per_session_train_r2s.get(sid))
+                merged[key][sid] = (r2, per_session_train_r2s.get(sid), per_session_time)
         else:
             no_session_runs.append(run)
 
     rows = []
     for (model, strategy, support_size), sessions in sorted(merged.items()):
-        r2_vals = [r2 for r2, _ in sessions.values()]
-        train_vals = [tr for _, tr in sessions.values() if tr is not None]
+        r2_vals = [r2 for r2, _, _t in sessions.values()]
+        train_vals = [tr for _, tr, _t in sessions.values() if tr is not None]
         overall_r2 = sum(r2_vals) / len(r2_vals)
         overall_train_r2 = sum(train_vals) / len(train_vals) if train_vals else None
-        for session_id, (session_r2, session_train_r2) in sessions.items():
+        for session_id, (session_r2, session_train_r2, session_adapt_time_s) in sessions.items():
             rows.append(
                 {
                     "model": model,
@@ -2616,6 +2626,7 @@ def save_per_session_csv(results: Dict, csv_path: Path):
                     "overall_r2": overall_r2,
                     "session_train_r2": session_train_r2,
                     "overall_train_r2": overall_train_r2,
+                    "adapt_time_s": session_adapt_time_s,
                 }
             )
 
@@ -2632,6 +2643,7 @@ def save_per_session_csv(results: Dict, csv_path: Path):
                 "overall_r2": overall_r2,
                 "session_train_r2": overall_train_r2,
                 "overall_train_r2": overall_train_r2,
+                "adapt_time_s": run.get("adapt_time_s"),
             }
         )
 
@@ -2646,6 +2658,7 @@ def save_per_session_csv(results: Dict, csv_path: Path):
                 "overall_r2",
                 "session_train_r2",
                 "overall_train_r2",
+                "adapt_time_s",
             ]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
