@@ -36,4 +36,4 @@ tbfm:
       wd_head: 1e-4
       wd_meta: 1e-5
     lambda_fro: 75.0
-    lambda_ortho: 0.00
+    lambda_ortho: 0.05
