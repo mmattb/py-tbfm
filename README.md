@@ -42,7 +42,7 @@ yhat = model(
 
 ## Multi-session training
 
-For multi-session meta-learning, use the `tma_standalone.py` training script. It trains a shared TBFM across many sessions using MAML-style inner-loop adaptation, with per-session learnable stimulus embeddings.
+For multi-session meta-learning, use the `scripts/tma_standalone.py` training script. It trains a shared TBFM across many sessions using MAML-style inner-loop adaptation, with per-session learnable stimulus embeddings.
 
 **Required environment variable:**
 ```bash
@@ -53,7 +53,7 @@ The data directory should contain one subdirectory per session (e.g. `MonkeyG_20
 
 **Basic usage:**
 ```bash
-python tma_standalone.py NUM_BASES NUM_SESSIONS GPU_ID COADAPT BASIS_RESIDUAL_RANK TRAIN_SIZE SHUFFLE
+python scripts/tma_standalone.py NUM_BASES NUM_SESSIONS GPU_ID COADAPT BASIS_RESIDUAL_RANK TRAIN_SIZE SHUFFLE
 ```
 
 Key arguments:
@@ -65,7 +65,7 @@ Key arguments:
 - `TRAIN_SIZE` — number of training trials per session
 - `SHUFFLE` — `true` to randomly sample support sets each epoch (recommended)
 
-See `python tma_standalone.py --help` for the full list of options, including ablation flags.
+See `python scripts/tma_standalone.py --help` for the full list of options, including ablation flags.
 
 ## Demos and walkthroughs
 
@@ -76,5 +76,7 @@ See `python tma_standalone.py --help` for the full list of options, including ab
 
 ## Architecture
 
-![detail_arch](https://github.com/user-attachments/assets/daf3fb08-f087-4dcb-b4fb-5835a2f8f5c0)
+![detail_arch](docs/images/detail_arch.png)
 
+## Multisession Architecture
+![multisession_arch](docs/images/multisession_arch.png)
