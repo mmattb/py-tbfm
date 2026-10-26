@@ -204,12 +204,20 @@ def parse_args():
     parser.add_argument(
         "--coadapt-tta",
         action="store_true",
-        help="Use joint TTA (persistent embedding + AE co-adaptation) instead of inner-outer TTA",
+        help="Use coadapt TTA (single shared forward/backward pass co-adaptation, "
+        "the method described in the paper) instead of inner-outer TTA",
+    )
+    parser.add_argument(
+        "--joint-tta",
+        action="store_true",
+        help="Also run joint TTA (alternating embedding/AE co-adaptation) — a "
+        "different strategy from coadapt, despite the historical name collision",
     )
     parser.add_argument(
         "--both-methods",
         action="store_true",
-        help="Run both inner-outer and joint TTA strategies in a single sweep",
+        help="Run both inner-outer and coadapt TTA strategies in a single sweep "
+        "(combine with --joint-tta to add joint as a third arm)",
     )
     parser.add_argument(
         "--ae-lr",
@@ -1260,26 +1268,47 @@ def clone_cfg_for_eval(base_cfg, vanilla=False):
     return cfg
 
 
-def get_tta_strategies(use_coadapt: bool = False, both_methods: bool = False) -> Dict:
+def get_tta_strategies(
+    use_coadapt: bool = False,
+    use_joint: bool = False,
+    both_methods: bool = False,
+) -> Dict:
     """Return available TTA strategies.
 
     inner_outer: re-initialises embeddings from noise each outer step, runs
         ``--tta-inner-steps`` MAML-style inner steps, then one AE gradient step.
         Default strategy.  Maps to ``test_time_adaptation_inner_outer``.
 
-    joint: persistent embedding + AE optimizers that carry momentum across all
-        steps — neither is ever re-initialised.  Maps to
-        ``test_time_adaptation``.  Select with ``--coadapt-tta``.
+    coadapt: single shared forward/backward pass per outer step — AE,
+        embeddings, and (if progressively unfrozen) TBFM are all updated
+        together from the same loss every step.  This is the original
+        strategy and the one the paper describes as "c^stim optimized
+        jointly with the autoencoder".  Maps to
+        ``test_time_adaptation_coadapt``.  Select with ``--coadapt-tta``.
 
-    When ``--both-methods`` is passed both strategies run back-to-back.
+    joint: a *different*, independently-developed strategy that alternates
+        embedding-only steps (AE+TBFM frozen) with AE-only steps (embeddings
+        detached).  NOT the paper's "coadapt" method despite the historical
+        name collision.  Maps to ``test_time_adaptation_joint``.  Select with
+        ``--joint-tta``.
+
+    ``--both-methods`` runs inner_outer + coadapt (the historical paper
+    comparison).  ``--joint-tta`` is additive and can combine with either —
+    e.g. ``--both-methods --joint-tta`` runs all three.
     """
-    inner_outer_cfg = {"label": "Inner-Outer TTA", "coadapt_embeddings": False}
-    joint_cfg = {"label": "Joint TTA", "coadapt_embeddings": True}
-    if both_methods:
-        return {"inner_outer": inner_outer_cfg, "joint": joint_cfg}
-    if use_coadapt:
-        return {"joint": joint_cfg}
-    return {"inner_outer": inner_outer_cfg}
+    inner_outer_cfg = {"label": "Inner-Outer TTA", "strategy": "inner_outer"}
+    coadapt_cfg = {"label": "Coadapt TTA", "strategy": "coadapt"}
+    joint_cfg = {"label": "Joint TTA", "strategy": "joint"}
+
+    strategies: Dict = {}
+    any_specific = use_coadapt or use_joint
+    if both_methods or not any_specific:
+        strategies["inner_outer"] = inner_outer_cfg
+    if use_coadapt or both_methods:
+        strategies["coadapt"] = coadapt_cfg
+    if use_joint:
+        strategies["joint"] = joint_cfg
+    return strategies
 
 
 def _dispatch_tta(
@@ -1296,10 +1325,10 @@ def _dispatch_tta(
 ):
     """Route to the correct TTA implementation via ``multisession.test_time_adaptation``.
 
-    ``coadapt_embeddings=True``  → ``joint=True``  (persistent co-adaptive optimizers).
-    ``coadapt_embeddings=False`` → ``joint=False`` (inner-outer MAML-style, default / best).
-    ``ae_lr`` overrides the AE learning rate for joint TTA (ignored for inner-outer).
+    ``strategy_cfg["strategy"]`` is one of ``"inner_outer"``, ``"coadapt"``, ``"joint"``.
+    ``ae_lr`` overrides the AE learning rate for joint TTA (ignored otherwise).
     """
+    strategy = strategy_cfg["strategy"]
     return multisession.test_time_adaptation(
         cfg,
         model,
@@ -1311,7 +1340,8 @@ def _dispatch_tta(
         adapt_ae=adapt_ae,
         support_size=support_size,
         quiet=False,
-        joint=strategy_cfg["coadapt_embeddings"],
+        joint=(strategy == "joint"),
+        coadapt=(strategy == "coadapt"),
         ae_lr=ae_lr,
     )
 
@@ -1974,6 +2004,7 @@ def run_tta_sweep(
     gpu_ids: List[int] = None,
     progressive_unfreezing_enabled: bool = False,
     use_coadapt: bool = False,
+    use_joint: bool = False,
     both_methods: bool = False,
     adapt_ae: bool = True,
     random_sample_support: bool = False,
@@ -2007,7 +2038,7 @@ def run_tta_sweep(
         Dictionary containing all results and metadata
     """
     tta_strategies = get_tta_strategies(
-        use_coadapt=use_coadapt, both_methods=both_methods
+        use_coadapt=use_coadapt, use_joint=use_joint, both_methods=both_methods
     )
     model_names = list(model_paths.keys())
 
@@ -2892,6 +2923,7 @@ def _main_impl(args):
         gpu_ids=args.gpu_ids,
         progressive_unfreezing_enabled=progressive_unfreezing_enabled or force_per_session,
         use_coadapt=args.coadapt_tta,
+        use_joint=args.joint_tta,
         both_methods=args.both_methods,
         adapt_ae=not args.no_adapt_ae,
         random_sample_support=args.random_support,

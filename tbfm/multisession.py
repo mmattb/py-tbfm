@@ -1258,6 +1258,318 @@ def test_time_adaptation_joint(
     return embeddings_stim, results
 
 
+def test_time_adaptation_coadapt(
+    cfg,
+    model,
+    embeddings_rest,
+    data_train,
+    epochs=1000,
+    data_test=None,
+    ae_warm_start: bool = True,
+    adapt_ae: bool = True,
+    embeddings_stim=None,
+    support_size: int | None = None,
+    quiet: bool = False,
+) -> tuple:
+    """
+    Co-adaptive test-time adaptation — original mechanism.
+
+    A single shared forward pass, single shared loss, single shared backward
+    pass per outer step: AE, embeddings, and (if progressively unfrozen) the
+    TBFM basis weights/bases are all updated together from the same gradient
+    computation every step. This is the method the paper describes as
+    "c^stim is optimized jointly with the autoencoder" — restored from the
+    original implementation (commit 11e6024c) after it was superseded by the
+    unrelated ``test_time_adaptation_joint`` strategy below.
+
+    This differs from ``test_time_adaptation_joint``, which *alternates*
+    between ``emb_steps_per_ae_step`` embedding-only steps (AE+TBFM frozen)
+    and one AE-only step (embeddings detached) — an independently developed
+    strategy that is NOT the "coadapt" method described in the paper, despite
+    the historical naming collision. Both are kept available: this function
+    for ``coadapt``, ``test_time_adaptation_joint`` for ``joint``.
+
+    Like ``joint``, the AE (and embedding) optimizers are built once and carry
+    momentum across the whole run — nothing is re-initialized mid-run. Unlike
+    ``joint``, the TBFM is eligible for progressive unfreezing
+    (``unfreeze_basis_weights`` / ``unfreeze_bases``), matching
+    ``test_time_adaptation_inner_outer``'s support for it.
+
+    Args:
+        cfg: Hydra config object.
+        model: TBFMMultisession instance.
+        embeddings_rest: {session_id: tensor} — fixed rest embeddings.
+        data_train: SyntheticMultisessionData (or any iterable) for the support set.
+        epochs: Total number of joint co-adaptation steps.
+        data_test: Optional held-out data for evaluation after adaptation.
+        ae_warm_start: If True, PCA-warm-start the AE before co-adaptation.
+        adapt_ae: If False, skip AE gradient updates (only embeddings are optimized).
+        embeddings_stim: If None, train new embeddings. Otherwise use provided and don't optimize.
+        support_size: Override cfg.meta.training.support_size.
+        quiet: Suppress per-step logging.
+
+    Returns:
+        embeddings_stim: {session_id: detached tensor}
+        results: dict with test metrics.
+    """
+    model.eval(ae=not adapt_ae)
+    device = model.device
+
+    support_size = support_size or cfg.meta.training.support_size
+    grad_clip = cfg.training.grad_clip
+
+    # Materialise support set (assumed small — single batch)
+    _, data_train = utils.iter_loader(iter(data_train), data_train, device=device)
+    data_train, filter_stats = utils.filter_batch_outliers(data_train, model.norms, cfg)
+    if cfg.training.use_outlier_filtering:
+        print(
+            f"TTA: Training data filtered: "
+            f"{filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
+        )
+
+    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    print(f"TTA: Using {support_size} samples for adaptation (support set)")
+
+    # Refit normalizers from support set
+    print("TTA: Refitting normalizers from support set...")
+    with torch.no_grad():
+        for session_id, d in data_for_adaptation.items():
+            x = torch.cat((d[0], d[2]), dim=1)
+            model.norms.instances[session_id].fit(x)
+
+    if ae_warm_start:
+        print("TTA: Warm starting autoencoder...")
+        with torch.no_grad():
+            for session_id, data in data_for_adaptation.items():
+                runway_norm = model.norms({session_id: data[0]})[session_id]
+                ae_inst = model.ae.instances.get(session_id)
+                if ae_inst is not None:
+                    ae_inst.pca_warm_start(runway_norm, center="median", whiten=False)
+                    print(f"  Warm started AE for {session_id}")
+
+    optimize_embeddings = embeddings_stim is None
+
+    # AE parameters — unfreeze and build optimizer (only when adapt_ae=True)
+    ae_params = []
+    ae_optims = []
+    if adapt_ae:
+        for session_id in data_for_adaptation.keys():
+            ae_inst = model.ae.instances.get(session_id)
+            if ae_inst is not None:
+                params = list(ae_inst.parameters())
+                ae_params.extend(params)
+                ae_optims.append(
+                    torch.optim.AdamW(
+                        params,
+                        lr=cfg.ae.training.optim.lr,
+                        weight_decay=cfg.ae.training.optim.weight_decay,
+                    )
+                )
+
+    # Embedding tensors — persistent across steps, same as joint
+    embed_optim = None
+    if optimize_embeddings:
+        embed_dim_stim = model.model.bases.embed_dim_stim
+        embeddings_stim = {
+            sid: (torch.randn(embed_dim_stim, device=device) * 0.1).requires_grad_(True)
+            for sid in data_for_adaptation.keys()
+        }
+        embed_optim = torch.optim.AdamW(
+            list(embeddings_stim.values()),
+            lr=cfg.meta.training.optim.lr,
+            weight_decay=cfg.meta.training.optim.weight_decay,
+        )
+
+    # Progressive unfreezing: optionally fine-tune TBFM components at high support sizes
+    tbfm_optims = {}
+    progressive_unfreezing_threshold = cfg.meta.training.get(
+        "progressive_unfreezing_threshold", 2000
+    )
+    unfreeze_basis_weights = cfg.meta.training.get("unfreeze_basis_weights", False)
+    unfreeze_bases = cfg.meta.training.get("unfreeze_bases", False)
+    basis_weight_lr = cfg.meta.training.get("basis_weight_lr", 1e-5)
+    bases_lr = cfg.meta.training.get("bases_lr", 1e-6)
+    enable_progressive_unfreezing = (
+        support_size >= progressive_unfreezing_threshold
+        and (unfreeze_basis_weights or unfreeze_bases)
+    )
+    if enable_progressive_unfreezing:
+        print(
+            f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})"
+        )
+        for session_id in data_for_adaptation.keys():
+            tbfm_instance = model.model.instances.get(session_id)
+            if tbfm_instance is not None:
+                params_to_optimize = []
+                if unfreeze_basis_weights:
+                    params_to_optimize.append(
+                        {
+                            "params": tbfm_instance.basis_weighting.parameters(),
+                            "lr": basis_weight_lr,
+                        }
+                    )
+                    print(
+                        f"  Unfreezing basis weights for {session_id} (lr={basis_weight_lr})"
+                    )
+                if unfreeze_bases:
+                    params_to_optimize.append(
+                        {
+                            "params": tbfm_instance.bases.parameters(),
+                            "lr": bases_lr,
+                        }
+                    )
+                    print(f"  Unfreezing bases for {session_id} (lr={bases_lr})")
+                if params_to_optimize:
+                    wd = cfg.tbfm.training.optim.get("weight_decay", 1e-4)
+                    tbfm_optims[session_id] = torch.optim.AdamW(
+                        params_to_optimize, weight_decay=wd
+                    )
+
+    lambda_ae_recon = cfg.ae.training.lambda_ae_recon
+
+    with torch.no_grad():
+        ys_norm = {
+            sid: model.norms({sid: d[2]})[sid] for sid, d in data_for_adaptation.items()
+        }
+
+    print(f"TTA: Joint (single-pass) co-adaptation for {epochs} steps...")
+
+    last_loss = None
+    for outer_step in range(epochs):
+        for opt in ae_optims:
+            opt.zero_grad()
+        if embed_optim:
+            embed_optim.zero_grad()
+        for opt in tbfm_optims.values():
+            opt.zero_grad()
+
+        model.model.reset_state()
+
+        preds = model(
+            data_for_adaptation,
+            embeddings_rest=embeddings_rest,
+            embeddings_stim=embeddings_stim,
+        )
+
+        loss = sum(
+            nn.MSELoss()(preds[sid], ys_norm[sid]) for sid in data_for_adaptation
+        ) / len(data_for_adaptation)
+
+        if lambda_ae_recon > 0 and adapt_ae:
+            runway_norm, runway_recon = model.forward_reconstruct(data_for_adaptation)
+            recon_loss = sum(
+                nn.MSELoss()(runway_recon[sid], runway_norm[sid])
+                for sid in data_for_adaptation
+            ) / len(data_for_adaptation)
+            loss = loss + lambda_ae_recon * recon_loss
+
+        if tbfm_optims:
+            for sid in data_for_adaptation.keys():
+                tbfm_instance = model.model.instances.get(sid)
+                if tbfm_instance is not None:
+                    if unfreeze_basis_weights:
+                        loss = (
+                            loss
+                            + cfg.tbfm.training.lambda_fro
+                            * tbfm_instance.get_weighting_reg()
+                        )
+                    if unfreeze_bases:
+                        loss = (
+                            loss
+                            + cfg.tbfm.training.lambda_ortho
+                            * tbfm_instance.get_basis_rms_reg()
+                        )
+
+        loss.backward()
+        if grad_clip:
+            if ae_params:
+                nn.utils.clip_grad_norm_(ae_params, grad_clip)
+            if embed_optim:
+                nn.utils.clip_grad_norm_(list(embeddings_stim.values()), grad_clip)
+            tbfm_params = [
+                p for opt in tbfm_optims.values() for pg in opt.param_groups for p in pg["params"]
+            ]
+            if tbfm_params:
+                nn.utils.clip_grad_norm_(tbfm_params, grad_clip)
+
+        for opt in ae_optims:
+            opt.step()
+        if embed_optim:
+            embed_optim.step()
+        for opt in tbfm_optims.values():
+            opt.step()
+
+        last_loss = loss.item()
+        if not quiet and outer_step % 100 == 0:
+            components = []
+            if adapt_ae:
+                components.append("AE")
+            if embed_optim:
+                components.append("embeddings")
+            if tbfm_optims:
+                if unfreeze_basis_weights:
+                    components.append("basis_weights")
+                if unfreeze_bases:
+                    components.append("bases")
+            print(
+                f"  step {outer_step}/{epochs}  loss={last_loss:.6f} [{'+'.join(components)}]"
+            )
+
+    if embed_optim:
+        embeddings_stim = {sid: e.detach() for sid, e in embeddings_stim.items()}
+
+    if not quiet:
+        print(f"TTA: Done. Final loss={last_loss:.6f}")
+
+    if data_test:
+        model.eval()
+        with torch.no_grad():
+            test_results = utils.evaluate_test_batches(
+                model,
+                data_test,
+                embeddings_rest,
+                embeddings_stim,
+                model.norms,
+                cfg,
+                device,
+                track_per_session_r2=True,
+            )
+        r2_test = test_results["r2"]
+        loss_test = test_results["loss"]
+        final_test_r2s = test_results["per_session_r2"]
+        y_hat_test = test_results["y_hat"]
+        test_batch = test_results["y_test"]
+        print(f"TTA: Test results - Loss: {loss_test:.6f}, R2: {r2_test:.4f}")
+    else:
+        r2_test = final_test_r2s = loss_test = y_hat_test = test_batch = None
+
+    with torch.no_grad():
+        train_results = utils.evaluate_test_batches(
+            model,
+            [data_for_adaptation],
+            embeddings_rest,
+            embeddings_stim,
+            model.norms,
+            cfg,
+            device,
+            track_per_session_r2=True,
+        )
+    r2_train = train_results["r2"]
+    final_train_r2s = train_results["per_session_r2"]
+    print(f"TTA: Train results - R2: {r2_train:.4f}")
+
+    results = {
+        "final_test_r2": r2_test,
+        "final_test_r2s": final_test_r2s,
+        "final_test_loss": loss_test,
+        "final_train_r2": r2_train,
+        "final_train_r2s": final_train_r2s,
+        "y_hat_test": y_hat_test,
+        "y_test": test_batch,
+    }
+    return embeddings_stim, results
+
+
 def test_time_adaptation(
     cfg,
     model,
@@ -1271,22 +1583,46 @@ def test_time_adaptation(
     support_size: int | None = None,
     quiet: bool = False,
     joint: bool = False,
+    coadapt: bool = False,
     emb_steps_per_ae_step: int = 5,
     ae_lr: float | None = None,
     random_sample_support: bool = False,
     support_seed: int | None = None,
 ) -> tuple:
-    """Dispatcher: routes to inner-outer (default) or joint TTA.
+    """Dispatcher: routes to inner-outer (default), joint, or coadapt TTA.
 
-    Pass ``joint=True`` to use the persistent co-adaptive strategy
-    (``test_time_adaptation_joint``).  The default (``joint=False``) uses
-    ``test_time_adaptation_inner_outer``, which re-initialises embeddings from
-    noise each outer step and runs MAML-style inner updates — currently the
-    best-performing strategy on held-out sessions (R²=0.450).
+    Pass ``coadapt=True`` to use the original co-adaptive strategy
+    (``test_time_adaptation_coadapt``) — single shared forward/backward pass,
+    the method described in the paper.
+
+    Pass ``joint=True`` to use the alternating co-adaptive strategy
+    (``test_time_adaptation_joint``) — a different, independently-developed
+    strategy, NOT the paper's "coadapt" method despite the historical name.
+
+    At most one of ``joint``/``coadapt`` may be True. The default (both
+    False) uses ``test_time_adaptation_inner_outer``, which re-initialises
+    embeddings from noise each outer step and runs MAML-style inner updates —
+    currently the best-performing strategy on held-out sessions (R²=0.450).
 
     ``emb_steps_per_ae_step`` and ``ae_lr`` are forwarded only when ``joint=True``.
-    ``random_sample_support`` and ``support_seed`` are forwarded only when ``joint=False``.
+    ``random_sample_support`` and ``support_seed`` are forwarded only when both are False.
     """
+    if joint and coadapt:
+        raise ValueError("test_time_adaptation: joint and coadapt are mutually exclusive")
+    if coadapt:
+        return test_time_adaptation_coadapt(
+            cfg,
+            model,
+            embeddings_rest,
+            data_train,
+            epochs=epochs,
+            data_test=data_test,
+            ae_warm_start=ae_warm_start,
+            adapt_ae=adapt_ae,
+            embeddings_stim=embeddings_stim,
+            support_size=support_size,
+            quiet=quiet,
+        )
     if joint:
         return test_time_adaptation_joint(
             cfg,
