@@ -3,6 +3,8 @@
 
 import os
 import random
+
+import numpy as np
 import shutil
 import sys
 
@@ -88,6 +90,7 @@ def main(
     embed_dim_stim=None,
     out_dir=None,
     random_seed=None,
+    torch_seed=None,
     held_in_sessions=None,
     normalizer=None,
     lambda_ae_recon=None,
@@ -127,6 +130,18 @@ def main(
     print(f"----------- Device: {gpu}, out: {my_out_dir} ------------")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+
+    if torch_seed is not None:
+        # Reproducible run: seed every RNG and ask for deterministic kernels.
+        # CUBLAS_WORKSPACE_CONFIG must be set before the first CUDA call.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        random.seed(torch_seed)
+        np.random.seed(torch_seed)
+        torch.manual_seed(torch_seed)
+        torch.cuda.manual_seed_all(torch_seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
     meta = dataset.load_meta(DATA_DIR)
     conf_dir = Path("./conf").resolve()
@@ -468,6 +483,12 @@ if __name__ == "__main__":
         help="Random seed for session selection",
     )
     parser.add_argument(
+        "--torch-seed",
+        type=int,
+        default=None,
+        help="Seed torch/numpy/random and enable deterministic kernels (for reproducible runs)",
+    )
+    parser.add_argument(
         "--held-in-sessions",
         type=str,
         default=None,
@@ -551,6 +572,7 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         data_dir=args.data_dir,
         random_seed=args.random_seed,
+        torch_seed=args.torch_seed,
         held_in_sessions=held_in_sessions,
         normalizer=args.normalizer,
         lambda_ae_recon=args.lambda_ae_recon,
