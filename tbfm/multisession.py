@@ -1018,6 +1018,8 @@ def test_time_adaptation_joint(
     quiet: bool = False,
     emb_steps_per_ae_step: int = 5,
     ae_lr: float | None = None,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
 ) -> tuple:
     """
     Co-adaptive test-time adaptation.
@@ -1068,7 +1070,16 @@ def test_time_adaptation_joint(
             f"{filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
         )
 
-    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    # Same support selection as test_time_adaptation_inner_outer: first N trials, or a
+    # random N (reproducible when support_seed is given).
+    if random_sample_support and support_seed is not None:
+        torch.manual_seed(support_seed)
+    data_for_adaptation, _ = split_support_query_sessions(
+        data_train,
+        support_size,
+        random_sample=random_sample_support,
+        train_set_size=None,
+    )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
     # Refit normalizers from support set
@@ -1270,6 +1281,8 @@ def test_time_adaptation_coadapt(
     embeddings_stim=None,
     support_size: int | None = None,
     quiet: bool = False,
+    random_sample_support: bool = False,
+    support_seed: int | None = None,
 ) -> tuple:
     """
     Co-adaptive test-time adaptation — original mechanism.
@@ -1327,7 +1340,16 @@ def test_time_adaptation_coadapt(
             f"{filter_stats['total_kept']}/{filter_stats['total_samples']} trials kept"
         )
 
-    data_for_adaptation, _ = split_support_query_sessions(data_train, support_size)
+    # Same support selection as test_time_adaptation_inner_outer: first N trials, or a
+    # random N (reproducible when support_seed is given).
+    if random_sample_support and support_seed is not None:
+        torch.manual_seed(support_seed)
+    data_for_adaptation, _ = split_support_query_sessions(
+        data_train,
+        support_size,
+        random_sample=random_sample_support,
+        train_set_size=None,
+    )
     print(f"TTA: Using {support_size} samples for adaptation (support set)")
 
     # Refit normalizers from support set
@@ -1605,7 +1627,9 @@ def test_time_adaptation(
     currently the best-performing strategy on held-out sessions (R²=0.450).
 
     ``emb_steps_per_ae_step`` and ``ae_lr`` are forwarded only when ``joint=True``.
-    ``random_sample_support`` and ``support_seed`` are forwarded only when both are False.
+    ``random_sample_support`` and ``support_seed`` are forwarded to every strategy, so all of
+    them pick the support set the same way: the first N trials by default, or a random N
+    (seeded when ``support_seed`` is given).
     """
     if joint and coadapt:
         raise ValueError("test_time_adaptation: joint and coadapt are mutually exclusive")
@@ -1622,6 +1646,8 @@ def test_time_adaptation(
             embeddings_stim=embeddings_stim,
             support_size=support_size,
             quiet=quiet,
+            random_sample_support=random_sample_support,
+            support_seed=support_seed,
         )
     if joint:
         return test_time_adaptation_joint(
@@ -1638,6 +1664,8 @@ def test_time_adaptation(
             quiet=quiet,
             emb_steps_per_ae_step=emb_steps_per_ae_step,
             ae_lr=ae_lr,
+            random_sample_support=random_sample_support,
+            support_seed=support_seed,
         )
     return test_time_adaptation_inner_outer(
         cfg,
