@@ -189,6 +189,27 @@ def load_model_components(path, model, device=None):
     return embeddings_stim, embeddings_rest
 
 
+def _unique_tbfm_instances(model, session_ids):
+    """
+    Distinct TBFM objects behind ``model.model.instances``, as ``[(session_id, instance)]``.
+
+    With a shared TBFM (``tbfm.sharing.shared``) the same object is registered under
+    every session id.  Anything built or applied once per session id -- optimizers,
+    regularizers, gradient clipping -- would then act on those shared parameters once
+    per session.  This returns one entry per distinct object (first session id seen),
+    so callers act once per parameter set.  Per-session (unshared) TBFMs are unchanged.
+    """
+    seen = set()
+    unique = []
+    for sid in session_ids:
+        inst = model.model.instances.get(sid)
+        if inst is None or id(inst) in seen:
+            continue
+        seen.add(id(inst))
+        unique.append((sid, inst))
+    return unique
+
+
 def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     optims_norms = tuple()
     if cfg.normalizers.training.coadapt:
@@ -199,7 +220,9 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     else:
         optims_aes = []
 
-    # Will have only 1 elem if tbfm is shared.
+    # The dispatcher returns one optimizer triple per session id.  If the TBFM is shared
+    # those are all over the same parameters, so keep one triple per distinct instance
+    # (below); otherwise every optimizer would step the shared parameters once per session.
     optims_model = model_ms.model.get_optim_custom_base(**cfg.tbfm.training.optim)
 
     def warmup_cos(warmup, cos=True):
@@ -220,7 +243,12 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     bg_schedulers = []
     meta_optims = []
 
+    seen_instances = set()
     for sid, optims in optims_model.items():
+        inst_id = id(model_ms.model.instances[sid])
+        if inst_id in seen_instances:
+            continue
+        seen_instances.add(inst_id)
         optim_bw, optim_bg, optim_meta = optims
 
         bw_optims.append(optim_bw)
@@ -785,8 +813,9 @@ def test_time_adaptation_inner_outer(
             print(
                 f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})"
             )
-            for session_id in data_for_adaptation.keys():
-                tbfm_instance = model.model.instances.get(session_id)
+            for session_id, tbfm_instance in _unique_tbfm_instances(
+                model, data_for_adaptation.keys()
+            ):
                 if tbfm_instance is not None:
                     params_to_optimize = []
                     if unfreeze_basis_weights:
@@ -880,8 +909,9 @@ def test_time_adaptation_inner_outer(
 
             # Add TBFM regularization if progressive unfreezing is active
             if tbfm_optims:
-                for sid in data_for_adaptation.keys():
-                    tbfm_instance = model.model.instances.get(sid)
+                for sid, tbfm_instance in _unique_tbfm_instances(
+                    model, data_for_adaptation.keys()
+                ):
                     if tbfm_instance is not None:
                         if unfreeze_basis_weights:
                             loss = (
@@ -1419,8 +1449,9 @@ def test_time_adaptation_coadapt(
         print(
             f"TTA: Progressive unfreezing enabled (support_size={support_size} >= {progressive_unfreezing_threshold})"
         )
-        for session_id in data_for_adaptation.keys():
-            tbfm_instance = model.model.instances.get(session_id)
+        for session_id, tbfm_instance in _unique_tbfm_instances(
+            model, data_for_adaptation.keys()
+        ):
             if tbfm_instance is not None:
                 params_to_optimize = []
                 if unfreeze_basis_weights:
@@ -1486,8 +1517,9 @@ def test_time_adaptation_coadapt(
             loss = loss + lambda_ae_recon * recon_loss
 
         if tbfm_optims:
-            for sid in data_for_adaptation.keys():
-                tbfm_instance = model.model.instances.get(sid)
+            for sid, tbfm_instance in _unique_tbfm_instances(
+                model, data_for_adaptation.keys()
+            ):
                 if tbfm_instance is not None:
                     if unfreeze_basis_weights:
                         loss = (

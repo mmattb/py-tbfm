@@ -31,8 +31,12 @@ tbfm:
   # Learning parameters
   training:
     optim:
-      lr_head: 4e-4
-      lr_meta: 3e-3
+      # Per-parameter-set rates.  These are 20x the old values (4e-4 / 3e-3): with a shared
+      # TBFM the optimizers used to be built once per session, so a 20-session run stepped
+      # the shared parameters 20 times per iteration.  There is now one optimizer, and the
+      # rate carries the old 20x factor.  Weight decay is unchanged (AdamW decays by lr*wd).
+      lr_head: 8e-3
+      lr_meta: 6e-2
       wd_head: 1e-4
       wd_meta: 1e-5
     lambda_fro: 75.0
