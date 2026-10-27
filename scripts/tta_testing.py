@@ -11,6 +11,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import random
 import sys
 import time
 from copy import deepcopy
@@ -688,6 +689,7 @@ def gpu_worker(
 
                 # Run TTA
                 _tta_t0 = time.perf_counter()
+                _maybe_seed_for_tta_job()
                 adapted_embeddings, strategy_results = _dispatch_tta(
                     strategy_cfg,
                     cfg_eval,
@@ -1309,6 +1311,24 @@ def get_tta_strategies(
     if use_joint:
         strategies["joint"] = joint_cfg
     return strategies
+
+
+def _maybe_seed_for_tta_job():
+    """
+    If TBFM_TTA_SEED is set, reseed every RNG at the start of a TTA job.  Embedding
+    initialisation draws from the global torch RNG, so without this a job's result
+    depends on which jobs ran before it in the same worker process.  Used for
+    reproducible A/B comparisons; unset (the default) leaves behavior unchanged.
+    """
+    seed = os.environ.get("TBFM_TTA_SEED")
+    if seed is None:
+        return
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def _dispatch_tta(
@@ -2364,6 +2384,7 @@ def run_tta_sweep(
                     )
 
                 # Run TTA
+                _maybe_seed_for_tta_job()
                 adapted_embeddings, strategy_results = _dispatch_tta(
                     strategy_cfg,
                     cfg_eval,
