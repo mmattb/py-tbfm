@@ -243,6 +243,14 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
     bg_schedulers = []
     meta_optims = []
 
+    # The configured TBFM rates are per session.  A shared TBFM sees one update per
+    # iteration but accumulates the gradient of every session, so its rate is multiplied
+    # by the number of session ids it serves (1 if the TBFM is not shared).
+    sessions_per_instance = {}
+    for sid in optims_model:
+        inst_id = id(model_ms.model.instances[sid])
+        sessions_per_instance[inst_id] = sessions_per_instance.get(inst_id, 0) + 1
+
     seen_instances = set()
     for sid, optims in optims_model.items():
         inst_id = id(model_ms.model.instances[sid])
@@ -250,6 +258,16 @@ def get_optims(cfg, model_ms: TBFMMultisession, embeddings_stim=None):
             continue
         seen_instances.add(inst_id)
         optim_bw, optim_bg, optim_meta = optims
+        for o in optims:
+            if o is not None:
+                for g in o.param_groups:
+                    g["lr"] *= sessions_per_instance[inst_id]
+        print(
+            f"TBFM optimizers: {sessions_per_instance[inst_id]} sessions share this "
+            f"instance; lr bw/bg/meta = {optim_bw.param_groups[0]['lr']:.2e}/"
+            f"{optim_bg.param_groups[0]['lr']:.2e}/"
+            f"{optim_meta.param_groups[0]['lr'] if optim_meta else float('nan'):.2e}"
+        )
 
         bw_optims.append(optim_bw)
         bw_schedulers.append(LambdaLR(optim_bw, lr_lambda=warmup_cos(1500, cos=False)))
