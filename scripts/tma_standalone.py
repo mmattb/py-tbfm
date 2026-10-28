@@ -98,6 +98,7 @@ def main(
     lambda_ortho=None,
     stim_embedding_lambda_l2=None,
     no_rest_embeddings=False,
+    drop_rest_embeddings=False,
     no_tanh_basis_weights=False,
     no_row_norm=False,
 ):
@@ -293,6 +294,9 @@ def main(
         cfg.tbfm.module.use_tanh_basis_weights = False
     if no_row_norm:
         cfg.tbfm.module.use_basis_weight_row_norm = False
+    if drop_rest_embeddings:
+        # Remove c^rest entirely: the base generator allocates no input columns for it.
+        cfg.tbfm.module.embed_dim_rest = 0
 
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
 
@@ -333,6 +337,7 @@ def main(
         "residual_mlp_hidden": cfg.meta.residual_mlp_hidden,
         "embed_dim_stim": cfg.tbfm.module.embed_dim_stim,
         "embed_dim_rest": cfg.tbfm.module.embed_dim_rest,
+        "normalizer": cfg.normalizers.module._target_,
         "coadapt": coadapt,
         "shuffle": shuffle,
         "train_size": train_size,
@@ -528,6 +533,12 @@ if __name__ == "__main__":
         help="L2 regularization on stim embeddings during inner-loop adaptation (default: 1e-3)",
     )
     parser.add_argument(
+        "--drop-rest-embeddings",
+        action="store_true",
+        help="Remove c_rest from the model (embed_dim_rest=0: no input columns allocated), "
+        "unlike --no-rest-embeddings which feeds zeros into the full-width model",
+    )
+    parser.add_argument(
         "--no-rest-embeddings",
         action="store_true",
         help="Zero out rest embeddings (ablate c_rest)",
@@ -580,6 +591,7 @@ if __name__ == "__main__":
         lambda_ortho=args.lambda_ortho,
         stim_embedding_lambda_l2=args.stim_embedding_lambda_l2,
         no_rest_embeddings=args.no_rest_embeddings,
+        drop_rest_embeddings=args.drop_rest_embeddings,
         no_tanh_basis_weights=args.no_tanh_basis_weights,
         no_row_norm=args.no_row_norm,
     )

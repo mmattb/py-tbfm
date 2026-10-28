@@ -67,7 +67,11 @@ class Bases(nn.Module):
         # Input is just stimdim (not flattened over time)
         in_dim = stimdim
         self.embed_dim_stim = embed_dim_stim
+        # embed_dim_rest == 0 (or None) means the base generator takes no rest embedding at
+        # all: no input columns are allocated for it and it is ignored in forward().
+        embed_dim_rest = embed_dim_rest or 0
         self.embed_dim_rest = embed_dim_rest
+        self.embed_dim_combined = 0
         if use_meta:
             if is_basis_residual:
                 # Residual mode: only rest embedding conditions base generator
@@ -194,21 +198,17 @@ class Bases(nn.Module):
         """
         batch_size = stiminds.shape[0]
 
-        if self.use_meta:
-            if self.is_basis_residual:
-                # Residual mode: only use rest embedding for base generator
-                embedding_combined = (
-                    embedding_rest
-                    .unsqueeze(0)
-                    .repeat(batch_size, 1)
-                )
-            else:
-                # Concatenation mode: use both embeddings
-                embedding_combined = (
-                    torch.cat((embedding_rest, embedding_stim), dim=0)
-                    .unsqueeze(0)
-                    .repeat(batch_size, 1)
-                )
+        if self.use_meta and self.embed_dim_combined > 0:
+            parts = []
+            if self.embed_dim_rest > 0:
+                parts.append(embedding_rest)
+            if not self.is_basis_residual:
+                # Concatenation mode: stim embedding also conditions the generator
+                # (in residual mode it only feeds the residual network below)
+                parts.append(embedding_stim)
+            embedding_combined = (
+                torch.cat(parts, dim=0).unsqueeze(0).repeat(batch_size, 1)
+            )
 
             if self._be_loud:
                 print(

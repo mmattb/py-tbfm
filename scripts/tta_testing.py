@@ -571,6 +571,13 @@ def gpu_worker(
                         and params["embed_dim_stim"] is not None
                     ):
                         cfg_eval.tbfm.module.embed_dim_stim = params["embed_dim_stim"]
+                    if (
+                        "embed_dim_rest" in params
+                        and params["embed_dim_rest"] is not None
+                    ):
+                        cfg_eval.tbfm.module.embed_dim_rest = params["embed_dim_rest"]
+                    if "normalizer" in params and params["normalizer"] is not None:
+                        cfg_eval.normalizers.module._target_ = params["normalizer"]
 
                     OmegaConf.set_struct(cfg_eval, True)
 
@@ -2287,6 +2294,13 @@ def run_tta_sweep(
                         and params["embed_dim_stim"] is not None
                     ):
                         cfg_eval.tbfm.module.embed_dim_stim = params["embed_dim_stim"]
+                    if (
+                        "embed_dim_rest" in params
+                        and params["embed_dim_rest"] is not None
+                    ):
+                        cfg_eval.tbfm.module.embed_dim_rest = params["embed_dim_rest"]
+                    if "normalizer" in params and params["normalizer"] is not None:
+                        cfg_eval.normalizers.module._target_ = params["normalizer"]
                     OmegaConf.set_struct(cfg_eval, True)
 
                 # Apply ablation overrides
