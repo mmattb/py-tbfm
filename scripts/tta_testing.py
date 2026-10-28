@@ -209,22 +209,9 @@ def parse_args():
         "the method described in the paper) instead of inner-outer TTA",
     )
     parser.add_argument(
-        "--joint-tta",
-        action="store_true",
-        help="Also run joint TTA (alternating embedding/AE co-adaptation) — a "
-        "different strategy from coadapt, despite the historical name collision",
-    )
-    parser.add_argument(
         "--both-methods",
         action="store_true",
-        help="Run both inner-outer and coadapt TTA strategies in a single sweep "
-        "(combine with --joint-tta to add joint as a third arm)",
-    )
-    parser.add_argument(
-        "--ae-lr",
-        type=float,
-        default=None,
-        help="Override AE learning rate for joint TTA (default: use cfg.ae.training.optim.lr = 1e-4)",
+        help="Run both inner-outer and coadapt TTA strategies in a single sweep",
     )
     parser.add_argument(
         "--no-adapt-ae",
@@ -411,7 +398,6 @@ def gpu_worker(
     support_seed: int | None = None,
     ablation_overrides: dict | None = None,
     zero_rest_embeddings: bool = False,
-    ae_lr: float | None = None,
 ):
     """
     Worker process for processing TTA jobs on a specific GPU.
@@ -700,7 +686,6 @@ def gpu_worker(
                     data_test=data_test_filtered,
                     adapt_ae=adapt_ae,
                     support_size=support_size,
-                    ae_lr=ae_lr,
                 )
                 adapt_time_s = time.perf_counter() - _tta_t0
 
@@ -1272,7 +1257,6 @@ def clone_cfg_for_eval(base_cfg, vanilla=False):
 
 def get_tta_strategies(
     use_coadapt: bool = False,
-    use_joint: bool = False,
     both_methods: bool = False,
 ) -> Dict:
     """Return available TTA strategies.
@@ -1288,28 +1272,18 @@ def get_tta_strategies(
         jointly with the autoencoder".  Maps to
         ``test_time_adaptation_coadapt``.  Select with ``--coadapt-tta``.
 
-    joint: a *different*, independently-developed strategy that alternates
-        embedding-only steps (AE+TBFM frozen) with AE-only steps (embeddings
-        detached).  NOT the paper's "coadapt" method despite the historical
-        name collision.  Maps to ``test_time_adaptation_joint``.  Select with
-        ``--joint-tta``.
-
     ``--both-methods`` runs inner_outer + coadapt (the historical paper
-    comparison).  ``--joint-tta`` is additive and can combine with either —
-    e.g. ``--both-methods --joint-tta`` runs all three.
+    comparison).
     """
     inner_outer_cfg = {"label": "Inner-Outer TTA", "strategy": "inner_outer"}
     coadapt_cfg = {"label": "Coadapt TTA", "strategy": "coadapt"}
-    joint_cfg = {"label": "Joint TTA", "strategy": "joint"}
 
     strategies: Dict = {}
-    any_specific = use_coadapt or use_joint
+    any_specific = use_coadapt
     if both_methods or not any_specific:
         strategies["inner_outer"] = inner_outer_cfg
     if use_coadapt or both_methods:
         strategies["coadapt"] = coadapt_cfg
-    if use_joint:
-        strategies["joint"] = joint_cfg
     return strategies
 
 
@@ -1341,12 +1315,10 @@ def _dispatch_tta(
     data_test,
     adapt_ae: bool,
     support_size: int,
-    ae_lr: float | None = None,
 ):
     """Route to the correct TTA implementation via ``multisession.test_time_adaptation``.
 
-    ``strategy_cfg["strategy"]`` is one of ``"inner_outer"``, ``"coadapt"``, ``"joint"``.
-    ``ae_lr`` overrides the AE learning rate for joint TTA (ignored otherwise).
+    ``strategy_cfg["strategy"]`` is one of ``"inner_outer"``, ``"coadapt"``.
     """
     strategy = strategy_cfg["strategy"]
     return multisession.test_time_adaptation(
@@ -1360,9 +1332,7 @@ def _dispatch_tta(
         adapt_ae=adapt_ae,
         support_size=support_size,
         quiet=False,
-        joint=(strategy == "joint"),
         coadapt=(strategy == "coadapt"),
-        ae_lr=ae_lr,
     )
 
 
@@ -1718,7 +1688,6 @@ def run_tta_sweep_multi_gpu(
     support_seed: int | None = None,
     ablation_overrides: dict | None = None,
     zero_rest_embeddings: bool = False,
-    ae_lr: float | None = None,
 ) -> Dict:
     """
     Multi-GPU version of run_tta_sweep using multiprocessing.
@@ -1873,7 +1842,6 @@ def run_tta_sweep_multi_gpu(
                     support_seed,
                     ablation_overrides,
                     zero_rest_embeddings,
-                    ae_lr,
                 ),
             )
             p.start()
@@ -2024,14 +1992,12 @@ def run_tta_sweep(
     gpu_ids: List[int] = None,
     progressive_unfreezing_enabled: bool = False,
     use_coadapt: bool = False,
-    use_joint: bool = False,
     both_methods: bool = False,
     adapt_ae: bool = True,
     random_sample_support: bool = False,
     support_seed: int | None = None,
     ablation_overrides: dict | None = None,
     zero_rest_embeddings: bool = False,
-    ae_lr: float | None = None,
 ) -> Dict:
     """
     Run comprehensive TTA sweep across models, support sizes, and strategies.
@@ -2058,7 +2024,7 @@ def run_tta_sweep(
         Dictionary containing all results and metadata
     """
     tta_strategies = get_tta_strategies(
-        use_coadapt=use_coadapt, use_joint=use_joint, both_methods=both_methods
+        use_coadapt=use_coadapt, both_methods=both_methods
     )
     model_names = list(model_paths.keys())
 
@@ -2156,7 +2122,6 @@ def run_tta_sweep(
             support_seed=support_seed,
             ablation_overrides=ablation_overrides,
             zero_rest_embeddings=zero_rest_embeddings,
-            ae_lr=ae_lr,
         )
 
     with open(log_path, "w", buffering=1, encoding="utf-8") as log_stream:
@@ -2395,7 +2360,6 @@ def run_tta_sweep(
                     data_test=data_test,
                     adapt_ae=adapt_ae,
                     support_size=support_size,
-                    ae_lr=ae_lr,
                 )
 
                 # Store results
@@ -2944,14 +2908,12 @@ def _main_impl(args):
         gpu_ids=args.gpu_ids,
         progressive_unfreezing_enabled=progressive_unfreezing_enabled or force_per_session,
         use_coadapt=args.coadapt_tta,
-        use_joint=args.joint_tta,
         both_methods=args.both_methods,
         adapt_ae=not args.no_adapt_ae,
         random_sample_support=args.random_support,
         support_seed=args.support_seed,
         ablation_overrides=ablation_overrides,
         zero_rest_embeddings=args.zero_rest_embeddings,
-        ae_lr=args.ae_lr,
     )
     all_results = [results]
 
