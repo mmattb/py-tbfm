@@ -727,3 +727,48 @@ def evaluate_test_batches(
         results["per_session_r2"] = per_session_r2
 
     return results
+
+
+def save_run_record(out_dir, cfg=None, args=None, name="run_record"):
+    """Persist everything needed to reproduce a run next to its outputs.
+
+    Writes ``<name>.json`` (argv, args, timestamp, host, python/torch versions, git commit and
+    whether tbfm/, scripts/ or conf/ had uncommitted changes) and, if ``cfg`` is given,
+    ``<name>_cfg.yaml`` (the fully resolved Hydra config). Never raises: a failure here must not
+    kill a multi-hour run.
+    """
+    import json
+    import os
+    import platform
+    import subprocess
+    import sys
+    from datetime import datetime
+
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        def git(*a):
+            return subprocess.run(
+                ["git", "-C", repo, *a], capture_output=True, text=True, timeout=30
+            ).stdout.strip()
+
+        record = {
+            "time": datetime.now().isoformat(),
+            "host": platform.node(),
+            "python": sys.version.split()[0],
+            "torch": torch.__version__,
+            "argv": sys.argv,
+            "args": {k: str(v) for k, v in (args or {}).items()},
+            "git_commit": git("rev-parse", "HEAD"),
+            "git_branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+            "git_dirty_files": git("status", "--porcelain", "--", "tbfm", "scripts", "conf"),
+        }
+        with open(os.path.join(out_dir, f"{name}.json"), "w") as f:
+            json.dump(record, f, indent=2)
+        if cfg is not None:
+            from omegaconf import OmegaConf
+
+            OmegaConf.save(cfg, os.path.join(out_dir, f"{name}_cfg.yaml"), resolve=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[save_run_record] skipped ({name}): {e}")

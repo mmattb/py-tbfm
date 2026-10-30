@@ -298,6 +298,9 @@ def main(
         # Remove c^rest entirely: the base generator allocates no input columns for it.
         cfg.tbfm.module.embed_dim_rest = 0
 
+    # Full resolved config + argv + git state, for reproducibility (hyperparameters.torch is a partial subset).
+    utils.save_run_record(my_out_dir, cfg=cfg, name="train_run")
+
     ms = multisession.build_from_cfg(cfg, data_train, device=DEVICE)
 
     # If co-adapting, pre-initialize trainable per-session stim embeddings and
@@ -338,6 +341,8 @@ def main(
         "embed_dim_stim": cfg.tbfm.module.embed_dim_stim,
         "embed_dim_rest": cfg.tbfm.module.embed_dim_rest,
         "normalizer": cfg.normalizers.module._target_,
+        # The complete resolved config this run trained with (so nothing has to be reconstructed from flags/commits).
+        "cfg": OmegaConf.to_container(cfg, resolve=True),
         "coadapt": coadapt,
         "shuffle": shuffle,
         "train_size": train_size,

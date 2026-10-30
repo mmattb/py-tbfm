@@ -578,6 +578,12 @@ def gpu_worker(
                         cfg_eval.tbfm.module.embed_dim_rest = params["embed_dim_rest"]
                     if "normalizer" in params and params["normalizer"] is not None:
                         cfg_eval.normalizers.module._target_ = params["normalizer"]
+                    # Architecture switches come from the training config stored in hyperparameters.torch
+                    # (older runs have no "cfg"; tta flags below still override).
+                    _trained_mod = (params.get("cfg") or {}).get("tbfm", {}).get("module", {})
+                    for _k in ("use_tanh_basis_weights", "use_basis_weight_row_norm"):
+                        if _k in _trained_mod:
+                            cfg_eval.tbfm.module[_k] = _trained_mod[_k]
 
                     OmegaConf.set_struct(cfg_eval, True)
 
@@ -601,6 +607,12 @@ def gpu_worker(
                     f"lambda_l2={cfg_eval.meta.training.stim_embedding_lambda_l2}, "
                     f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}"
                 )
+                try:
+                    utils.save_run_record(
+                        output_dir, cfg=cfg_eval, name=f"tta_cfg_{model_key}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"[save_run_record] skipped: {e}")
 
                 is_coadapt = params.get("coadapt", False)
                 is_split_format = (model_path / "tbfm.torch").exists()
@@ -2301,6 +2313,12 @@ def run_tta_sweep(
                         cfg_eval.tbfm.module.embed_dim_rest = params["embed_dim_rest"]
                     if "normalizer" in params and params["normalizer"] is not None:
                         cfg_eval.normalizers.module._target_ = params["normalizer"]
+                    # Architecture switches come from the training config stored in hyperparameters.torch
+                    # (older runs have no "cfg"; tta flags below still override).
+                    _trained_mod = (params.get("cfg") or {}).get("tbfm", {}).get("module", {})
+                    for _k in ("use_tanh_basis_weights", "use_basis_weight_row_norm"):
+                        if _k in _trained_mod:
+                            cfg_eval.tbfm.module[_k] = _trained_mod[_k]
                     OmegaConf.set_struct(cfg_eval, True)
 
                 # Apply ablation overrides
@@ -2316,6 +2334,12 @@ def run_tta_sweep(
                     f"lambda_l2={cfg_eval.meta.training.stim_embedding_lambda_l2}, "
                     f"lambda_ortho={cfg_eval.tbfm.training.get('lambda_ortho', 0.0)}"
                 )
+                try:
+                    utils.save_run_record(
+                        output_dir, cfg=cfg_eval, name=f"tta_cfg_{model_key}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    print(f"[save_run_record] skipped: {e}")
 
                 is_coadapt = params.get("coadapt", False)
                 is_split_format = (model_paths[model_key] / "tbfm.torch").exists()
@@ -2831,6 +2855,7 @@ def _main_impl(args):
 
     # Create output directory
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    utils.save_run_record(args.output_dir, args=vars(args), name="tta_run")
 
     # Load configuration
     cfg = load_configuration(args.config_dir)
