@@ -2102,6 +2102,25 @@ def run_tta_sweep(
         print(f"Baselines: {', '.join(baselines)}")
     print(f"Total jobs: {len(jobs)}")
 
+    # The single-GPU path builds one model over all adapt sessions, i.e. one TBFM shared by every session
+    # (tbfm.sharing.shared).  With unfrozen bases / basis weights that TBFM would be adapted jointly across
+    # the sessions, which is not how TTA is deployed (one session at a time).  Refuse rather than silently
+    # produce numbers that are not comparable with per-session runs.
+    unfreezing = cfg.meta.training.get("unfreeze_basis_weights", False) or cfg.meta.training.get(
+        "unfreeze_bases", False
+    )
+    if (
+        not use_multi_gpu
+        and unfreezing
+        and len(adapt_session_ids) > 1
+        and cfg.meta.training.get("progressive_unfreezing_threshold", 2000) <= max(support_sizes)
+    ):
+        raise ValueError(
+            "Single-GPU TTA with unfrozen TBFM parameters would adapt one shared TBFM jointly across "
+            f"{len(adapt_session_ids)} sessions. Use --use-multi-gpu --gpu-ids <id> (per-session adaptation; "
+            "a single id is fine), or adapt one session with --adapt-session."
+        )
+
     if use_multi_gpu:
         if gpu_ids is None:
             gpu_ids = list(range(torch.cuda.device_count()))
