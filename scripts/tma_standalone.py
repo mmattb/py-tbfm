@@ -524,13 +524,17 @@ if __name__ == "__main__":
         "--lambda-ortho",
         type=float,
         default=None,
-        help="Orthonormality penalty on bases (default: 0.0)",
+        help="Orthonormality penalty on bases (default: cfg.tbfm.training.lambda_ortho = 0.05)",
     )
     parser.add_argument(
         "--stim-embedding-lambda-l2",
+        "--lambda-l2",
+        dest="stim_embedding_lambda_l2",
         type=float,
         default=None,
-        help="L2 regularization on stim embeddings during inner-loop adaptation (default: 1e-3)",
+        help="L2 regularization on stim embeddings during inner-loop adaptation "
+        "(default: cfg.meta.training.stim_embedding_lambda_l2 = 0.5e-3). "
+        "--lambda-l2 is an alias matching tta_testing.py's flag name.",
     )
     parser.add_argument(
         "--drop-rest-embeddings",

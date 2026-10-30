@@ -249,19 +249,19 @@ def parse_args():
         "--lambda-fro",
         type=float,
         default=None,
-        help="Override cfg.tbfm.training.lambda_fro at TTA time",
+        help="Override cfg.tbfm.training.lambda_fro at TTA time. Only enters the TTA loss when basis weights are unfrozen (cfg.meta.training.unfreeze_basis_weights; false in the golden config), so it is a no-op there.",
     )
     parser.add_argument(
         "--lambda-l2",
         type=float,
         default=None,
-        help="Override cfg.meta.training.stim_embedding_lambda_l2 at TTA time",
+        help="Override cfg.meta.training.stim_embedding_lambda_l2 at TTA time (TTA default is 1e-2, set in this script, vs the 0.5e-3 training default)",
     )
     parser.add_argument(
         "--lambda-ortho",
         type=float,
         default=None,
-        help="Override cfg.tbfm.training.lambda_ortho at TTA time",
+        help="Override cfg.tbfm.training.lambda_ortho at TTA time (cfg default 0.05; enters the TTA loss when bases are unfrozen)",
     )
     parser.add_argument(
         "--no-tanh-basis-weights",
